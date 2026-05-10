@@ -1,0 +1,24 @@
+# 敏感配置
+.env
+
+# 运行时数据（本地数据库、日志、记忆、表情包）
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# 编辑器 / 系统
+.DS_Store
+.obsidian/
+.claude/
+
+# Obsidian 粘贴图（大文件，不入库）
+Pasted image *.png
+Pasted image *.jpg
+
+# 空文件
+.md

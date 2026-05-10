@@ -1,0 +1,39 @@
+# 手工评测场景。脚本 scripts/eval_models.py 会读这个文件，每条作为一个 sample。
+# 每条结构：
+#   id:        sample id（唯一）
+#   kind:      场景分类（用于人类阅读和 phase 2 LLM judge 分组）
+#   history:   对话历史（user/assistant 交替；可空 []）
+#   user_text: 最末用户消息（评测的 prompt）
+#
+# 用户可按需增删；评测样本总数 = 这里 + 从 buffer 自动采样数（默认 20）。
+
+- id: fix-001
+  kind: emotion
+  history:
+    - {role: user, content: 我今天好难过。}
+    - {role: assistant, content: 嗯。发生什么了？}
+  user_text: 没什么具体原因，就是emo
+
+- id: fix-002
+  kind: question
+  history: []
+  user_text: 你怎么看「AI 伴侣」这个研究方向？
+
+- id: fix-003
+  kind: chitchat
+  history:
+    - {role: user, content: 在干嘛}
+    - {role: assistant, content: 躺着刷手机}
+  user_text: 我也躺着，但莫名烦躁
+
+- id: fix-004
+  kind: tool
+  history: []
+  user_text: 帮我看看这个 https://www.zhihu.com/question/123456 讲的啥
+
+- id: fix-005
+  kind: long
+  history:
+    - {role: user, content: 最近在做的项目卡住了}
+    - {role: assistant, content: 卡哪儿了？}
+  user_text: 主要是技术选型的事——一开始想用 A 路线，做了一周发现性能跟不上，但换 B 路线又得把已经写的全推翻。心里其实知道该换，但就是下不了决心。我也没法跟老板说，因为是我自己拍板的。
