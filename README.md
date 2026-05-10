@@ -1,4 +1,4 @@
-# AIDemo — 一个不像 AI 的陪伴型 bot
+# YYnoTomotachi
 
 >文档位置
 >手写文档： `/me`
