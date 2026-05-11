@@ -1,7 +1,7 @@
 # YYnoTomotachi
 
 >文档位置
->手写文档： `/me`
+>手写文档： `/me` [文档](https://github.com/YYuRain/YYnoTomotachi/tree/main/me)
 >AI沉淀文档：`/document`
 
 - 启停 / 日志 / 故障：`document/running.md`
