@@ -2,7 +2,7 @@
 
 >文档位置
 >手写文档： `/me` [文档](https://github.com/YYuRain/YYnoTomotachi/tree/main/me)
->AI沉淀文档：`/document`
+>AI沉淀文档：`/document` [AI沉淀](https://github.com/YYuRain/YYnoTomotachi/tree/main/document)
 
 - 启停 / 日志 / 故障：`document/running.md`
 - 架构总览：`document/overview.md`
