@@ -4,7 +4,7 @@
 
 ## 仓库
 
-GitHub（私有）：https://github.com/yangyu216413-creator/YYnoTomotachi，branch = `main`
+GitHub（私有）：https://github.com/YYuRain/YYnoTomotachi，branch = `main`
 
 ```bash
 git add -p && git commit -m "..." && git push

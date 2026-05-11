@@ -127,7 +127,7 @@ caffeinate -t 3600
 
 ## 代码同步（Git）
 
-仓库：https://github.com/yangyu216413-creator/YYnoTomotachi（私有），branch = `main`
+仓库：https://github.com/YYuRain/YYnoTomotachi（私有），branch = `main`
 
 改完代码后推送：
 
