@@ -16,9 +16,9 @@ __pycache__/
 .obsidian/
 .claude/
 
-# Obsidian 粘贴图（大文件，不入库）
-Pasted image *.png
-Pasted image *.jpg
+# Obsidian 粘贴图（根目录大文件不入库；me/img/ 下的允许追踪）
+/Pasted image *.png
+/Pasted image *.jpg
 
 # 空文件
 .md

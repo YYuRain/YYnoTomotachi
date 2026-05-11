@@ -2,6 +2,18 @@
 
 陪伴型 Telegram agent（非助手/非咨询师）。单用户 MVP，本地部署。
 
+## 仓库
+
+GitHub（私有）：https://github.com/yangyu216413-creator/YYnoTomotachi，branch = `main`
+
+```bash
+git add -p && git commit -m "..." && git push
+```
+
+`.gitignore` 已排除：`.env`、`data/`、`.venv/`、`.obsidian/`、`.claude/`、`Pasted image *.png`
+
+---
+
 ## 启动
 
 ```bash

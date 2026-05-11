@@ -125,6 +125,22 @@ caffeinate -t 3600
 | chat 返回空字符串 | MiniMax-M2 的 `<think>` 块占满 max_tokens。调高 `minimax.chat` 的 max_tokens（默认 1024）。 |
 | 模型加载时网络报错 | HF 被墙。第一次需要 Clash；之后 `HF_HUB_OFFLINE=1` 已经在 `main.py` 里强制设了，不应再联网。 |
 
+## 代码同步（Git）
+
+仓库：https://github.com/yangyu216413-creator/YYnoTomotachi（私有），branch = `main`
+
+改完代码后推送：
+
+```bash
+git add src/ scripts/ document/ CLAUDE.md README.md .gitignore   # 按改动范围选
+git commit -m "简短说明"
+git push
+```
+
+**不要** `git add data/` / `.env` / `.venv/` / `.claude/`——`.gitignore` 已排除，误 add 会泄漏 API key 和本地聊天记录。
+
+---
+
 ## 每次开机的最短手速版
 
 ```bash
