@@ -7,6 +7,108 @@
 
 ---
 
+## 2026-05-12 — 日常态从 INTP 偏向略 ENTP
+
+**触发**：用户："日常态的聊天有些平淡，希望 AI 感到聊天还'蛮有意思'，偶尔抖抖机灵，但不要刻意做作。目前比较 INTP，希望可以 ENTP 一点点，但不要太多。"
+
+**根因**：`System Prompt v0.0.1.md` baseline 把"平"压得太死——
+- 「日常闲聊时是平淡的——『嗯』『哦』『知道了』不丢人」 把 baseline 钉在被动应答
+- 「state 会明显变活」只有"聊到有趣的事"才触发——例外，不是 baseline
+- 「宁可平，不要浮」——直接把秤砣压到 INTP 那头
+
+**改动**（`System Prompt v0.0.1.md` 四处微调，每处都松一头但不放飞）：
+
+1. **态度·情绪起伏**：日常 baseline 从"平淡"→"带轻微兴致"。是带点好奇的平，不是死寂。
+2. **反应规则·正常闲聊**：从"正常接话+不主动反问+一条就够"→"接话带点自己的脑回路（吐槽/怪联想/突然想起的事），偶尔陈述句抛点小东西"。
+3. **幽默感**：「宁可平，不要浮」→「**怕做作 > 怕平淡**，但死气沉沉也不对劲。几条里偶尔抖一下，不是每条都抖」。
+4. **结尾总结**：「话不多」→「话不多但脑子转得不慢」。
+
+**保留的红线**："不刻意做作 / 不演热情 / 不演冷漠 / 不硬梗" 在反应规则、幽默感、绝对禁忌都仍在。
+
+**生效**：`load_persona_state()` 每轮重读 system prompt 文件，**无需重启**。
+
+---
+
+## 2026-05-12 — 短期上下文 `_recent` 持久化 + 召回记忆带形成日期
+
+**触发**：用户反馈"昨天才讨论的事情似乎今天就不记得了"。
+
+**诊断**（看 audit.jsonl）：
+1. `_recent` 是 `src/agent.py` 模块级 list，**bot 重启即清**——这两天我们重启好几次切模型
+2. memU `memory_flush` 事件批批 `new_items: 0`——单轮 flush 太小，模型抽不出条目
+3. memU 召回的是分类摘要，没有"昨天"这种时间锚
+
+**改动**：
+
+1. **`src/agent.py`：`_recent` 持久化到 `data/recent.json`**
+   - 模块加载即 `_load_recent()`（首次启动文件不存在静默回空）
+   - 每轮 `_save_recent()` 写盘（最近 12 轮、24 条消息）
+   - 重启后能直接接上短期对话
+
+2. **`src/memory.py::recall`：每条带形成日期**
+   - item 输出 `(2026-05-06) 用户倾向于平等的探讨...`（取 `created_at`）
+   - category 输出 `【habits｜更新于 2026-05-11】用户在饮食上...`（取 `updated_at`）
+
+3. **`src/prompts.py::_render_memory`**：告诉 AI 怎么用日期
+   - 几天内 → 当"刚聊过的事"自然带出
+   - 一个月以前 → 是"旧背景"，别假装 ta 此刻刚说
+
+**生效**：bot 重启后生效（2026-05-12 ~17:54 ready）。
+
+**预期体感**：跨日聊天能接上"昨天聊的"；AI 能自然区分"上周聊到 X" vs "上个月就有的旧背景"。
+
+---
+
+## 2026-05-12 — Jina Reader 401 + LibreSSL CONNECT bug 修复
+
+**触发**：用户反馈"bot 反映无法读取链接，发生鉴权错误"。
+
+**根因 1（Jina 401）**：`https://r.jina.ai/<url>` 匿名调用返回：
+```
+401 AuthenticationRequiredError
+You have been blocked from performing anonymous queries due to bad IP reputation.
+```
+Clash 出口 IP 信誉被 Jina 拉黑。注册免费 key（每月 1M token）即可。
+
+**根因 2（LibreSSL bug）**：加了 `JINA_API_KEY` 后仍返回空——`_run` 通过 `HTTPS_PROXY` env 让 curl 走 Clash 时，macOS LibreSSL 偶发 `SSL_ERROR_SYSCALL` 在 CONNECT tunnel；同样的命令显式 `curl -x http://127.0.0.1:7897 ...` 却稳定成功。
+
+**改动**：
+
+1. **`src/config.py`** 加 `jina_api_key` 字段
+2. **`src/tools.py::read_url`**：
+   - 带 `Authorization: Bearer $JINA_API_KEY`（设了 key 时）
+   - 用显式 `-x $TELEGRAM_PROXY` 走代理（不再依赖 env-var 模式）
+   - 识别 401 JSON 体，视作失败让 `_fetch_one_url` 退到 Exa 兜底
+3. **`.env` / `.env.example`**：加 `JINA_API_KEY=` 占位 + 注册引导
+
+**生效**：bot 重启后链接读取恢复（2026-05-12 ~17:54）。
+
+---
+
+## 2026-05-12 — 主聊天换 Sonnet 4.6 + memU 换 deepseek-v4-flash
+
+**触发**：用户："bot 模型换为 sonnet，openrouter 的，记忆 memu 层模型换为 deepseekv4flash"。
+
+**改动**：
+
+| 角色 | 旧 | 新 | 路径 |
+|------|----|----|------|
+| 主聊天 / 主动开场 | `openrouter/moonshotai/kimi-k2.6` | `openrouter/anthropic/claude-sonnet-4.6` | 改 `.env::OPENROUTER_MODEL` 一行 |
+| memU 抽取 / 分类 | MiniMax-M2.7 via :18082 shim | `deepseek/deepseek-v4-flash` via :18082 shim → OpenRouter | 加 `.env::MEMU_CHAT_MODEL` |
+
+**新增**：
+
+- `MEMU_CHAT_MODEL` env（`src/config.py::memu_chat_model`）：设了 → shim 走 OpenRouter；空 → 旧 MiniMax 路径
+- `src/llm_proxy.py` 启动时按 `MEMU_CHAT_MODEL` 决定上游 base_url + headers + 是否走 Clash 代理
+
+**为什么不让 memU 直连 OpenRouter**：`main.py::_purge_proxy_env` 清掉了代理 env-var，memU 内置 httpx 不会走 Clash 出不去。让 :18082 shim 兜底处理。
+
+**为什么 deepseek-v4-flash**：评测中等水平 + 便宜（$0.14/M in / $0.28/M out）+ 无 `<think>`（shim 的 strip 是 no-op）+ 中文 JSON 抽取够用。
+
+**生效**：bot 重启后启动日志显示 `provider=openrouter, model=anthropic/claude-sonnet-4.6`，shim `memU shim upstream: OpenRouter`。
+
+---
+
 ## 2026-05-10 — 新增 interest 聊法档：用户在兴头上时接住劲儿
 
 **触发**：用户反馈"用户在进入到感兴趣话题中时，可以适当的调整 bot 的情绪，目前的语气稍微有点扫兴"。

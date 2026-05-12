@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from . import availability, clock, emotion, interests, llm, memory, prompts, stickers, tools
 from .audit_log import audit
+from .config import settings
 from .persona import load_persona_state
 from .rhythm import deliver
 
@@ -26,14 +28,55 @@ SendSticker = Callable[[Path], Awaitable[None]]
 
 log = logging.getLogger(__name__)
 
-# 简单的短期对话记忆：最近 N 轮（非持久化；memU 管长期）
+# 短期对话记忆：最近 N 轮，**持久化到 data/recent.json**。
+# 重启后从盘上读回来，避免"昨天聊的今天不记得"的体感（之前 _recent 是模块级 list，重启即清）。
+# 注意这只是"最近若干轮原文"，不是 memU 的长期摘要——两者目的不同：
+# - _recent：让模型看到原始上下文，能精确接住代词、刚提过的事
+# - memU：长期 RAG 召回，跨日跨周的事
 _SHORT_WINDOW = 12
 _recent: list[dict[str, str]] = []
+_recent_loaded = False
+
+
+def _recent_path() -> Path:
+    return settings().root / "data" / "recent.json"
+
+
+def _load_recent() -> None:
+    """启动时调一次。文件缺失/损坏静默回到空 list。"""
+    global _recent, _recent_loaded
+    if _recent_loaded:
+        return
+    _recent_loaded = True
+    p = _recent_path()
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            _recent[:] = [m for m in data if isinstance(m, dict) and "role" in m and "content" in m]
+            log.info("loaded _recent: %d msgs from %s", len(_recent), p.name)
+    except Exception as e:
+        log.warning("load _recent failed (ignored): %s", e)
+
+
+def _save_recent() -> None:
+    """每轮 append 完调一次。失败静默——不阻塞主流程。"""
+    try:
+        p = _recent_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(_recent, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.debug("save _recent failed (ignored): %s", e)
 
 
 def _trim() -> None:
     if len(_recent) > _SHORT_WINDOW * 2:
         del _recent[: len(_recent) - _SHORT_WINDOW * 2]
+
+
+# 模块加载即读一次。bot 启动后第一次 import agent 就会触发。
+_load_recent()
 
 
 async def _build_turn(
@@ -264,6 +307,7 @@ async def handle_user_message(
     _recent.append({"role": "user", "content": history_user_text})
     _recent.append({"role": "assistant", "content": reply})
     _trim()
+    _save_recent()
 
     # 节奏化发送：
     # - max_piece_chars：硬上限（超了才切）

@@ -34,13 +34,15 @@ docker start memu-postgres          # memU 持久化（postgres）
 | `MINIMAX_API_KEY` | MiniMax key |
 | `MINIMAX_GROUP_ID` | MiniMax group id |
 | `MINIMAX_CHAT_MODEL` | 默认 `MiniMax-M2` |
-| `LLM_PROVIDER` | `openrouter`（当前，kimi-k2.6）/ `minimax` / `anthropic` |
-| `OPENROUTER_MODEL` | 默认 `moonshotai/kimi-k2.6`（主聊天模型） |
+| `LLM_PROVIDER` | `openrouter`（当前）/ `minimax` / `anthropic` |
+| `OPENROUTER_MODEL` | 主聊天模型；当前 `anthropic/claude-sonnet-4.6`（之前 `moonshotai/kimi-k2.6`，2026-05-12 切） |
 | `ANTHROPIC_API_KEY` | Claude key（LLM_PROVIDER=anthropic 时） |
 | `ANTHROPIC_MODEL` | 默认 `claude-opus-4-6` |
 | `ANTHROPIC_MODEL_AUX` | 默认 `claude-sonnet-4-6`（辅助 tier） |
 | `MEMU_METADATA_PROVIDER` | `postgres` |
 | `MEMU_DB_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/memu` |
+| `MEMU_CHAT_MODEL` | memU 抽取/分类模型；设了 → shim 走 OpenRouter（当前 `deepseek/deepseek-v4-flash`）；空 → 走 MiniMax（旧路径） |
+| `JINA_API_KEY` | Jina Reader 鉴权 key（网页正文读取，匿名易被 401）。免费注册：https://jina.ai/reader/ |
 | `LLM_PROXY_HOST` / `LLM_PROXY_PORT` | 默认 `127.0.0.1` / `18082`（strip-think shim） |
 | `OPENROUTER_API_KEY` | OpenRouter key（主聊天 + `scripts/eval_*`） |
 | `OPENROUTER_BASE_URL` | 默认 `https://openrouter.ai/api/v1` |
@@ -57,8 +59,8 @@ docker start memu-postgres          # memU 持久化（postgres）
 | `src/llm.py` | LLM 统一门面（openrouter/minimax/anthropic 分发，支持 tier） |
 | `src/minimax.py` | MiniMax chat/chat_json/embed |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
-| `src/llm_proxy.py` | 本地 strip-think shim（:18082）—— memU 内部抽取的 LLM 走这里，剥 `<think>` 后再回 memU |
-| `src/memory.py` | memU 封装（recall/memorize/flush） |
+| `src/llm_proxy.py` | 本地 memU 上游 shim（:18082）：按 `MEMU_CHAT_MODEL` 路由 OpenRouter（带 Clash）/MiniMax，永远剥 `<think>` |
+| `src/memory.py` | memU 封装（recall/memorize/flush）；recall 输出每条带形成日期 `(YYYY-MM-DD)` |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
@@ -67,7 +69,7 @@ docker start memu-postgres          # memU 持久化（postgres）
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
-| `src/agent.py` | 对话 turn 流水线 + generate_opener |
+| `src/agent.py` | 对话 turn 流水线 + generate_opener；`_recent` 持久化 `data/recent.json`（重启接续短期上下文） |
 | `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate |
 | `src/bot.py` | python-telegram-bot |
 | `src/main.py` | 统一启停 |
@@ -82,6 +84,7 @@ docker start memu-postgres          # memU 持久化（postgres）
 - **SQLite** `data/app.sqlite`：interests, reply_samples, last_interaction, proactive_fires, persona_snapshots
 - **memU** via **Postgres** `localhost:5432/memu`（容器 `memu-postgres`）
 - **HuggingFace 模型缓存**：`~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`
+- **本地状态文件**：`data/recent.json`（短期上下文 12 轮）；`data/audit.jsonl`（审计事件流）
 - **静态资源**：`data/stickers/*` 表情包（文件名当 tag）；`data/eval/run_*.{jsonl,md}` 模型评测产物
 
 ## Agent Reach 工具

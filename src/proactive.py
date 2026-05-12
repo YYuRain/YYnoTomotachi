@@ -119,15 +119,24 @@ async def decide(now: datetime | None = None) -> Optional[dict[str, Any]]:
     """返回 None = 不主动；否则返回 {why, user_probably_doing, opener_angle}。"""
     now = now or datetime.now()
 
-    # 硬门（夜间不再过滤——交给下面的软门 LLM 看 user_active_score_now 判断）
+    # 硬门（夜间不再过滤——交给下面的软门 LLM 看 user_active_score_now 判断）。
+    # 每个硬门拦截都打 audit，方便事后排查"为啥这段时间没主动发"——之前 silent return 的话
+    # 看 audit 只见 scheduler 触发不见 decision，根本不知道是 LLM 没说还是硬门拦了。
     idle_sec = availability.seconds_since_last_interaction()
-    if idle_sec < MIN_GAP_FROM_USER_SEC:
-        return None
-    last_fire = _last_fire_ts()
-    if last_fire and (now - last_fire).total_seconds() < MIN_GAP_FROM_SELF_SEC:
-        return None
     today_count = _count_today()
+    last_fire = _last_fire_ts()
+    if idle_sec < MIN_GAP_FROM_USER_SEC:
+        audit("proactive_decision", should=False, why="hard_gate:user_cooldown",
+              ctx={"idle_min": round(idle_sec / 60, 1), "min_gap_min": MIN_GAP_FROM_USER_SEC // 60})
+        return None
+    if last_fire and (now - last_fire).total_seconds() < MIN_GAP_FROM_SELF_SEC:
+        audit("proactive_decision", should=False, why="hard_gate:self_cooldown",
+              ctx={"since_last_fire_min": round((now - last_fire).total_seconds() / 60, 1),
+                   "min_gap_min": MIN_GAP_FROM_SELF_SEC // 60})
+        return None
     if today_count >= DAILY_CAP:
+        audit("proactive_decision", should=False, why="hard_gate:daily_cap",
+              ctx={"opens_today": today_count, "cap": DAILY_CAP})
         return None
 
     score = availability.score(now.weekday(), now.hour)
@@ -154,6 +163,8 @@ async def decide(now: datetime | None = None) -> Optional[dict[str, Any]]:
         )
     except Exception as e:
         log.debug("proactive decide failed: %s", e)
+        audit("proactive_decision", should=False, why=f"llm_error:{type(e).__name__}",
+              ctx={**ctx, "error": str(e)[:200]})
         return None
 
     if not isinstance(data, dict) or not data.get("should"):

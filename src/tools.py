@@ -264,7 +264,26 @@ async def search_web(query: str) -> str:
 
 
 async def read_url(url: str) -> str:
-    """通过 Jina Reader 读取网页正文（前 600 字）。"""
+    """通过 Jina Reader 读取网页正文（前 600 字）。
+
+    Jina 对匿名查询限速，IP 信誉差时直接 401。设了 JINA_API_KEY 就带 Authorization 鉴权。
+    返回的 401 / AuthenticationRequiredError JSON 当作失败让上游走 Exa 兜底。
+    """
+    from .config import settings as _settings
     reader_url = f"https://r.jina.ai/{url}"
-    raw = await _run("curl", "-s", "--max-time", "7", reader_url, proxy=True)
-    return raw[:600] if raw else ""
+    s = _settings()
+    # 显式 -x 比 HTTPS_PROXY env 稳——env 模式下 LibreSSL 偶发 SSL_ERROR_SYSCALL
+    args = ["curl", "-s", "--max-time", "10"]
+    if s.telegram_proxy:
+        args += ["-x", s.telegram_proxy]
+    if s.jina_api_key:
+        args += ["-H", f"Authorization: Bearer {s.jina_api_key}"]
+    args.append(reader_url)
+    raw = await _run(*args)  # 不再依赖 proxy=True 设 env，env_var 与显式 -x 双用易冲突
+    if not raw:
+        return ""
+    # Jina 失败时返回 JSON 错误体，识别后视为失败让 _fetch_one_url 走 Exa
+    if raw.lstrip().startswith("{") and ("AuthenticationRequiredError" in raw or '"code":4' in raw):
+        log.info("jina reader 鉴权/限流失败：%s", raw[:120])
+        return ""
+    return raw[:600]

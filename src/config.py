@@ -43,6 +43,7 @@ class Settings:
 
     memu_metadata_provider: str
     memu_db_url: str
+    memu_chat_model: str       # memU 内部抽取/分类的模型（设了就走 OpenRouter；空则回退 MiniMax via shim）
 
     embed_server_host: str
     embed_server_port: int
@@ -50,6 +51,9 @@ class Settings:
 
     llm_proxy_host: str
     llm_proxy_port: int
+
+    # Jina Reader（read_url 用）。空则匿名调用，但 IP 被风控时会 401，建议注册免费 key
+    jina_api_key: str
 
     # OpenRouter
     openrouter_api_key: str
@@ -83,11 +87,13 @@ def load_settings() -> Settings:
         anthropic_base_url=_opt("ANTHROPIC_BASE_URL", "").rstrip("/"),
         memu_metadata_provider=_opt("MEMU_METADATA_PROVIDER", "inmemory"),
         memu_db_url=_opt("MEMU_DB_URL", ""),
+        memu_chat_model=_opt("MEMU_CHAT_MODEL", ""),
         embed_server_host=_opt("EMBED_SERVER_HOST", "127.0.0.1"),
         embed_server_port=int(_opt("EMBED_SERVER_PORT", "18080")),
         embed_model_name=_opt("EMBED_MODEL_NAME", "BAAI/bge-small-zh-v1.5"),
         llm_proxy_host=_opt("LLM_PROXY_HOST", "127.0.0.1"),
         llm_proxy_port=int(_opt("LLM_PROXY_PORT", "18082")),
+        jina_api_key=_opt("JINA_API_KEY", ""),
         openrouter_api_key=_opt("OPENROUTER_API_KEY", ""),
         openrouter_base_url=_opt("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
         openrouter_model=_opt("OPENROUTER_MODEL", ""),

@@ -46,15 +46,23 @@ def _get_service():
 
     s = settings()
     embed_base = f"http://{s.embed_server_host}:{s.embed_server_port}/v1"
-    # 指向本地 strip-think shim（src.llm_proxy），它转发到 MiniMax 后剥 <think>。
-    # 不直连 MiniMax 是因为：MiniMax-M2 输出带 <think> 块，memU 内置 OpenAI 客户端
-    # 不知道剥，会把 raw content 写进 memory_categories.summary，admin UI 直接看到。
+    # memU 内部 LLM 走本地 :18082 shim（src.llm_proxy）。shim 内部根据 MEMU_CHAT_MODEL 决定上游：
+    # - 设了 MEMU_CHAT_MODEL → 走 OpenRouter（带 Clash 代理；推荐 deepseek-v4-flash）
+    # - 空 → 走 MiniMax 直连（剥 <think>）
+    # 不直连 OpenRouter 是因为 _purge_proxy_env() 清了代理环境变量，memU 内置 httpx 拿不到 Clash 出不去
     chat_base = f"http://{s.llm_proxy_host}:{s.llm_proxy_port}/v1"
+    if s.memu_chat_model and s.openrouter_api_key:
+        memu_chat_key = s.openrouter_api_key
+        memu_chat_model = s.memu_chat_model
+    else:
+        memu_chat_key = s.minimax_api_key  # shim 透传到上游
+        memu_chat_model = s.minimax_chat_model
+
     llm_profiles: dict[str, dict[str, Any]] = {
         "default": {
             "base_url": chat_base,
-            "api_key": s.minimax_api_key,  # shim 透传到上游，本地不校验
-            "chat_model": s.minimax_chat_model,
+            "api_key": memu_chat_key,
+            "chat_model": memu_chat_model,
             "client_backend": "httpx",
         },
         "embedding": {
@@ -90,14 +98,29 @@ def _get_service():
         },
     )
     log.info(
-        "memU service initialized (provider=%s, zh prompts enabled)",
+        "memU service initialized (db=%s, chat=%s)",
         s.memu_metadata_provider,
+        memu_chat_model,
     )
     return _service
 
 
+def _fmt_date(ts_str: str) -> str:
+    """memU 时间戳是 '2026-05-06 09:34:32.009219+00:00'。截前 10 位拿日期。"""
+    if not ts_str:
+        return ""
+    return str(ts_str)[:10]
+
+
 async def recall(user_text: str, *, top_k: int = 3) -> list[str]:
-    """返回若干记忆片段（字符串）。失败返回空 list，不阻塞主流程。"""
+    """返回若干记忆片段（字符串），每条带形成日期。失败返回空 list，不阻塞主流程。
+
+    snippet 格式：
+    - item: `(2026-05-06) 用户倾向于平等的探讨交流...`
+    - category: `【habits｜更新于 2026-05-11】用户在饮食上偏好快餐...`
+
+    AI 看到日期能区分"刚聊到的"和"上个月就有的旧背景"。
+    """
     try:
         svc = _get_service()
         queries = [{"role": "user", "content": {"text": user_text}}]
@@ -108,14 +131,20 @@ async def recall(user_text: str, *, top_k: int = 3) -> list[str]:
 
     snippets: list[str] = []
     for item in (result.get("items") or [])[:top_k]:
-        summary = item.get("summary") or ""
-        if summary:
-            snippets.append(summary.strip())
+        summary = (item.get("summary") or "").strip()
+        if not summary:
+            continue
+        date = _fmt_date(item.get("created_at") or item.get("updated_at") or "")
+        snippets.append(f"({date}) {summary}" if date else summary)
     if not snippets:
         for cat in (result.get("categories") or [])[:top_k]:
-            summary = cat.get("summary") or cat.get("description") or ""
-            if summary:
-                snippets.append(f"【{cat.get('name','')}】{summary.strip()}")
+            summary = (cat.get("summary") or cat.get("description") or "").strip()
+            if not summary:
+                continue
+            name = cat.get("name", "")
+            date = _fmt_date(cat.get("updated_at") or cat.get("created_at") or "")
+            head = f"{name}｜更新于 {date}" if date else name
+            snippets.append(f"【{head}】{summary}")
 
     # 让日志里能看到召回了什么，方便排查"AI 不记得"类问题
     log.info("recall query=%r → %d hits%s",

@@ -175,6 +175,8 @@ messages.append({"role": "user", "content": user_msg})
 | agent 说"看不了链接" | tool_context 注入 system prompt 末尾，MiniMax 忽略 | 改注入用户消息前缀 |
 | xhslink 短链读不到内容 | Exa 搜索这个 URL 返回 GitHub 的 "xhslink resolver" 项目 | 先 `_resolve_url` 跟随重定向拿真实 URL，再提取 note_id + xsec_token |
 | xhs read 24 字符 ID 失败 | 某些帖子路径是 `discovery/item/` 而非 `explore/`，xsec_token 必传 | 从 query string 解析 xsec_token 并明确传参 |
+| Jina Reader 401 AuthenticationRequiredError | Clash 出口 IP 被 Jina 标记为 bad reputation，匿名查询拒绝 | `.env` 加 `JINA_API_KEY`；`read_url` 带 `Authorization: Bearer` |
+| `read_url` 在 macOS 静默返回空（curl `SSL_ERROR_SYSCALL`） | LibreSSL 通过 `HTTPS_PROXY` env-var 做 CONNECT tunnel 偶发挂；同样命令显式 `-x` 走代理却稳 | `read_url` 改成显式 `curl -x $TELEGRAM_PROXY ...`，不再依赖 env 模式 |
 
 ---
 
@@ -200,7 +202,7 @@ curl -s --max-time 7 --proxy http://127.0.0.1:7897 "https://r.jina.ai/https://ex
 
 - **B 站视频**：`yt-dlp` 部分视频需要登录才能获取完整信息，未登录时只返回标题。
 - **YouTube**：国内需代理，`_read_video` 首次失败会自动用代理重试。
-- **Jina Reader**：需代理（国内直连超时），慢于 Exa。主路径用于通用网页，XHS/视频已有专用路径。
+- **Jina Reader**：需代理（国内直连超时），慢于 Exa。主路径用于通用网页，XHS/视频已有专用路径。**2026-05-12 起需 `JINA_API_KEY`**（Clash 出口 IP 信誉差，匿名查询会 401；免费 key 注册：https://jina.ai/reader/，每月 1M token 够单用户用）。空 key 时 `read_url` 直接返回空，`_fetch_one_url` 退到 Exa 兜底。
 - **32 字符 XHS note_id**：标准 24 字符 ID 可读，部分较新格式的 32 字符 ID 未经充分测试。
 - **工具超时**：全部 8 秒硬超时（`_TIMEOUT = 8`），超时静默返回空字符串，不阻塞主流程。
 

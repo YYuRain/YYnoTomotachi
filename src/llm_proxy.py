@@ -4,12 +4,13 @@
      MiniMax-M2 输出带 `<think>...</think>`，memU 内置 OpenAI 客户端不知道剥，
      于是 `memory_categories.summary` 字段全被 think 内容污染（admin UI 直接可见）。
 
-方案：在 memU 和 MiniMax 之间架一层 shim：
-     - 监听本地端口（默认 18082），暴露 `/v1/chat/completions`
-     - 收到请求 → httpx 转发到 MiniMax（base_url 来自 settings）
-     - 拿到响应 → 把 message.content 里的 <think>...</think> 剥掉
-     - 原样返回给 memU
-     `memory.py` 的 default LLM profile 指向这个 shim 即可，对 memU 透明。
+上游路由（由 settings 决定，启动时一次性绑定）：
+- 设了 `MEMU_CHAT_MODEL` → OpenRouter（base=`OPENROUTER_BASE_URL`，key=`OPENROUTER_API_KEY`，
+  走 Clash 代理 `TELEGRAM_PROXY`；deepseek-v4-flash 等无 think 模型 strip 是 no-op，零代价）
+- 否则 → MiniMax 直连（不走代理；strip <think> 防 memory_categories.summary 污染）
+
+shim 永远剥 `<think>`：对没 think 的模型是 no-op；让 memory.py 的 default profile
+不必关心上游是谁，统一指向 :18082 即可（且统一吃 _purge_proxy_env 后的环境）。
 
 不做：
 - 流式（memU 没用 stream）。stream=true 的请求直接报 501，避免静默错。
@@ -36,15 +37,36 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         s = settings()
-        _client = httpx.AsyncClient(
-            base_url=s.minimax_base_url,
-            headers={
-                "Authorization": f"Bearer {s.minimax_api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=120.0,
-            trust_env=False,  # 防 Clash 劫持
-        )
+        if s.memu_chat_model and s.openrouter_api_key:
+            # OpenRouter 路径：走 Clash（_purge_proxy_env 清掉了 env，必须显式传 proxy）
+            kwargs: dict[str, Any] = {
+                "base_url": s.openrouter_base_url,
+                "headers": {
+                    "Authorization": f"Bearer {s.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/YYuRain/YYnoTomotachi",
+                    "X-Title": "AIDemo memU",
+                },
+                "timeout": 120.0,
+                "trust_env": False,
+            }
+            if s.telegram_proxy:
+                kwargs["proxy"] = s.telegram_proxy
+            _client = httpx.AsyncClient(**kwargs)
+            log.info("memU shim upstream: OpenRouter (model from request, proxy=%s)",
+                     s.telegram_proxy or "<none>")
+        else:
+            # MiniMax 老路径：直连，不走代理
+            _client = httpx.AsyncClient(
+                base_url=s.minimax_base_url,
+                headers={
+                    "Authorization": f"Bearer {s.minimax_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=120.0,
+                trust_env=False,  # 防 Clash 劫持
+            )
+            log.info("memU shim upstream: MiniMax (%s)", s.minimax_base_url)
     return _client
 
 

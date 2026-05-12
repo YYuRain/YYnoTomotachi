@@ -11,13 +11,23 @@
 ```python
 MemoryService(
   llm_profiles={
-    "default":   {"base_url": MINIMAX_BASE, "api_key": KEY, "chat_model": "MiniMax-M2", "client_backend": "httpx"},
-    "embedding": {"base_url": MINIMAX_BASE, "api_key": KEY, "embed_model": "embo-01"},
+    # default 永远指向本地 :18082 shim（src/llm_proxy.py），shim 内部根据 settings 选上游
+    "default":   {"base_url": "http://127.0.0.1:18082/v1", "api_key": ..., "chat_model": ..., "client_backend": "httpx"},
+    # embedding 走本地 :18080 shim（src/embed_server.py，bge-small-zh）
+    "embedding": {"base_url": "http://127.0.0.1:18080/v1", "api_key": "local", "embed_model": "BAAI/bge-small-zh-v1.5"},
   },
-  database_config={"metadata_store": {"provider": "inmemory"}},
+  database_config={"metadata_store": {"provider": "postgres", "dsn": ...}},
   retrieve_config={"method": "rag"},
+  memorize_config={"memory_type_prompts": ..., "memory_categories": ..., "default_category_summary_prompt": ...},
 )
 ```
+
+**chat 上游由 `MEMU_CHAT_MODEL` 环境变量决定**（2026-05-12 起）：
+- 设了 `MEMU_CHAT_MODEL`（如 `deepseek/deepseek-v4-flash`）→ shim 走 OpenRouter，带 Clash 代理
+- 空 → shim 走 MiniMax 直连（旧路径，剥 `<think>`）
+
+`memory.py` 不直连 OpenRouter 是因为 `main.py::_purge_proxy_env` 清掉了代理环境变量，
+memU 内置 httpx 客户端不会走 Clash。让 shim 兜底处理上游和代理。详见 [strip-think shim 章节](#strip-think-shim2026-05-07-加--防-think-块污染-category-summary)。
 
 ## MemU 的 API 使用方式
 
@@ -132,25 +142,29 @@ asyncio.run(m())
 
 ## strip-think shim（2026-05-07 加）—— 防 think 块污染 category summary
 
-**症状**：admin UI 看到的 `memory_categories.summary` 字段全是 `<think>用户提供了一个分类的旧摘要...</think>` 内容。
+**最初症状**：admin UI 看到的 `memory_categories.summary` 字段全是 `<think>用户提供了一个分类的旧摘要...</think>` 内容。
 
 **根因**：memU 内部 category summary 是直接拿 LLM raw response 写库，不走 XML 解析。MiniMax-M2 输出带 `<think>...</think>` 块，memU 内置 OpenAI 风格客户端**不知道**剥（这是 MiniMax 模型行为），raw content 直接进 DB。
 （`memory_items` 没受影响，因为我们的 prompt 让 extraction 输出 XML，memU 的 XML 解析自然过滤掉非 `<item>` 包裹的 think。）
 
-**修法**：架本地 shim `src/llm_proxy.py`（FastAPI :18082）转发到 MiniMax 时剥 `<think>`：
-
-```python
-# memory.py::_get_service
-chat_base = f"http://{s.llm_proxy_host}:{s.llm_proxy_port}/v1"  # ← 走 shim
-llm_profiles = {
-    "default": {"base_url": chat_base, "api_key": ..., "chat_model": "MiniMax-M2.7", ...},
-    "embedding": {"base_url": "http://127.0.0.1:18080/v1", ...},  # 本地 bge
-}
-```
+**架构**：本地 shim `src/llm_proxy.py`（FastAPI :18082）作为 memU 与上游 LLM 之间的代理层。
 
 `main.py` 启动时一并起 shim（先于 bot ready）。对 memU 透明——它依然以为自己在调一个普通的 OpenAI 兼容 chat 端点。
 
-**清理已污染数据**：
+### 上游路由（2026-05-12 扩展）
+
+shim 启动时按 `settings()` 一次性绑定上游：
+
+| 条件 | 上游 | 代理 | 为什么 |
+|------|------|------|--------|
+| `MEMU_CHAT_MODEL` 设了（如 `deepseek/deepseek-v4-flash`）+ `OPENROUTER_API_KEY` 有 | OpenRouter | 显式 `TELEGRAM_PROXY`（Clash） | 当前推荐：deepseek-v4-flash 便宜（$0.14/M）、无 think、中文抽取够用 |
+| 否则 | MiniMax 直连 | 不走代理 | 旧路径；MiniMax-M2.7 带 `<think>` 必须经 shim 剥 |
+
+shim 永远剥 `<think>`：对没 think 块的模型是 no-op，零代价。这样 memory.py 不必关心上游是谁，统一指向 :18082。
+
+切回 MiniMax：把 `.env` 的 `MEMU_CHAT_MODEL` 留空重启即可。
+
+### 清理已污染数据
 
 ```sql
 -- 一次性清理已污染的 summary

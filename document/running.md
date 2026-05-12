@@ -7,7 +7,7 @@
 - 本机走 Clash 类代理，本地端口 `127.0.0.1:7897`（`.env` 里 `TELEGRAM_PROXY` 写的就是这个）。
   Telegram API 国内直连不通，**bot 启动时 Clash 必须在运行**。
 - `.venv/` 已经建好（`python3 -m venv .venv && .venv/bin/pip install -e .`）。
-- `.env` 已经填好（token、chat id、MiniMax key、proxy）。
+- `.env` 已经填好（token、chat id、`OPENROUTER_API_KEY`/`MINIMAX_API_KEY`、proxy；可选 `MEMU_CHAT_MODEL` 切换 memU 上游、`JINA_API_KEY` 让网页正文读取走鉴权）。
 - HF 模型已经缓存在 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`。
   第一次启动时联网下载过一次，之后靠缓存，不再联网。
 - **memU 持久化容器在运行**：`docker ps | grep memu-postgres`。没起就 `docker start memu-postgres`。

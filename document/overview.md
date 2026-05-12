@@ -35,7 +35,7 @@
 │                                                      │
 │  本地服务（main.py 内 asyncio task）                   │
 │   ├─ embed_server  :18080  bge-small-zh embedding shim │
-│   └─ llm_proxy     :18082  memU→MiniMax 中间 strip-think│
+│   └─ llm_proxy     :18082  memU 上游 shim（OpenRouter/MiniMax 路由+strip-think）│
 │                                                      │
 │  APScheduler                                         │
 │   ├─ decay_job           每 1h  interests.decay_tick │
@@ -56,8 +56,8 @@
 | `src/storage.py` | SQLite 表：interests / reply_samples / last_interaction / persona_snapshots(预留) | ✅ MVP |
 | `src/minimax.py` | 聊天走 OpenAI 兼容端点；embed 走 MiniMax 原生格式；自动剥 `<think>` | ✅ MVP |
 | `src/embed_server.py` | 本地 OpenAI 兼容 embedding shim：FastAPI + sentence-transformers (bge-small-zh) :18080 | ✅ MVP |
-| `src/llm_proxy.py` | 本地 strip-think shim :18082。memU 内部抽取的 LLM 走这里，剥 `<think>` 后再回 memU（防 think 污染 memory_categories.summary） | ✅ 接入（2026-05-07） |
-| `src/memory.py` | memU MemoryService 封装；chat=本地 shim:18082→MiniMax，embedding=本地 shim:18080；rolling buffer → JSON → memorize | ✅ MVP |
+| `src/llm_proxy.py` | 本地 memU 上游 shim :18082。按 `MEMU_CHAT_MODEL` 自动路由：OpenRouter（带 Clash）或 MiniMax 直连；永远剥 `<think>` 防污染 `memory_categories.summary` | ✅ 接入（2026-05-07，2026-05-12 加 OpenRouter 路由） |
+| `src/memory.py` | memU MemoryService 封装；chat=本地 shim:18082→上游，embedding=本地 shim:18080；rolling buffer → JSON → memorize；recall 携带形成日期 | ✅ MVP |
 | `src/interests.py` | 话题抽取（轻量 LLM）+ 热度 bump/decay/top/cold | ✅ MVP |
 | `src/availability.py` | 每次回消息记 (weekday, hour)；`score` 给 proactive 用 | ✅ MVP（带冷启动先验） |
 | `src/emotion.py` | 聊天模式判档：casual / empathy / depth / interest | ✅ MVP |
@@ -68,7 +68,7 @@
 | `src/openrouter.py` | OpenAI 兼容 httpx 客户端；主聊天（LLM_PROVIDER=openrouter，2026-05-10 起）+ `scripts/eval_*`；走 Clash 代理 | ✅ 接入（2026-05-08） |
 | `src/prompts.py` | 装配 system prompt + `PROACTIVE_OPENER_INSTRUCTIONS` + 表情包段 + 四档情绪指令（empathy/depth/interest） | ✅ MVP |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
-| `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener` | ✅ MVP |
+| `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener`；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
 | `src/scheduler.py` | APScheduler 四个 job：decay/memu_flush/proactive/persona_consolidate | ✅ MVP |
 | `src/bot.py` | `python-telegram-bot`，白名单单用户；text + photo handler；`send_sticker` 回调 | ✅ MVP |
 | `src/main.py` | 统一启动/关停（embed_server + llm_proxy + bot + scheduler） | ✅ MVP |
@@ -86,10 +86,12 @@
   - 每 6 轮或 15 分钟把 rolling buffer flush 成 `data/memu_buffer/conv_*.json`，调 `service.memorize`
   - 每条用户消息到达时 `service.retrieve` 做主动召回
   - 容器：`docker memu-postgres`（pgvector），`localhost:5432/memu`
-  - **memU 内部 LLM 调用走本地 :18082 shim**（`src/llm_proxy.py`）剥 `<think>` 后再回 memU
+  - **memU 内部 LLM 调用走本地 :18082 shim**（`src/llm_proxy.py`）；shim 按 `MEMU_CHAT_MODEL` 选 OpenRouter（默认 deepseek-v4-flash）或 MiniMax，永远剥 `<think>`
 - **静态资源**：
   - `data/stickers/*.{jpg,png,gif,webp}` — 表情包，文件名（去后缀）当 tag
   - `data/eval/run_<ts>.{jsonl,md,scores.jsonl,scores.md}` — 模型评测产物（`scripts/eval_*`）
+  - `data/recent.json` — `_recent` 持久化（最近 12 轮短期上下文，重启接续；`src/agent.py` 写）
+  - `data/audit.jsonl` — 审计事件流（`src/audit_log.py` 写，admin UI :18081 读）
 
 ## 扩展点（为下一期明确预留）
 
