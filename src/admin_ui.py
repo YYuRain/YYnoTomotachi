@@ -104,6 +104,7 @@ class CategoryPatch(BaseModel):
 _INDEX_HTML = """<!doctype html>
 <html lang="zh"><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>AIDemo · 记忆浏览</title>
 <style>
   :root { --fg:#222; --muted:#777; --bd:#e4e4e4; --bg:#fafafa; --accent:#1a6cff; --danger:#d9554f; }
@@ -156,6 +157,40 @@ _INDEX_HTML = """<!doctype html>
   .audit-summary { max-width: 700px; word-break: break-word; }
   .audit-summary .k { color: var(--muted); font-size: 12px; margin-right: 4px; }
   pre.json { background: #f7f7f7; border: 1px solid var(--bd); border-radius: 6px; padding: 10px; font-size: 12px; overflow-x: auto; max-height: 60vh; margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+  /* 表格容器横向滚动——窄屏时表格不破布局，可以左右滑 */
+  .tab { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tab table { min-width: 100%; }
+
+  /* 移动端断点 */
+  @media (max-width: 720px) {
+    body { font-size: 13px; }
+    header { padding: 10px 12px; flex-wrap: wrap; gap: 6px 12px; }
+    header h1 { font-size: 14px; flex: 0 0 100%; }
+    header .stats { font-size: 12px; display: flex; gap: 10px; flex-wrap: wrap; }
+    header .stats span { white-space: nowrap; }
+    nav { padding: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    nav button { padding: 12px 14px; font-size: 13px; flex-shrink: 0; min-height: 44px; }
+    main { padding: 10px 12px; }
+    .toolbar { gap: 6px; }
+    .toolbar input[type=search] { min-width: 0; flex: 1 1 180px; }
+    .toolbar select, .toolbar input { font-size: 13px; padding: 8px 10px; }
+    th, td { padding: 8px 8px; font-size: 12px; }
+    td.summary, .audit-summary { max-width: 60vw; }
+    /* 触控更友好的按钮 */
+    button.op { padding: 7px 11px; font-size: 12px; min-height: 32px; }
+    .modal { padding: 14px; }
+    .modal textarea { min-height: 100px; }
+    .modal .actions button { padding: 8px 14px; }
+    pre.json { font-size: 11px; max-height: 50vh; }
+  }
+
+  /* 防止 iOS Safari 自动放大 input（字号 < 16px 会触发） */
+  @media (max-width: 720px) {
+    .toolbar input[type=search],
+    .toolbar select,
+    .modal textarea { font-size: 16px; }
+  }
 </style>
 </head><body>
 
