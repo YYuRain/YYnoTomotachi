@@ -129,17 +129,11 @@ async def _cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """admin 用——返回当前 cloudflared 临时 admin UI URL（每次 cloudflared 重启会变）。
-
-    给两个链接：
-    - 纯 URL（输地址栏 / 桌面浏览器用，会弹基本认证框）
-    - 自带 user:pwd 的 URL（手机点链接用，省去手动输；Telegram 内嵌浏览器/iOS Safari 通常不弹框）
-    """
+    """admin 用——返回当前 cloudflared 临时 admin UI URL（每次 cloudflared 重启会变）。"""
     chat = update.effective_chat
     if chat is None or not users.is_admin(chat.id):
         return
     import os, re
-    from urllib.parse import quote
     log_path = "/shared/cf.log"
     url = ""
     if os.path.exists(log_path):
@@ -158,13 +152,7 @@ async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     user_env = os.environ.get("ADMIN_UI_USER", "")
-    pwd_env = os.environ.get("ADMIN_UI_PASSWORD", "")
-    msg = f"admin UI:\n{url}"
-    if user_env and pwd_env:
-        host = url.replace("https://", "", 1)
-        # URL-encode 凭证防特殊字符；浏览器会自动用 Basic Auth 提交
-        embedded = f"https://{quote(user_env, safe='')}:{quote(pwd_env, safe='')}@{host}"
-        msg += f"\n\n手机一点直接进（自带凭证，Telegram 里点这条）：\n{embedded}"
+    msg = f"admin UI: {url}\n\n首次访问会提示输用户名/密码（用户名：{user_env or '设的那个'}）"
     await context.bot.send_message(chat_id=chat.id, text=msg)
 
 
