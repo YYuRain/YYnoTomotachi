@@ -21,7 +21,11 @@ def main() -> None:
     from src.admin_ui import build_app
 
     app = build_app()
-    uvicorn.run(app, host="127.0.0.1", port=18081, log_level="info")
+    # bind 全 interface 让 docker port mapping 工作；docker-compose 把 host 端口绑死 127.0.0.1，
+    # 所以暴露面没扩大——本机访问、SSH 隧道访问都 OK，公网仍打不到
+    host = os.environ.get("ADMIN_HOST", "0.0.0.0")
+    port = int(os.environ.get("ADMIN_PORT", "18081"))
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
