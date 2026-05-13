@@ -80,29 +80,36 @@ def _today_range_utc() -> tuple[datetime, datetime]:
     return start_local, end_local
 
 
-def _count_today() -> int:
+def _count_today(user_id: int) -> int:
     start, end = _today_range_utc()
     with session() as sess:
         stmt = select(func.count(ProactiveFire.id)).where(
-            ProactiveFire.ts >= start, ProactiveFire.ts < end
+            ProactiveFire.user_id == user_id,
+            ProactiveFire.ts >= start,
+            ProactiveFire.ts < end,
         )
         return int(sess.execute(stmt).scalar() or 0)
 
 
-def _last_fire_ts() -> Optional[datetime]:
+def _last_fire_ts(user_id: int) -> Optional[datetime]:
     with session() as sess:
         row = sess.execute(
-            select(ProactiveFire).order_by(ProactiveFire.ts.desc()).limit(1)
+            select(ProactiveFire)
+            .where(ProactiveFire.user_id == user_id)
+            .order_by(ProactiveFire.ts.desc())
+            .limit(1)
         ).scalar_one_or_none()
         return row.ts if row else None
 
 
 def record_fire(
-    *, why: str, user_probably_doing: str, opener_angle: str, opener_text: str
+    user_id: int,
+    *, why: str, user_probably_doing: str, opener_angle: str, opener_text: str,
 ) -> None:
     with session() as sess:
         sess.add(
             ProactiveFire(
+                user_id=user_id,
                 ts=datetime.now(),
                 why=why[:80],
                 user_probably_doing=user_probably_doing[:80],
@@ -111,36 +118,40 @@ def record_fire(
             )
         )
         sess.commit()
-    audit("proactive_fire", why=why, user_probably_doing=user_probably_doing,
+    audit("proactive_fire", user_id=user_id, why=why,
+          user_probably_doing=user_probably_doing,
           opener_angle=opener_angle, opener_text=opener_text)
 
 
-async def decide(now: datetime | None = None) -> Optional[dict[str, Any]]:
+async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str, Any]]:
     """返回 None = 不主动；否则返回 {why, user_probably_doing, opener_angle}。"""
     now = now or datetime.now()
 
     # 硬门（夜间不再过滤——交给下面的软门 LLM 看 user_active_score_now 判断）。
-    # 每个硬门拦截都打 audit，方便事后排查"为啥这段时间没主动发"——之前 silent return 的话
-    # 看 audit 只见 scheduler 触发不见 decision，根本不知道是 LLM 没说还是硬门拦了。
-    idle_sec = availability.seconds_since_last_interaction()
-    today_count = _count_today()
-    last_fire = _last_fire_ts()
+    # 每个硬门拦截都打 audit，方便事后排查"为啥这段时间没主动发"。
+    idle_sec = availability.seconds_since_last_interaction(user_id)
+    today_count = _count_today(user_id)
+    last_fire = _last_fire_ts(user_id)
     if idle_sec < MIN_GAP_FROM_USER_SEC:
-        audit("proactive_decision", should=False, why="hard_gate:user_cooldown",
-              ctx={"idle_min": round(idle_sec / 60, 1), "min_gap_min": MIN_GAP_FROM_USER_SEC // 60})
+        audit("proactive_decision", user_id=user_id, should=False,
+              why="hard_gate:user_cooldown",
+              ctx={"idle_min": round(idle_sec / 60, 1),
+                   "min_gap_min": MIN_GAP_FROM_USER_SEC // 60})
         return None
     if last_fire and (now - last_fire).total_seconds() < MIN_GAP_FROM_SELF_SEC:
-        audit("proactive_decision", should=False, why="hard_gate:self_cooldown",
+        audit("proactive_decision", user_id=user_id, should=False,
+              why="hard_gate:self_cooldown",
               ctx={"since_last_fire_min": round((now - last_fire).total_seconds() / 60, 1),
                    "min_gap_min": MIN_GAP_FROM_SELF_SEC // 60})
         return None
     if today_count >= DAILY_CAP:
-        audit("proactive_decision", should=False, why="hard_gate:daily_cap",
+        audit("proactive_decision", user_id=user_id, should=False,
+              why="hard_gate:daily_cap",
               ctx={"opens_today": today_count, "cap": DAILY_CAP})
         return None
 
-    score = availability.score(now.weekday(), now.hour)
-    top = [t for t, _ in interests.top(6)]
+    score = availability.score(user_id, now.weekday(), now.hour)
+    top = [t for t, _ in interests.top(user_id, 6)]
 
     ctx: dict[str, Any] = {
         "now": now.strftime("%H:%M"),
@@ -163,15 +174,16 @@ async def decide(now: datetime | None = None) -> Optional[dict[str, Any]]:
         )
     except Exception as e:
         log.debug("proactive decide failed: %s", e)
-        audit("proactive_decision", should=False, why=f"llm_error:{type(e).__name__}",
+        audit("proactive_decision", user_id=user_id, should=False,
+              why=f"llm_error:{type(e).__name__}",
               ctx={**ctx, "error": str(e)[:200]})
         return None
 
     if not isinstance(data, dict) or not data.get("should"):
         why = (data or {}).get("why", "") if isinstance(data, dict) else ""
         if why:
-            log.info("proactive skip: %s", why)
-        audit("proactive_decision", should=False, why=why, ctx=ctx)
+            log.info("proactive skip uid=%d: %s", user_id, why)
+        audit("proactive_decision", user_id=user_id, should=False, why=why, ctx=ctx)
         return None
 
     decision = {
@@ -181,8 +193,8 @@ async def decide(now: datetime | None = None) -> Optional[dict[str, Any]]:
         "recent_topics": top,
     }
     log.info(
-        "proactive GO: why=%r doing=%r angle=%r",
-        decision["why"], decision["user_probably_doing"], decision["opener_angle"],
+        "proactive GO uid=%d: why=%r doing=%r angle=%r",
+        user_id, decision["why"], decision["user_probably_doing"], decision["opener_angle"],
     )
-    audit("proactive_decision", should=True, ctx=ctx, **decision)
+    audit("proactive_decision", user_id=user_id, should=True, ctx=ctx, **decision)
     return decision

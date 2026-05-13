@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: memu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: memu
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    # 不暴露端口到宿主机；只在 compose 内网通；admin 想本地连数据库可加 ports
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d memu"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: aidemo-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # 容器内连同网内的 postgres
+      MEMU_DB_URL: postgresql+psycopg://postgres:postgres@postgres:5432/memu
+    volumes:
+      - ./data:/app/data
+      - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
+    # 不暴露端口；bot 是出站连接
+
+  admin:
+    build: .
+    container_name: aidemo-admin
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      MEMU_DB_URL: postgresql+psycopg://postgres:postgres@postgres:5432/memu
+    volumes:
+      - ./data:/app/data:ro
+      - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
+    command: ["python", "-m", "scripts.admin"]
+    ports:
+      # 只绑 127.0.0.1，外网访问靠 ssh -L 18081:127.0.0.1:18081 user@host
+      - "127.0.0.1:18081:18081"
+
+volumes:
+  pg-data:

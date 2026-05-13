@@ -51,57 +51,70 @@ async def extract_topics(text: str) -> list[str]:
     return out[:3]
 
 
-def bump(topics: list[str], delta: float = 1.0) -> None:
+def bump(user_id: int, topics: list[str], delta: float = 1.0) -> None:
     if not topics:
         return
     now = datetime.utcnow()
     after: dict[str, float] = {}
     with session() as sess:
         for t in topics:
-            row = sess.get(Interest, t)
+            row = sess.get(Interest, (user_id, t))
             if row is None:
-                sess.add(Interest(topic=t, heat=delta, last_touch=now))
+                sess.add(Interest(user_id=user_id, topic=t, heat=delta, last_touch=now))
                 after[t] = delta
             else:
                 row.heat = float(row.heat or 0.0) + delta
                 row.last_touch = now
                 after[t] = row.heat
         sess.commit()
-    audit("interest_bump", topics=topics, delta=delta, heat_after=after)
+    audit("interest_bump", user_id=user_id, topics=topics, delta=delta, heat_after=after)
 
 
-def decay_tick() -> int:
-    """全表做一次衰减；淘汰 heat < 0.1 的条目。返回淘汰数。"""
+def decay_tick(user_id: int) -> int:
+    """对单个用户的兴趣表做一次衰减；淘汰 heat < 0.1 的条目。返回淘汰数。"""
     tau_sec = settings().interest_decay_tau_hours * 3600.0
     now = datetime.utcnow()
     evicted = 0
     with session() as sess:
-        rows = sess.execute(select(Interest)).scalars().all()
+        rows = sess.execute(
+            select(Interest).where(Interest.user_id == user_id)
+        ).scalars().all()
         for row in rows:
             dt = (now - row.last_touch).total_seconds()
             row.heat = float(row.heat) * math.exp(-dt / tau_sec)
             row.last_touch = now
             if row.heat < 0.1:
-                sess.execute(delete(Interest).where(Interest.topic == row.topic))
+                sess.execute(
+                    delete(Interest).where(
+                        Interest.user_id == user_id,
+                        Interest.topic == row.topic,
+                    )
+                )
                 evicted += 1
         sess.commit()
     if evicted:
-        log.info("interests decay: evicted %d", evicted)
+        log.info("interests decay uid=%d: evicted %d", user_id, evicted)
     return evicted
 
 
-def top(n: int = 5) -> list[tuple[str, float]]:
+def top(user_id: int, n: int = 5) -> list[tuple[str, float]]:
     with session() as sess:
         rows = sess.execute(
-            select(Interest).order_by(Interest.heat.desc()).limit(n)
+            select(Interest)
+            .where(Interest.user_id == user_id)
+            .order_by(Interest.heat.desc())
+            .limit(n)
         ).scalars().all()
         return [(r.topic, float(r.heat)) for r in rows]
 
 
-def cold(n: int = 5) -> list[tuple[str, float]]:
+def cold(user_id: int, n: int = 5) -> list[tuple[str, float]]:
     """返回 heat 最低的 n 个（用于"最近没聊"的提示）。"""
     with session() as sess:
         rows = sess.execute(
-            select(Interest).order_by(Interest.heat.asc()).limit(n)
+            select(Interest)
+            .where(Interest.user_id == user_id)
+            .order_by(Interest.heat.asc())
+            .limit(n)
         ).scalars().all()
         return [(r.topic, float(r.heat)) for r in rows]

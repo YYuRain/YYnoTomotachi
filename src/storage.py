@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from sqlalchemy import (
-    Column, DateTime, Float, Integer, String, Text, create_engine,
+    BigInteger, Column, DateTime, Float, Index, Integer, PrimaryKeyConstraint,
+    String, Text, create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -15,43 +16,70 @@ class Base(DeclarativeBase):
 
 class Interest(Base):
     __tablename__ = "interests"
-    topic = Column(String, primary_key=True)
+    user_id = Column(BigInteger, nullable=False)
+    topic = Column(String, nullable=False)
     heat = Column(Float, nullable=False, default=0.0)
     last_touch = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (PrimaryKeyConstraint("user_id", "topic"),)
 
 
 class ReplySample(Base):
     __tablename__ = "reply_samples"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
     ts = Column(DateTime, nullable=False, default=datetime.utcnow)
     weekday = Column(Integer, nullable=False)  # 0=Mon..6=Sun
     hour = Column(Integer, nullable=False)     # 0..23
     replied_within_sec = Column(Integer, nullable=True)
+    __table_args__ = (Index("ix_reply_samples_user_wd_h", "user_id", "weekday", "hour"),)
 
 
 class LastInteraction(Base):
+    """每个用户一行；user_id 是主键。"""
     __tablename__ = "last_interaction"
-    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, primary_key=True)
     ts = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class ProactiveFire(Base):
-    """AI 主动发起（开场）的历史，用于节流 / 每日上限 / 记录最近触发时间。"""
+    """AI 主动发起（开场）的历史。每条带 user_id；用于节流 / 每日上限 / 最近触发时间。"""
     __tablename__ = "proactive_fires"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    ts = Column(DateTime, nullable=False, default=datetime.utcnow)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     why = Column(String, nullable=True)
     user_probably_doing = Column(String, nullable=True)
     opener_angle = Column(String, nullable=True)
     opener_text = Column(String, nullable=True)
 
 
-# 为未来的人格演化预留
 class PersonaSnapshot(Base):
+    """每个用户独立的 persona 动态层快照流（事件流，最新一行 = 当前状态）。"""
     __tablename__ = "persona_snapshots"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
     ts = Column(DateTime, nullable=False, default=datetime.utcnow)
     payload_json = Column(Text, nullable=False)
+    __table_args__ = (Index("ix_persona_snapshots_user_ts", "user_id", "ts"),)
+
+
+class User(Base):
+    """已注册用户。chat_id 即 user_id；status 用 'active' 标识。"""
+    __tablename__ = "users"
+    chat_id = Column(BigInteger, primary_key=True)
+    status = Column(String, nullable=False, default="active")  # active | banned (预留)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    note = Column(String, nullable=True)  # admin 备注用
+
+
+class InviteCode(Base):
+    """邀请码：admin 生成，未使用前 used_by/used_at 为空。"""
+    __tablename__ = "invite_codes"
+    code = Column(String, primary_key=True)
+    created_by = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    used_by = Column(BigInteger, nullable=True)
+    used_at = Column(DateTime, nullable=True)
 
 
 _engine = None

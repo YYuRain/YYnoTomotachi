@@ -1,13 +1,16 @@
-"""turn 处理流水线。
+"""turn 处理流水线（多用户版）。
 
 顺序严格如下（记忆主动召回 + 扩展点 turn_context 贯穿）：
-1. emotion.detect（MVP 占位，None）
-2. memory.recall → 即使 agent 最终没用上也算"想起来了"
-3. interests: 抽话题 + bump 热度
+1. emotion.detect（按 user_id 拉短期上下文）
+2. memory.recall(user_id) → 即使 agent 最终没用上也算"想起来了"
+3. interests.extract_topics → bump(user_id, ...)
 4. prompts.build_system_prompt（persona + memories + interests + emotion）
-5. minimax.chat → 文本
+5. llm.chat → 文本
 6. rhythm.deliver → 通过回调分条发出
-7. 异步：memory.note_turn + maybe_flush、availability.record
+7. 异步：memory.note_turn(user_id) + maybe_flush(user_id)、availability.record(user_id)
+
+短期对话 `_recent` 是 dict[str_uid, list]——每用户一份；持久化到 `data/recent.json`：
+  { "<uid>": [...], "<uid>": [...] }
 """
 from __future__ import annotations
 
@@ -28,14 +31,13 @@ SendSticker = Callable[[Path], Awaitable[None]]
 
 log = logging.getLogger(__name__)
 
-# 短期对话记忆：最近 N 轮，**持久化到 data/recent.json**。
-# 重启后从盘上读回来，避免"昨天聊的今天不记得"的体感（之前 _recent 是模块级 list，重启即清）。
-# 注意这只是"最近若干轮原文"，不是 memU 的长期摘要——两者目的不同：
-# - _recent：让模型看到原始上下文，能精确接住代词、刚提过的事
-# - memU：长期 RAG 召回，跨日跨周的事
 _SHORT_WINDOW = 12
-_recent: list[dict[str, str]] = []
+_recent_per_user: dict[str, list[dict[str, str]]] = {}
 _recent_loaded = False
+
+
+def _uid(chat_id: int | str) -> str:
+    return str(chat_id)
 
 
 def _recent_path() -> Path:
@@ -43,8 +45,11 @@ def _recent_path() -> Path:
 
 
 def _load_recent() -> None:
-    """启动时调一次。文件缺失/损坏静默回到空 list。"""
-    global _recent, _recent_loaded
+    """启动时调一次。文件缺失/损坏静默回到空 dict。
+
+    兼容老格式：如果文件是 list（单用户旧版），全部塞到 admin 名下。
+    """
+    global _recent_loaded
     if _recent_loaded:
         return
     _recent_loaded = True
@@ -52,10 +57,25 @@ def _load_recent() -> None:
     if not p.exists():
         return
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        raw = p.read_text(encoding="utf-8")
+        data = json.loads(raw)
         if isinstance(data, list):
-            _recent[:] = [m for m in data if isinstance(m, dict) and "role" in m and "content" in m]
-            log.info("loaded _recent: %d msgs from %s", len(_recent), p.name)
+            # 老格式：包成 admin 名下，由迁移脚本重写文件
+            admin_uid = _uid(settings().admin_chat_id)
+            _recent_per_user[admin_uid] = [
+                m for m in data if isinstance(m, dict) and "role" in m and "content" in m
+            ]
+            log.info("loaded _recent (legacy list): %d msgs → uid=%s",
+                     len(_recent_per_user[admin_uid]), admin_uid)
+        elif isinstance(data, dict):
+            for uid, msgs in data.items():
+                if isinstance(msgs, list):
+                    _recent_per_user[str(uid)] = [
+                        m for m in msgs if isinstance(m, dict) and "role" in m and "content" in m
+                    ]
+            total = sum(len(v) for v in _recent_per_user.values())
+            log.info("loaded _recent: %d users, %d msgs total",
+                     len(_recent_per_user), total)
     except Exception as e:
         log.warning("load _recent failed (ignored): %s", e)
 
@@ -65,14 +85,16 @@ def _save_recent() -> None:
     try:
         p = _recent_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(_recent, ensure_ascii=False, indent=2), encoding="utf-8")
+        p.write_text(json.dumps(_recent_per_user, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
     except Exception as e:
         log.debug("save _recent failed (ignored): %s", e)
 
 
-def _trim() -> None:
-    if len(_recent) > _SHORT_WINDOW * 2:
-        del _recent[: len(_recent) - _SHORT_WINDOW * 2]
+def _trim(uid: str) -> None:
+    buf = _recent_per_user.get(uid)
+    if buf and len(buf) > _SHORT_WINDOW * 2:
+        del buf[: len(buf) - _SHORT_WINDOW * 2]
 
 
 # 模块加载即读一次。bot 启动后第一次 import agent 就会触发。
@@ -80,27 +102,28 @@ _load_recent()
 
 
 async def _build_turn(
+    user_id: int,
     user_text: str,
     image_b64: str | None = None,
     image_media_type: str | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     ctx: dict[str, Any] = {}
+    uid = _uid(user_id)
+    recent = _recent_per_user.setdefault(uid, [])
 
     # 用于召回 / 话题抽取 / 工具的"可搜索文本"——纯图片时给一个占位，避免空字符串挂掉这些 task
     text_for_aux = user_text or "[对方发来一张图]"
 
     # 1-4 并行：情绪判档 / 记忆召回 / 话题抽取 / 工具查询
-    recent_snapshot = list(_recent[-_SHORT_WINDOW * 2 :])
+    recent_snapshot = list(recent[-_SHORT_WINDOW * 2 :])
     emotion_task = asyncio.create_task(emotion.detect(text_for_aux, recent=recent_snapshot))
-    memories_task = asyncio.create_task(_safe_recall(text_for_aux))
+    memories_task = asyncio.create_task(_safe_recall(user_id, text_for_aux))
     topics_task = asyncio.create_task(interests.extract_topics(text_for_aux))
-    # URL 读取优先（确定性）：有链接就直接读，跳过 LLM 工具判断
     if user_text and tools._URL_RE.search(user_text):
         tool_task = asyncio.create_task(tools.fetch_urls_in_message(user_text))
     elif user_text:
         tool_task = asyncio.create_task(_maybe_fetch_context(user_text))
     else:
-        # 纯图片消息没必要查工具
         async def _empty() -> str:
             return ""
         tool_task = asyncio.create_task(_empty())
@@ -109,27 +132,25 @@ async def _build_turn(
         emotion_task, memories_task, topics_task, tool_task
     )
     if topics:
-        interests.bump(topics, delta=1.0)
+        interests.bump(user_id, topics, delta=1.0)
     ctx["topics"] = topics
 
-    # 5. 拼 system prompt（不含 tool_context，tool_context 直接贴用户消息前）
-    persona = load_persona_state()
+    # 5. 拼 system prompt
+    persona = load_persona_state(user_id)
     sys_prompt = prompts.build_system_prompt(
         persona=persona,
         memories=ctx["memories"],
-        interests_top=interests.top(5),
-        interests_cold=interests.cold(3),
+        interests_top=interests.top(user_id, 5),
+        interests_cold=interests.cold(user_id, 3),
         emotion=ctx["emotion"],
         sticker_tags=stickers.available_tags(),
     )
 
     messages = [{"role": "system", "content": sys_prompt}]
-    messages.extend(_recent[-_SHORT_WINDOW * 2 :])
+    messages.extend(recent[-_SHORT_WINDOW * 2 :])
 
-    # 时间感 + idle + tool_context 都贴在用户消息前面，LLM 一定能看到。
-    # 不进 system 段：保住 prompt cache 命中率；MiniMax 链路上 user 前缀也比 system 末尾稳。
     bits = [f"现在 {clock.now_signal()}"]
-    idle_sec = availability.seconds_since_last_interaction()
+    idle_sec = availability.seconds_since_last_interaction(user_id)
     if idle_sec != float("inf") and idle_sec > 30:
         bits.append(f"距上次聊 {clock.since_phrase(idle_sec)}")
     time_prefix = "[" + "｜".join(bits) + "]"
@@ -139,14 +160,12 @@ async def _build_turn(
     if tool_ctx:
         text_parts.append(f"[链接内容]\n{tool_ctx}")
     if image_b64:
-        # 标识对方是图为主——纯图无 caption 时给 LLM 一个明确的"她/他发了张图"提示
         text_parts.append(user_text or "（对方发了一张图，没附文字——你看一眼，自然回应）")
     else:
         text_parts.append(user_text)
     text_block = "\n\n".join(text_parts)
 
     if image_b64:
-        # Anthropic 风格的 multimodal content blocks：image 在前、text 在后（让 AI 先看图再读语境）
         user_content: Any = [
             {
                 "type": "image",
@@ -165,9 +184,9 @@ async def _build_turn(
     return messages, ctx
 
 
-async def _safe_recall(user_text: str) -> list[str]:
+async def _safe_recall(user_id: int, user_text: str) -> list[str]:
     try:
-        return await memory.recall(user_text)
+        return await memory.recall(user_id, user_text)
     except Exception as e:
         log.debug("recall error ignored: %s", e)
         return []
@@ -222,6 +241,7 @@ async def _maybe_fetch_context(user_text: str) -> str:
 
 
 async def handle_user_message(
+    user_id: int,
     user_text: str,
     send: Callable[[str], Awaitable[None]],
     typing_action: Callable[[], Awaitable[None]] | None = None,
@@ -234,37 +254,34 @@ async def handle_user_message(
     if not user_text and not image_b64:
         return
 
-    audit("user_msg", text=user_text, has_image=bool(image_b64),
-          image_media_type=image_media_type, recent_len=len(_recent))
+    uid = _uid(user_id)
+    recent = _recent_per_user.setdefault(uid, [])
 
-    # 只有当前 provider 真不支持 vision 时才降级——避免触发上游 400 走 except 兜底说
-    # "脑子卡了一下"那种困惑感。
-    # 已支持：anthropic（原生 vision）/ openrouter（取决于具体 model 是不是 vision-capable，
-    # kimi-k2.6、claude-sonnet-4.6、gemini-3.x-pro 等都行）。
-    # 已知不支持：minimax（M2.7 当前 token plan 没真 vision-capable 模型）。
+    audit("user_msg", user_id=user_id, text=user_text, has_image=bool(image_b64),
+          image_media_type=image_media_type, recent_len=len(recent))
+
     from .config import settings as _settings
     if image_b64 and _settings().llm_provider == "minimax":
         log.info("image dropped: provider=minimax 当前模型不支持 vision")
         msg = (f"图我现在看不见（图模型挂了）\n你说的「{user_text[:30]}」我倒是能聊"
                if user_text else "图我看不见呢\n描述一下？")
-        audit("assistant_reply", text=msg, mode="degrade", reason="provider=minimax no vision")
+        audit("assistant_reply", user_id=user_id, text=msg, mode="degrade",
+              reason="provider=minimax no vision")
         await send(msg)
         return
 
     import time as _time
     _t0 = _time.time()
-    messages, ctx = await _build_turn(user_text, image_b64=image_b64, image_media_type=image_media_type)
+    messages, ctx = await _build_turn(user_id, user_text,
+                                      image_b64=image_b64, image_media_type=image_media_type)
 
-    # 按模式调整生成参数
     em = ctx.get("emotion")
     mode = getattr(em, "mode", "casual")
     if mode == "depth":
-        # depth 不再"长 + 稳"——靠近 casual 的语气，让想法碰撞而不是教学
         temperature, max_tokens = 0.85, 600
     elif mode == "empathy":
         temperature, max_tokens = 0.6, 400
     elif mode == "interest":
-        # 跟着兴头走：稍高温度更活，字数不拉长
         temperature, max_tokens = 0.95, 500
     else:
         temperature, max_tokens = 0.9, 500
@@ -280,40 +297,34 @@ async def handle_user_message(
         reply = await llm.chat(messages, temperature=temperature, max_tokens=max_tokens)
     except Exception as e:
         log.exception("chat failed: %s", e)
-        audit("assistant_reply", text="(脑子卡了一下)", mode=mode, error=str(e)[:200],
-              provider=s.llm_provider, model=active_model)
+        audit("assistant_reply", user_id=user_id, text="(脑子卡了一下)", mode=mode,
+              error=str(e)[:200], provider=s.llm_provider, model=active_model)
         await send("（脑子卡了一下）")
         return
 
     reply = reply.strip()
     if not reply:
-        audit("assistant_reply", text="", mode=mode, error="empty reply",
+        audit("assistant_reply", user_id=user_id, text="", mode=mode, error="empty reply",
               provider=s.llm_provider, model=active_model)
         return
 
-    audit("assistant_reply", text=reply, mode=mode,
+    audit("assistant_reply", user_id=user_id, text=reply, mode=mode,
           temperature=temperature, max_tokens=max_tokens,
           provider=s.llm_provider, model=active_model,
           latency_ms=int((_time.time() - _t0) * 1000),
           memories_used=len(ctx.get("memories") or []),
           topics=ctx.get("topics") or [],
           tool_ctx_chars=len(ctx.get("tool_ctx") or ""),
-          history_len=len(_recent))
+          history_len=len(recent))
 
-    # 更新短期对话——_recent 不存 base64（避免膨胀），纯图给一个文本占位让历史可读
     history_user_text = user_text if user_text else ("[图片]" if image_b64 else "")
     if image_b64 and user_text:
         history_user_text = f"[图片] {user_text}"
-    _recent.append({"role": "user", "content": history_user_text})
-    _recent.append({"role": "assistant", "content": reply})
-    _trim()
+    recent.append({"role": "user", "content": history_user_text})
+    recent.append({"role": "assistant", "content": reply})
+    _trim(uid)
     _save_recent()
 
-    # 节奏化发送：
-    # - max_piece_chars：硬上限（超了才切）
-    # - merge_up_to：合并阈值（相邻短句只有合并后仍 ≤ 此值才合）
-    # depth 不再贪心合并——和 casual 节奏对齐，避免"认真聊就突然一段成段"的端起来感；
-    # 单条上限略高（80 vs 60），允许一句完整观点不被硬切，但不再合多句
     if mode == "depth":
         piece_limit, merge_limit = 80, 14
     elif mode == "empathy":
@@ -323,10 +334,8 @@ async def handle_user_message(
     else:
         piece_limit, merge_limit = 60, 12
 
-    # 先 parse 出 [sticker:xxx] 标记 → 切成 text/sticker 段，按顺序发
     segments = stickers.parse_message(reply) if send_sticker else [("text", reply)]
     if not segments:
-        # 整条都是无效 sticker 标记 → 退化全发文本
         segments = [("text", reply)]
     for kind, payload in segments:
         if kind == "text" and payload:
@@ -336,33 +345,32 @@ async def handle_user_message(
             )
         elif kind == "sticker" and send_sticker is not None:
             try:
-                await send_sticker(payload)  # type: ignore[arg-type]
+                await send_sticker(payload)
             except Exception as e:
                 log.exception("send_sticker failed: %s", e)
 
-    # 后台任务：长期记忆 + 活跃时段
-    asyncio.create_task(_post_turn(history_user_text, reply))
+    asyncio.create_task(_post_turn(user_id, history_user_text, reply))
 
 
-async def _post_turn(user_text: str, reply: str) -> None:
+async def _post_turn(user_id: int, user_text: str, reply: str) -> None:
     try:
-        memory.note_turn(user_text, reply)
-        await memory.maybe_flush()
+        memory.note_turn(user_id, user_text, reply)
+        await memory.maybe_flush(user_id)
     except Exception as e:
         log.debug("post_turn memory err: %s", e)
     try:
-        availability.record()
+        availability.record(user_id)
     except Exception as e:
         log.debug("post_turn availability err: %s", e)
 
 
-async def generate_opener(context: dict | None = None) -> str:
+async def generate_opener(user_id: int, context: dict | None = None) -> str:
     """scheduler 主动发起时用这个。
     context 由 proactive.decide 提供：user_probably_doing / opener_angle / recent_topics。
     没 context 就退回旧的通用指令。"""
-    persona = load_persona_state()
-    top = interests.top(5)
-    cold_ = interests.cold(3)
+    persona = load_persona_state(user_id)
+    top = interests.top(user_id, 5)
+    cold_ = interests.cold(user_id, 3)
     sys_prompt = prompts.build_system_prompt(
         persona=persona,
         memories=[],  # 主动开场不主推记忆，避免显得在翻旧账
@@ -371,7 +379,7 @@ async def generate_opener(context: dict | None = None) -> str:
     )
     hint = prompts.render_proactive_opener(context) if context else prompts.PROACTIVE_OPENER_INSTRUCTIONS
     bits = [f"现在 {clock.now_signal()}"]
-    idle_sec = availability.seconds_since_last_interaction()
+    idle_sec = availability.seconds_since_last_interaction(user_id)
     if idle_sec != float("inf") and idle_sec > 30:
         bits.append(f"距上次聊 {clock.since_phrase(idle_sec)}")
     hint = "[" + "｜".join(bits) + "]\n\n" + hint
@@ -381,6 +389,6 @@ async def generate_opener(context: dict | None = None) -> str:
     ]
     text = await llm.chat(messages, temperature=1.0, max_tokens=200)
     text = text.strip()
-    audit("proactive_opener_generated", text=text, context=context or {},
+    audit("proactive_opener_generated", user_id=user_id, text=text, context=context or {},
           idle_sec=int(idle_sec) if idle_sec != float("inf") else -1)
     return text

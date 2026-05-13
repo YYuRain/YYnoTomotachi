@@ -44,10 +44,10 @@ async def _main() -> None:
         active_model = s.openrouter_model or "(unset!)"
     else:
         active_model = s.minimax_chat_model
-    log.info("启动：allowed_chat=%s, provider=%s, model=%s",
-             s.telegram_allowed_chat_id, s.llm_provider, active_model)
+    log.info("启动：admin=%s, provider=%s, model=%s",
+             s.admin_chat_id, s.llm_provider, active_model)
     audit("startup", provider=s.llm_provider, model=active_model,
-          allowed_chat=s.telegram_allowed_chat_id)
+          admin_chat=s.admin_chat_id)
 
     # 初始化 DB schema
     storage.engine()
@@ -72,9 +72,8 @@ async def _main() -> None:
     # Telegram application
     app = bot.build_application()
 
-    # Scheduler
-    send, typing = bot.make_send_and_typing()
-    sched = scheduler.build(send, typing)
+    # Scheduler——多用户版每个 job 内部按 user 构造 send/typing
+    sched = scheduler.build()
 
     stop_event = asyncio.Event()
 

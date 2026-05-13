@@ -62,10 +62,11 @@ class PersonaState:
 
 # ============ DB IO ============
 
-def _load_latest_payload() -> dict[str, Any]:
+def _load_latest_payload(user_id: int) -> dict[str, Any]:
     with storage.session() as s:
         row = (
             s.query(storage.PersonaSnapshot)
+            .filter(storage.PersonaSnapshot.user_id == user_id)
             .order_by(storage.PersonaSnapshot.id.desc())
             .first()
         )
@@ -84,10 +85,13 @@ def _load_latest_payload() -> dict[str, Any]:
         return base
 
 
-def _write_snapshot(payload: dict[str, Any]) -> None:
+def _write_snapshot(user_id: int, payload: dict[str, Any]) -> None:
     payload = {**payload, "updated_at": datetime.utcnow().isoformat()}
     with storage.session() as s:
-        s.add(storage.PersonaSnapshot(payload_json=json.dumps(payload, ensure_ascii=False)))
+        s.add(storage.PersonaSnapshot(
+            user_id=user_id,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        ))
         s.commit()
 
 
@@ -147,10 +151,10 @@ def _render_dynamic_block(payload: dict[str, Any]) -> str:
     return header + "\n" + "\n".join(sections)
 
 
-def load_persona_state() -> PersonaState:
-    """读 baseline body + DB 最新动态段，合成完整 PersonaState。"""
+def load_persona_state(user_id: int) -> PersonaState:
+    """读 baseline body + 该用户最新动态段，合成完整 PersonaState。"""
     base_body = settings().system_prompt_path.read_text(encoding="utf-8")
-    payload = _load_latest_payload()
+    payload = _load_latest_payload(user_id)
     dynamic = _render_dynamic_block(payload)
     body = base_body + ("\n\n" + dynamic if dynamic else "")
     return PersonaState(body=body, extras=payload)
@@ -214,14 +218,14 @@ def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
 
 
-async def update_state(messages_batch: list[dict[str, str]]) -> bool:
-    """根据本批对话异步更新 persona。失败/无变化都返回 False，不抛。"""
+async def update_state(user_id: int, messages_batch: list[dict[str, str]]) -> bool:
+    """根据本批对话异步更新该用户的 persona。失败/无变化都返回 False，不抛。"""
     if not messages_batch:
         return False
     try:
         from . import llm  # 延迟避免循环
 
-        cur = _load_latest_payload()
+        cur = _load_latest_payload(user_id)
         traits = cur.get("traits", {})
         recent_obs = [o.get("text", "") for o in (cur.get("observations") or [])[-MAX_OBSERVATIONS_KEEP:]]
         sys_prompt = _UPDATE_SYSTEM.format(
@@ -304,9 +308,10 @@ async def update_state(messages_batch: list[dict[str, str]]) -> bool:
         "observations": obs_list,
         "milestones": ms_list,
     }
-    _write_snapshot(payload)
+    _write_snapshot(user_id, payload)
     log.info(
-        "persona updated: traits=%s mood=%r obs=+%d ms=+%d",
+        "persona updated uid=%d: traits=%s mood=%r obs=+%d ms=+%d",
+        user_id,
         {k: round(new_traits.get(k, 0.0), 2) for k in TRAIT_KEYS},
         cur_mood,
         len([o for o in new_obs[:2] if isinstance(o, str) and o.strip()]),
@@ -315,6 +320,7 @@ async def update_state(messages_batch: list[dict[str, str]]) -> bool:
     new_obs_added = [o for o in new_obs[:2] if isinstance(o, str) and o.strip()]
     new_ms_added = [m for m in new_ms[:1] if isinstance(m, str) and m.strip()]
     audit("persona_update",
+          user_id=user_id,
           batch_msgs=len(messages_batch),
           traits_before={k: round(traits.get(k, 0.0), 3) for k in TRAIT_KEYS},
           traits_after={k: round(new_traits.get(k, 0.0), 3) for k in TRAIT_KEYS},
@@ -329,9 +335,9 @@ async def update_state(messages_batch: list[dict[str, str]]) -> bool:
 
 # ============ 每日 consolidate（scheduler 03:00）============
 
-def consolidate() -> bool:
+def consolidate(user_id: int) -> bool:
     """traits 衰减 + 清旧 observations。同步函数（纯本地操作，不调 LLM）。"""
-    cur = _load_latest_payload()
+    cur = _load_latest_payload(user_id)
     traits = dict(cur.get("traits") or {})
     new_traits = {k: round(_clamp(traits.get(k, 0.0) * DAILY_DECAY), 4) for k in TRAIT_KEYS}
 
@@ -347,6 +353,7 @@ def consolidate() -> bool:
             obs_list.append(o)
 
     audit("persona_consolidate",
+          user_id=user_id,
           traits_before={k: round(traits.get(k, 0.0), 3) for k in TRAIT_KEYS},
           traits_after={k: round(new_traits.get(k, 0.0), 3) for k in TRAIT_KEYS},
           observations_kept=len(obs_list),
@@ -357,6 +364,7 @@ def consolidate() -> bool:
         "observations": obs_list,
         "milestones": list(cur.get("milestones") or []),  # 永久保留
     }
-    _write_snapshot(payload)
-    log.info("persona consolidated: traits=%s observations kept=%d", new_traits, len(obs_list))
+    _write_snapshot(user_id, payload)
+    log.info("persona consolidated uid=%d: traits=%s observations kept=%d",
+             user_id, new_traits, len(obs_list))
     return True

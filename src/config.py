@@ -26,7 +26,7 @@ def _opt(key: str, default: str = "") -> str:
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
-    telegram_allowed_chat_id: int
+    admin_chat_id: int            # 多用户化后这个 ID 是 admin（生成邀请码、看 /users 等）
     telegram_proxy: str
 
     minimax_api_key: str
@@ -73,7 +73,8 @@ class Settings:
 def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=_req("TELEGRAM_BOT_TOKEN"),
-        telegram_allowed_chat_id=int(_req("TELEGRAM_ALLOWED_CHAT_ID")),
+        # 兼容旧名 TELEGRAM_ALLOWED_CHAT_ID：迁移期保留，新部署用 ADMIN_CHAT_ID
+        admin_chat_id=int(_opt("ADMIN_CHAT_ID", "") or _req("TELEGRAM_ALLOWED_CHAT_ID")),
         telegram_proxy=_opt("TELEGRAM_PROXY", ""),
         minimax_api_key=_req("MINIMAX_API_KEY"),
         minimax_group_id=_opt("MINIMAX_GROUP_ID"),

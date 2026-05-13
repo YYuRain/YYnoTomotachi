@@ -1,83 +1,94 @@
-"""后台定时任务：兴趣衰减 + 主动搭话。
+"""后台定时任务（多用户版）：兴趣衰减 + memU flush + 人格 consolidate + 主动搭话。
 
-- interests.decay_tick 每小时跑一次。
-- proactive_tick 每 10 分钟检查一次：满足 idle 阈值 + 此刻 availability.score 够高 → 发一句开场。
-  发出后会记一条 availability（视作一次尝试时段）。
+每个 job 内部 `asyncio.gather` 遍历活跃用户，`Semaphore(5)` 兜底并发。
+proactive_job 每用户独立 send/typing 闭包；硬门 SQL 拦掉绝大多数，软门 LLM 调用量很小。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime
-from typing import Awaitable, Callable
-
-import random
+from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from . import availability, interests, memory, persona, proactive
+from . import bot as bot_mod
+from . import interests, memory, persona, proactive, users
 from .agent import generate_opener
-from .config import settings
 from .rhythm import deliver
 
 log = logging.getLogger(__name__)
 
-Send = Callable[[str], Awaitable[None]]
-Typing = Callable[[], Awaitable[None]] | None
+# 限制每个 job 内部并发（防止 OpenRouter 短期被打爆）
+_PER_JOB_SEMAPHORE = 5
 
 
-def build(send: Send, typing: Typing) -> AsyncIOScheduler:
+async def _fan_out(coro_factory, sem_n: int = _PER_JOB_SEMAPHORE) -> None:
+    """对所有活跃用户 fan-out。coro_factory(uid) 返回 awaitable。"""
+    user_ids = users.list_active()
+    if not user_ids:
+        return
+    sem = asyncio.Semaphore(sem_n)
+
+    async def _wrap(uid: int):
+        async with sem:
+            try:
+                await coro_factory(uid)
+            except Exception as e:
+                log.exception("job err uid=%d: %s", uid, e)
+
+    await asyncio.gather(*(_wrap(u) for u in user_ids), return_exceptions=True)
+
+
+def build() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="UTC")
 
     async def decay_job() -> None:
-        try:
-            interests.decay_tick()
-        except Exception as e:
-            log.exception("decay_tick failed: %s", e)
+        async def _one(uid: int):
+            interests.decay_tick(uid)
+        await _fan_out(_one)
 
     async def memu_flush_job() -> None:
+        # memory.maybe_flush(None) 内部已遍历所有 buffer 非空的用户
         try:
-            await memory.maybe_flush()
+            await memory.maybe_flush(None)
         except Exception as e:
             log.debug("memu flush err: %s", e)
 
     async def proactive_job() -> None:
-        try:
-            decision = await proactive.decide()
+        async def _one(uid: int):
+            decision = await proactive.decide(uid)
             if decision is None:
                 return
-            text = await generate_opener(context=decision)
+            text = await generate_opener(uid, context=decision)
             if not text:
                 return
+            send, typing = bot_mod.make_send_and_typing(uid)
             await deliver(text, send, typing)
-            # 记录 AI 主动开场（用于节流/每日上限/事后检查）
             proactive.record_fire(
+                uid,
                 why=decision.get("why", ""),
                 user_probably_doing=decision.get("user_probably_doing", ""),
                 opener_angle=decision.get("opener_angle", ""),
                 opener_text=text,
             )
-            log.info("proactive opener sent: %s", text[:60])
-        except Exception as e:
-            log.exception("proactive_job failed: %s", e)
+            log.info("proactive opener sent uid=%d: %s", uid, text[:60])
+
+        await _fan_out(_one)
 
     async def persona_consolidate_job() -> None:
-        try:
-            persona.consolidate()
-        except Exception as e:
-            log.exception("persona consolidate failed: %s", e)
+        async def _one(uid: int):
+            persona.consolidate(uid)
+        await _fan_out(_one)
 
     sched.add_job(decay_job, "interval", hours=1, id="decay")
     sched.add_job(memu_flush_job, "interval", minutes=15, id="memu_flush")
-    # 每日本地凌晨 03:07 跑 consolidate（trait 朝中性衰减、清旧 observations）
     sched.add_job(
         persona_consolidate_job,
         CronTrigger(hour=3, minute=7),
         id="persona_consolidate",
     )
-    # proactive 检查：平均每 25 分钟一次 + ±10 分钟 jitter
-    # （硬门兜底：用户冷却 1h、自冷却 90min、每日 6 条；多出来的检查只是给软门更多机会）
     jitter_sec = 10 * 60
     sched.add_job(
         proactive_job,
