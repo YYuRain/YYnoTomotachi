@@ -42,7 +42,8 @@ async def _fan_out(coro_factory, sem_n: int = _PER_JOB_SEMAPHORE) -> None:
 
 
 def build() -> AsyncIOScheduler:
-    sched = AsyncIOScheduler(timezone="UTC")
+    # 用中国时区，cron 表达式（persona_consolidate 03:07）就是中国时间凌晨
+    sched = AsyncIOScheduler(timezone="Asia/Shanghai")
 
     async def decay_job() -> None:
         async def _one(uid: int):

@@ -17,6 +17,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: memu
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
     volumes:
       - pg-data:/var/lib/postgresql/data
     # 不暴露端口到宿主机；只在 compose 内网通；admin 想本地连数据库可加 ports

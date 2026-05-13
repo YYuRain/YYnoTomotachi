@@ -2,10 +2,14 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# 系统依赖：psycopg 编译 + curl（agent reach 工具用 curl 拉链接）
+# 系统依赖：psycopg 编译 + curl + tzdata（设中国时区）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev gcc curl ca-certificates \
+    libpq-dev gcc curl ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 中国大陆时区——bot 的 clock.now_signal / availability / proactive 都依赖 datetime.now() 取本地时间
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 先装依赖让 layer 可缓存
 COPY pyproject.toml ./
