@@ -71,19 +71,20 @@ services:
 
   cloudflared:
     # 给 admin UI 一个临时的 https://<random>.trycloudflare.com URL（HTTPS、零配置、不开端口）。
-    # URL 由 cloudflared 启动时分配，写入 /shared/cf.log；bot 的 /admin 命令读这个文件返回。
-    # restart 后 URL 会变 → 用 /admin 重新获取
+    # cloudflared 用 --logfile 把启动日志（含分配到的 URL）写到 /shared/cf.log；
+    # bot 的 /admin 命令读这个文件 grep 出当前 URL 返回。restart 后 URL 会变 → 重新 /admin。
     image: cloudflare/cloudflared:latest
     container_name: aidemo-cloudflared
     restart: unless-stopped
     depends_on:
       - admin
-    entrypoint: ["sh", "-c"]
-    # tee 同时落盘 + 输出日志，便于排查；--no-autoupdate 防止重启
     command:
-      - |
-        : > /shared/cf.log
-        exec cloudflared tunnel --no-autoupdate --url http://admin:18081 2>&1 | tee /shared/cf.log
+      - tunnel
+      - --no-autoupdate
+      - --url
+      - http://admin:18081
+      - --logfile
+      - /shared/cf.log
     volumes:
       - cf-shared:/shared
 
