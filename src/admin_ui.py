@@ -162,7 +162,7 @@ _INDEX_HTML = """<!doctype html>
   .tab { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .tab table { min-width: 100%; }
 
-  /* 移动端断点 */
+  /* 移动端断点：表格转卡片，thead 隐藏，每行变成一张卡 */
   @media (max-width: 720px) {
     body { font-size: 13px; }
     header { padding: 10px 12px; flex-wrap: wrap; gap: 6px 12px; }
@@ -175,14 +175,65 @@ _INDEX_HTML = """<!doctype html>
     .toolbar { gap: 6px; }
     .toolbar input[type=search] { min-width: 0; flex: 1 1 180px; }
     .toolbar select, .toolbar input { font-size: 13px; padding: 8px 10px; }
-    th, td { padding: 8px 8px; font-size: 12px; }
-    td.summary, .audit-summary { max-width: 60vw; }
     /* 触控更友好的按钮 */
     button.op { padding: 7px 11px; font-size: 12px; min-height: 32px; }
     .modal { padding: 14px; }
     .modal textarea { min-height: 100px; }
     .modal .actions button { padding: 8px 14px; }
     pre.json { font-size: 11px; max-height: 50vh; }
+
+    /* 表格 → 卡片栈 */
+    .tab { overflow-x: visible; }
+    .tab table { display: block; background: transparent; border: none; min-width: 0; border-radius: 0; }
+    .tab thead { display: none; }  /* 列头隐藏 */
+    .tab tbody { display: block; }
+    .tab tr {
+      display: block;
+      background: white;
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.02);
+    }
+    .tab td {
+      display: block;
+      padding: 5px 0;
+      border: none;
+      white-space: normal;
+      word-break: break-word;
+      font-size: 13px;
+      max-width: none;
+    }
+    .tab td.mono { color: var(--muted); font-size: 11px; white-space: normal; }
+    .tab td.ops {
+      text-align: left;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--bd);
+      white-space: normal;
+    }
+    .tab td.ops button.op { margin-left: 0; margin-right: 6px; }
+    /* data-label 当字段标签显示在每个 td 前 */
+    .tab td[data-label]::before {
+      content: attr(data-label) "  ";
+      display: inline-block;
+      color: var(--muted);
+      font-size: 11px;
+      min-width: 44px;
+      margin-right: 8px;
+      vertical-align: top;
+    }
+    /* 长文本字段：label 放上一行，正文换行 */
+    .tab td.summary[data-label]::before,
+    .tab td.audit-summary[data-label]::before {
+      display: block;
+      margin-bottom: 2px;
+      min-width: 0;
+    }
+    /* empty / 空表 row 不变卡片，保留居中提示 */
+    .tab tr td.empty { text-align: center; padding: 30px 8px; color: var(--muted); }
+    .tab tr td.empty::before { display: none; }
   }
 
   /* 防止 iOS Safari 自动放大 input（字号 < 16px 会触发） */
@@ -338,12 +389,12 @@ async function loadCats() {
   if (!j.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">空</td></tr>'; return; }
   for (const c of j) {
     const tr = el('tr');
-    tr.appendChild(el('td', {}, c.name || '（未命名）'));
-    tr.appendChild(el('td', {}, String(c.item_count || 0)));
-    const td = el('td', { class: 'summary' });
+    tr.appendChild(el('td', { 'data-label': '名字' }, c.name || '（未命名）'));
+    tr.appendChild(el('td', { 'data-label': '条目' }, String(c.item_count || 0)));
+    const td = el('td', { class: 'summary', 'data-label': '摘要' });
     td.textContent = (c.summary || c.description || '').slice(0, 400);
     tr.appendChild(td);
-    tr.appendChild(el('td', { class: 'mono' }, fmt(c.updated_at)));
+    tr.appendChild(el('td', { class: 'mono', 'data-label': '更新' }, fmt(c.updated_at)));
     const ops = el('td', { class: 'ops' });
     const bEdit = el('button', { class: 'op' }, '编辑');
     bEdit.onclick = () => {
@@ -383,9 +434,9 @@ async function loadItems() {
   for (const it of j) {
     const tr = el('tr');
     const pill = el('span', { class: 'pill' }, it.memory_type || '');
-    const tdT = el('td'); tdT.appendChild(pill); tr.appendChild(tdT);
-    tr.appendChild(el('td', { class: 'summary' }, it.summary || ''));
-    tr.appendChild(el('td', { class: 'mono' }, fmt(it.created_at)));
+    const tdT = el('td', { 'data-label': '类型' }); tdT.appendChild(pill); tr.appendChild(tdT);
+    tr.appendChild(el('td', { class: 'summary', 'data-label': '内容' }, it.summary || ''));
+    tr.appendChild(el('td', { class: 'mono', 'data-label': '时间' }, fmt(it.created_at)));
     const ops = el('td', { class: 'ops' });
     const bEdit = el('button', { class: 'op' }, '编辑');
     bEdit.onclick = () => {
@@ -421,9 +472,9 @@ async function loadResources() {
   if (!j.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">空</td></tr>'; return; }
   for (const x of j) {
     const tr = el('tr');
-    tr.appendChild(el('td', {}, x.modality || ''));
-    tr.appendChild(el('td', { class: 'summary' }, x.url || ''));
-    tr.appendChild(el('td', { class: 'mono' }, fmt(x.created_at)));
+    tr.appendChild(el('td', { 'data-label': '模态' }, x.modality || ''));
+    tr.appendChild(el('td', { class: 'summary', 'data-label': 'URL' }, x.url || ''));
+    tr.appendChild(el('td', { class: 'mono', 'data-label': '创建' }, fmt(x.created_at)));
     tb.appendChild(tr);
   }
 }
@@ -524,9 +575,9 @@ async function loadAudit() {
   for (const d of j) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="mono">${auditTimeFmt(d.ts)}</td>
-      <td><span class="ev ${d.event}">${d.event}</span></td>
-      <td class="audit-summary">${summarizeAudit(d)}</td>
+      <td class="mono" data-label="时间">${auditTimeFmt(d.ts)}</td>
+      <td data-label="事件"><span class="ev ${d.event}">${d.event}</span></td>
+      <td class="audit-summary" data-label="摘要">${summarizeAudit(d)}</td>
       <td class="ops"><button class="op">详情</button></td>
     `;
     tr.querySelector('button').addEventListener('click', () => {
