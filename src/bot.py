@@ -144,11 +144,23 @@ async def _cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """admin 用——返回当前 cloudflared 临时 admin UI URL（每次 cloudflared 重启会变）。"""
+async def _cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """所有激活用户可用——返回 webUI URL + 个人登录信息。
+
+    admin（环境变量凭证）→ 看全部用户数据（带下拉切换）。
+    普通用户 → 只看自己。用户名 = chat_id，密码用 /mypw 查。
+    """
     chat = update.effective_chat
-    if chat is None or not users.is_admin(chat.id):
+    if chat is None:
         return
+    chat_id = chat.id
+    if not users.is_active(chat_id) and not users.is_admin(chat_id):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="webUI 需要先激活账号——发 /start <邀请码>",
+        )
+        return
+
     import os, re
     log_path = "/shared/cf.log"
     url = ""
@@ -163,13 +175,26 @@ async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             pass
     if not url:
         await context.bot.send_message(
-            chat_id=chat.id,
-            text="cloudflared 还没拿到 URL（可能刚重启），过 30 秒再试 /admin",
+            chat_id=chat_id,
+            text="webUI 服务还没拿到 URL（可能刚重启），过 30 秒再试 /memory",
         )
         return
-    user_env = os.environ.get("ADMIN_UI_USER", "")
-    msg = f"admin UI: {url}\n\n首次访问会提示输用户名/密码（用户名：{user_env or '设的那个'}）"
-    await context.bot.send_message(chat_id=chat.id, text=msg)
+
+    if users.is_admin(chat_id):
+        admin_user = os.environ.get("ADMIN_UI_USER", "")
+        msg = (
+            f"webUI: {url}\n\n"
+            f"管理员登录（看全部 + 下拉切换用户）：用户名 {admin_user or '(env 里设的)'}\n"
+            f"想用普通用户身份看自己的，发 /mypw 查个人密码"
+        )
+    else:
+        pw = users.get_webui_password(chat_id) or "(用 /mypw 查)"
+        msg = (
+            f"webUI: {url}\n\n"
+            f"登录：用户名 {chat_id} / 密码 {pw}\n"
+            f"（只能看你自己的记忆 / persona / 审计）"
+        )
+    await context.bot.send_message(chat_id=chat_id, text=msg)
 
 
 async def _cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -284,7 +309,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("mypw", _cmd_mypw))
     app.add_handler(CommandHandler("invite", _cmd_invite))
     app.add_handler(CommandHandler("users", _cmd_users))
-    app.add_handler(CommandHandler("admin", _cmd_admin))
+    app.add_handler(CommandHandler("memory", _cmd_memory))
     # 业务
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _on_message))
     app.add_handler(MessageHandler(filters.PHOTO, _on_photo))

@@ -175,6 +175,44 @@ async def _cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """返回 webUI URL + 当前虚拟身份的登录信息。"""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    uid = _identity.get(chat.id)
+    if not uid or not users.is_active(uid):
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text="先 /become <label> 选身份并 /start <邀请码> 激活，再 /memory 拿 webUI",
+        )
+        return
+    import os, re
+    log_path = "/shared/cf.log"
+    url = ""
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
+            if m:
+                url = m.group(0)
+        except Exception:
+            pass
+    if not url:
+        await ctx.bot.send_message(chat_id=chat.id, text="webUI 还没就绪，过 30 秒再试")
+        return
+    pw = users.get_webui_password(uid) or "(无)"
+    await ctx.bot.send_message(
+        chat_id=chat.id,
+        text=(
+            f"webUI: {url}\n\n"
+            f"登录：用户名 {uid} / 密码 {pw}\n"
+            f"（虚拟身份 user_id={uid} 只看自己的数据）"
+        ),
+    )
+
+
 async def _cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """清空当前虚拟身份的所有数据。"""
     chat = update.effective_chat
@@ -299,6 +337,7 @@ def build_application() -> Application | None:
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("whoami", _cmd_whoami))
     app.add_handler(CommandHandler("clear", _cmd_clear))
+    app.add_handler(CommandHandler("memory", _cmd_memory))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _on_message))
     app.add_handler(MessageHandler(filters.PHOTO, _on_photo))
     _app = app
