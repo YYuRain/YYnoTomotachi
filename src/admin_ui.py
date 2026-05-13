@@ -23,13 +23,8 @@ import json
 import logging
 from typing import Any
 
-import hmac
-import hashlib
-import json as _json
 import os
-import secrets
 import time
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -40,60 +35,26 @@ from sqlalchemy import create_engine, text
 from .config import settings
 
 
-# Cookie session（替代 Basic Auth；Basic Auth 在浏览器退不干净，
-# admin 凭证记完后切换普通用户体验很差）：
-# - POST /login JSON {username,password} → 验证 → set cookie aidemo_session（HMAC 签名）
-# - GET /logout → 删 cookie + 跳 /login
-# - GET / → cookie 无效就重定向 /login；有效就返回主页
-# - /api/* → cookie 无效返 401，前端识别后跳 /login
+# Cookie session：登录走 Telegram /memory 返回的 token URL。
+# 没有密码逻辑——bot 进程铸 token 是完全的"凭票入场"。
+# token 用 HMAC 签名，密钥在 src/users.py 中由 bot/admin 共享（disk file `data/.webui_secret`）。
 _SESSION_COOKIE = "aidemo_session"
 _SESSION_TTL = 7 * 86400
-_session_secret: bytes | None = None
-
-
-def _get_secret() -> bytes:
-    """进程级随机密钥；重启会让所有现有 session 失效——可接受。"""
-    global _session_secret
-    if _session_secret is None:
-        _session_secret = secrets.token_bytes(32)
-    return _session_secret
-
-
-def _sign_session(payload: dict) -> str:
-    body = urlsafe_b64encode(_json.dumps(payload).encode()).rstrip(b"=").decode()
-    sig = hmac.new(_get_secret(), body.encode(), hashlib.sha256).hexdigest()
-    return f"{body}.{sig}"
-
-
-def _verify_session(token: str) -> dict | None:
-    if not token or "." not in token:
-        return None
-    try:
-        body, sig = token.rsplit(".", 1)
-        expected = hmac.new(_get_secret(), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        padded = body + "=" * ((4 - len(body) % 4) % 4)
-        payload = _json.loads(urlsafe_b64decode(padded.encode()))
-        if int(payload.get("exp", 0)) < int(time.time()):
-            return None
-        return payload
-    except Exception:
-        return None
 
 
 def _session_from_request(request: Request) -> dict | None:
-    return _verify_session(request.cookies.get(_SESSION_COOKIE, ""))
+    from . import users
+    return users.verify_session_token(request.cookies.get(_SESSION_COOKIE, ""))
 
 
 def _get_viewer(request: Request) -> int | None:
     """返回 viewer 的 user_id；None 表示 admin（看全部，可加 ?user_id 过滤）。
 
-    没登录 / cookie 失效 → 401。前端 fetch 收到 401 跳 /login。
+    cookie 不在或失效 → 401。前端 fetch 收到 401 跳 /login（提示去 Telegram 拿链接）。
     """
+    # dev 模式：admin env 都没设 + admin_chat_id 是默认值时，不鉴权
     admin_user = os.environ.get("ADMIN_UI_USER", "")
     admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
-    # dev 模式：env 都没设 → 不鉴权，当 admin
     if not admin_user and not admin_pwd:
         return None
     p = _session_from_request(request)
@@ -159,49 +120,27 @@ _LOGIN_HTML = """<!doctype html>
   body { font: 14px/1.5 -apple-system, "PingFang SC", system-ui, sans-serif; color:#222; margin:0;
          background:#fafafa; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
   .card { background:white; padding:28px 26px; border-radius:10px; border:1px solid #e4e4e4;
-          box-shadow:0 4px 16px rgba(0,0,0,.04); width:100%; max-width:340px; }
-  h1 { margin:0 0 6px; font-size:16px; font-weight:600; }
-  p.hint { margin:0 0 18px; color:#888; font-size:12px; }
-  label { display:block; font-size:12px; color:#666; margin-bottom:4px; }
-  input { width:100%; padding:10px 12px; border:1px solid #e4e4e4; border-radius:6px; font:inherit; font-size:16px; }
-  input:focus { outline:none; border-color:#1a6cff; }
-  .row { margin-bottom:14px; }
-  button { width:100%; padding:10px; background:#1a6cff; color:white; border:none; border-radius:6px;
-           font:inherit; font-weight:600; cursor:pointer; }
-  button:hover { background:#1558d6; }
-  .err { color:#d9554f; font-size:12px; margin-top:10px; min-height:18px; }
+          box-shadow:0 4px 16px rgba(0,0,0,.04); width:100%; max-width:380px; text-align:center; }
+  h1 { margin:0 0 14px; font-size:18px; font-weight:600; }
+  p { margin:0 0 12px; color:#555; line-height:1.6; }
+  .cmd { display:inline-block; padding:6px 12px; background:#f0f4ff; color:#1a6cff;
+         border-radius:6px; font-family:ui-monospace,Menlo,monospace; font-size:14px; margin:2px; }
+  .err { color:#d9554f; font-size:13px; margin-top:14px; min-height:18px; }
+  .muted { color:#999; font-size:12px; }
 </style>
 </head><body>
-<form class="card" id="f">
+<div class="card">
   <h1>AIDemo · 登录</h1>
-  <p class="hint">管理员用 env 凭证；普通用户的用户名是 chat_id（在 Telegram 发 /mypw 拿密码）</p>
-  <div class="row">
-    <label>用户名</label>
-    <input name="username" autocomplete="username" autofocus required>
-  </div>
-  <div class="row">
-    <label>密码</label>
-    <input name="password" type="password" autocomplete="current-password" required>
-  </div>
-  <button type="submit">登录</button>
+  <p>这个 webUI 走 Telegram 链接登录，没有密码。</p>
+  <p>在 Telegram 里给你的 bot 发<br><span class="cmd">/memory</span><br>会回一条带登录链接的消息，点开就直接进。</p>
+  <p class="muted">链接 10 分钟内有效；登录后浏览器保 7 天</p>
   <div class="err" id="err"></div>
-</form>
+</div>
 <script>
-const f = document.getElementById('f'), err = document.getElementById('err');
-f.onsubmit = async (e) => {
-  e.preventDefault();
-  err.textContent = '';
-  const r = await fetch('/login', {
-    method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({ username: f.username.value, password: f.password.value })
-  });
-  if (r.ok) { location.href = '/'; }
-  else {
-    let m = '登录失败';
-    try { m = (await r.json()).detail || m; } catch (_) {}
-    err.textContent = m;
-  }
-};
+const params = new URLSearchParams(location.search);
+if (params.get('err') === 'expired') {
+  document.getElementById('err').textContent = '上次的链接过期了——重新发 /memory 拿一条';
+}
 </script>
 </body></html>
 """
@@ -817,37 +756,26 @@ def build_app() -> FastAPI:
     async def login_page() -> HTMLResponse:
         return HTMLResponse(_LOGIN_HTML)
 
-    @app.post("/login")
-    async def login_submit(request: Request, response: Response) -> dict:
-        body = await request.json()
-        username = (body.get("username") or "").strip()
-        password = body.get("password") or ""
-        admin_user = os.environ.get("ADMIN_UI_USER", "")
-        admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
-
-        viewer: int | None
-        is_admin: bool
-        if (admin_user and admin_pwd
-                and secrets.compare_digest(username, admin_user)
-                and secrets.compare_digest(password, admin_pwd)):
-            viewer, is_admin = None, True
-        else:
-            from . import users as _users
-            uid = _users.authenticate_webui(username, password)
-            if uid is None:
-                raise HTTPException(401, "用户名或密码错误")
-            viewer, is_admin = uid, False
-
-        payload = {"v": viewer, "a": is_admin, "exp": int(time.time()) + _SESSION_TTL}
-        token = _sign_session(payload)
-        response.set_cookie(
-            _SESSION_COOKIE, token,
-            max_age=_SESSION_TTL, httponly=True, samesite="lax",
-            # secure=True 在 HTTPS 必须；HTTP 直连 18081 时设 True 浏览器不发送 cookie。
-            # cloudflared 给我们 HTTPS，但 Cloudflare 后到 origin 是 HTTP——这里设 False 兼容两边
-            secure=False,
+    @app.get("/login-by-token")
+    async def login_by_token(t: str = Query(..., max_length=2048)) -> RedirectResponse:
+        """点 Telegram /memory 给的链接进来。token 校验通过 → set cookie → 跳主页。"""
+        from . import users as _users
+        payload = _users.verify_session_token(t)
+        if payload is None:
+            return RedirectResponse("/login?err=expired", status_code=302)
+        # 续期到完整 session TTL
+        cookie_token = _users.make_session_token(
+            payload.get("v"),
+            bool(payload.get("a")),
+            ttl=_SESSION_TTL,
         )
-        return {"ok": True, "is_admin": is_admin, "user_id": viewer}
+        resp = RedirectResponse("/", status_code=302)
+        resp.set_cookie(
+            _SESSION_COOKIE, cookie_token,
+            max_age=_SESSION_TTL, httponly=True, samesite="lax",
+            secure=False,  # cloudflare HTTPS → origin HTTP，secure=True 会让 cookie 不发回
+        )
+        return resp
 
     @app.get("/logout")
     async def logout() -> RedirectResponse:

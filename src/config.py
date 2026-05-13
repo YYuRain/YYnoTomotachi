@@ -29,6 +29,7 @@ class Settings:
     admin_chat_id: int            # 多用户化后这个 ID 是 admin（生成邀请码、看 /users 等）
     telegram_proxy: str
     test_bot_token: str           # 可选——多用户测试 bot；空 = 不启
+    webui_session_secret: str     # webUI session token 共享密钥；空 → 自动落 data/.webui_secret
 
     minimax_api_key: str
     minimax_group_id: str
@@ -78,6 +79,7 @@ def load_settings() -> Settings:
         admin_chat_id=int(_opt("ADMIN_CHAT_ID", "") or _req("TELEGRAM_ALLOWED_CHAT_ID")),
         telegram_proxy=_opt("TELEGRAM_PROXY", ""),
         test_bot_token=_opt("TEST_BOT_TOKEN", ""),
+        webui_session_secret=_opt("WEBUI_SESSION_SECRET", ""),
         minimax_api_key=_req("MINIMAX_API_KEY"),
         minimax_group_id=_opt("MINIMAX_GROUP_ID"),
         minimax_base_url=_opt("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/"),

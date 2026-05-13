@@ -93,25 +93,12 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if err:
         await context.bot.send_message(chat_id=chat_id, text=f"邀请码不对：{err}")
         return
-    pw = users.get_webui_password(chat_id) or "(无)"
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
             "搞定。\n你可以直接发消息聊了——不用再打 / 命令。\n\n"
-            f"webUI 登录：用户名 = {chat_id}，密码 = {pw}\n"
-            "（用 /mypw 随时再看）"
+            "想看自己的记忆/persona？发 /memory 拿 webUI 链接"
         ),
-    )
-
-
-async def _cmd_mypw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    if chat is None or not users.is_active(chat.id):
-        return
-    pw = users.get_webui_password(chat.id) or "(无)"
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=f"webUI 登录：\n用户名 = {chat.id}\n密码 = {pw}",
     )
 
 
@@ -145,16 +132,18 @@ async def _cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """所有激活用户可用——返回 webUI URL + 个人登录信息。
+    """所有激活用户可用——返回带签名 token 的 webUI 一键登录链接。
 
-    admin（环境变量凭证）→ 看全部用户数据（带下拉切换）。
-    普通用户 → 只看自己。用户名 = chat_id，密码用 /mypw 查。
+    admin（settings().admin_chat_id）→ 看全部用户数据（带下拉切换）。
+    普通用户 → 只看自己的数据。
+    链接 10 分钟内有效，点开自动 set cookie，浏览器保 7 天。
     """
     chat = update.effective_chat
     if chat is None:
         return
     chat_id = chat.id
-    if not users.is_active(chat_id) and not users.is_admin(chat_id):
+    is_admin = users.is_admin(chat_id)
+    if not is_admin and not users.is_active(chat_id):
         await context.bot.send_message(
             chat_id=chat_id,
             text="webUI 需要先激活账号——发 /start <邀请码>",
@@ -176,25 +165,21 @@ async def _cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not url:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="webUI 服务还没拿到 URL（可能刚重启），过 30 秒再试 /memory",
+            text="webUI 还没拿到 URL（cloudflared 可能刚重启），过 30 秒再试 /memory",
         )
         return
 
-    if users.is_admin(chat_id):
-        admin_user = os.environ.get("ADMIN_UI_USER", "")
-        msg = (
-            f"webUI: {url}\n\n"
-            f"管理员登录（看全部 + 下拉切换用户）：用户名 {admin_user or '(env 里设的)'}\n"
-            f"想用普通用户身份看自己的，发 /mypw 查个人密码"
-        )
-    else:
-        pw = users.get_webui_password(chat_id) or "(用 /mypw 查)"
-        msg = (
-            f"webUI: {url}\n\n"
-            f"登录：用户名 {chat_id} / 密码 {pw}\n"
-            f"（只能看你自己的记忆 / persona / 审计）"
-        )
-    await context.bot.send_message(chat_id=chat_id, text=msg)
+    token = users.make_session_token(None if is_admin else chat_id, is_admin)
+    login_url = f"{url}/login-by-token?t={token}"
+    role_hint = "管理员（看全部 + 下拉切换）" if is_admin else "只看自己的数据"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{login_url}\n\n"
+            f"点开直接进，{role_hint}\n"
+            f"（链接 10 分钟内有效；登进去浏览器保 7 天）"
+        ),
+    )
 
 
 async def _cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,7 +291,6 @@ def build_application() -> Application:
     # 命令在前
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("myid", _cmd_myid))
-    app.add_handler(CommandHandler("mypw", _cmd_mypw))
     app.add_handler(CommandHandler("invite", _cmd_invite))
     app.add_handler(CommandHandler("users", _cmd_users))
     app.add_handler(CommandHandler("memory", _cmd_memory))

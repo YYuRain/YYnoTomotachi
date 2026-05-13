@@ -1,16 +1,25 @@
-"""用户准入 + 邀请码（多用户化的"门"）。
+"""用户准入 + 邀请码（多用户化的"门"）+ webUI session token。
 
 设计：
 - `users` 表存活跃用户名单。chat_id 是 telegram 那个数字（=user_id）。
 - `invite_codes` 表存 admin 生成的邀请码；redeem 一次即标记 used。
 - admin 是 settings().admin_chat_id（单例），无需另外 grant。
 - 每条入站消息先经过 `is_active(chat_id)`；未激活的 silent drop（除了 /start <code> 路径）。
+
+webUI 登录走 Telegram 链接（/memory 命令）——bot 进程铸 HMAC 签名 token，
+admin 容器解 token 即设 cookie。两进程共享 `data/.webui_secret` 文件（compose 同卷）。
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json as _json
 import logging
 import secrets
+import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import select
@@ -29,33 +38,74 @@ def _gen_code() -> str:
     return "".join(secrets.choice(_ALPHA) for _ in range(8))
 
 
-def _gen_webui_password() -> str:
-    return "".join(secrets.choice(_ALPHA) for _ in range(8))
+# =============== webUI session token（HMAC，bot 与 admin 进程共享）===============
+
+# 跨进程共享密钥：写在挂载卷里的固定文件；首启者写、其它读
+_SECRET_PATH_NAME = ".webui_secret"
+_SESSION_TTL_DEFAULT = 7 * 86400  # 浏览器 cookie 有效期
+_LOGIN_TOKEN_TTL = 600            # /memory 给的链接 token 有效期，10 分钟够点开
 
 
-def get_webui_password(chat_id: int) -> Optional[str]:
-    """读这个用户的 webUI 登录密码（admin 走 env 不在这里）。"""
-    with session() as s:
-        row = s.get(User, chat_id)
-        return row.webui_password if row else None
+def _secret_path() -> Path:
+    return settings().root / "data" / _SECRET_PATH_NAME
 
 
-def authenticate_webui(username: str, password: str) -> Optional[int]:
-    """webUI Basic Auth 校验普通用户。返回 chat_id 或 None。
-    用户名 = 用户的 chat_id（数字字符串），密码 = users.webui_password。
-    admin（环境变量凭证）由 admin_ui.py 自己处理，不进这里。"""
-    if not username or not username.lstrip("-").isdigit():
+def _get_session_secret() -> bytes:
+    """返回 32 字节密钥；优先 env，再 disk file，最后生成并写盘。"""
+    env_val = settings().webui_session_secret
+    if env_val:
+        return env_val.encode()
+    p = _secret_path()
+    if p.exists():
+        try:
+            data = p.read_bytes().strip()
+            if len(data) >= 16:
+                return data
+        except Exception as e:
+            log.warning("read webui secret failed: %s", e)
+    # 首次生成
+    secret = secrets.token_hex(32).encode()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(secret)
+        try:
+            p.chmod(0o600)
+        except Exception:
+            pass
+        log.info("generated new webui session secret at %s", p)
+    except Exception as e:
+        log.warning("write webui secret failed (will use in-memory): %s", e)
+    return secret
+
+
+def make_session_token(user_id: Optional[int], is_admin: bool, *, ttl: int = _LOGIN_TOKEN_TTL) -> str:
+    """铸一个签名 token。bot 进程在 /memory 命令里用——admin 容器收到后 set cookie。"""
+    payload = {
+        "v": user_id,
+        "a": bool(is_admin),
+        "exp": int(time.time()) + ttl,
+    }
+    body = urlsafe_b64encode(_json.dumps(payload).encode()).rstrip(b"=").decode()
+    sig = hmac.new(_get_session_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def verify_session_token(token: str) -> Optional[dict]:
+    """校验 token；过期/无效返回 None。返回 payload dict（含 v / a / exp）。"""
+    if not token or "." not in token:
         return None
-    chat_id = int(username)
-    with session() as s:
-        row = s.get(User, chat_id)
-        if row is None or row.status != "active":
+    try:
+        body, sig = token.rsplit(".", 1)
+        expected = hmac.new(_get_session_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
             return None
-        if not row.webui_password:
+        padded = body + "=" * ((4 - len(body) % 4) % 4)
+        payload = _json.loads(urlsafe_b64decode(padded.encode()))
+        if int(payload.get("exp", 0)) < int(time.time()):
             return None
-        if secrets.compare_digest(row.webui_password, password):
-            return chat_id
-    return None
+        return payload
+    except Exception:
+        return None
 
 
 def is_active(chat_id: int) -> bool:
@@ -112,21 +162,17 @@ def redeem(code: str, chat_id: int) -> Optional[str]:
             return "邀请码不存在"
         if row.used_by is not None:
             return "邀请码已被使用"
-        # 标记 + 激活；同步生成 webUI 密码
+        # 标记 + 激活
         row.used_by = chat_id
         row.used_at = datetime.utcnow()
-        webui_pw = _gen_webui_password()
         if existing_user:
             existing_user.status = "active"
-            if not existing_user.webui_password:
-                existing_user.webui_password = webui_pw
         else:
             s.add(User(
                 chat_id=chat_id,
                 status="active",
                 created_at=datetime.utcnow(),
                 note=f"redeemed:{code}",
-                webui_password=webui_pw,
             ))
         s.commit()
     audit("user_activated", user_id=chat_id, via_code=code)

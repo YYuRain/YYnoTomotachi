@@ -143,12 +143,11 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if err:
         await ctx.bot.send_message(chat_id=chat.id, text=f"邀请码不对：{err}")
         return
-    pw = users.get_webui_password(uid) or "(无)"
     await ctx.bot.send_message(
         chat_id=chat.id,
         text=(
             f"搞定，user_id={uid} 注册成功。直接发消息开聊。\n"
-            f"webUI：用户名 = {uid}，密码 = {pw}"
+            f"想看 webUI 发 /memory"
         ),
     )
 
@@ -176,7 +175,7 @@ async def _cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """返回 webUI URL + 当前虚拟身份的登录信息。"""
+    """返回当前虚拟身份的 webUI 一键登录链接。"""
     chat = update.effective_chat
     if chat is None:
         return
@@ -184,7 +183,7 @@ async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not uid or not users.is_active(uid):
         await ctx.bot.send_message(
             chat_id=chat.id,
-            text="先 /become <label> 选身份并 /start <邀请码> 激活，再 /memory 拿 webUI",
+            text="先 /become <label> + /start <邀请码> 激活，再 /memory 拿 webUI",
         )
         return
     import os, re
@@ -202,13 +201,13 @@ async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not url:
         await ctx.bot.send_message(chat_id=chat.id, text="webUI 还没就绪，过 30 秒再试")
         return
-    pw = users.get_webui_password(uid) or "(无)"
+    token = users.make_session_token(uid, is_admin=False)
+    login_url = f"{url}/login-by-token?t={token}"
     await ctx.bot.send_message(
         chat_id=chat.id,
         text=(
-            f"webUI: {url}\n\n"
-            f"登录：用户名 {uid} / 密码 {pw}\n"
-            f"（虚拟身份 user_id={uid} 只看自己的数据）"
+            f"{login_url}\n\n"
+            f"点开直接进 user_id={uid} 视图（10 分钟内有效，登进去保 7 天）"
         ),
     )
 
