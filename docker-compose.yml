@@ -47,6 +47,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
+      - cf-shared:/shared:ro   # 读 cloudflared 写的 admin URL（/admin 命令用）
     # 不暴露端口；bot 是出站连接
 
   admin:
@@ -68,5 +69,24 @@ services:
       # 内网用建议改回 "127.0.0.1:18081:18081" 走 SSH 隧道
       - "0.0.0.0:18081:18081"
 
+  cloudflared:
+    # 给 admin UI 一个临时的 https://<random>.trycloudflare.com URL（HTTPS、零配置、不开端口）。
+    # URL 由 cloudflared 启动时分配，写入 /shared/cf.log；bot 的 /admin 命令读这个文件返回。
+    # restart 后 URL 会变 → 用 /admin 重新获取
+    image: cloudflare/cloudflared:latest
+    container_name: aidemo-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - admin
+    entrypoint: ["sh", "-c"]
+    # tee 同时落盘 + 输出日志，便于排查；--no-autoupdate 防止重启
+    command:
+      - |
+        : > /shared/cf.log
+        exec cloudflared tunnel --no-autoupdate --url http://admin:18081 2>&1 | tee /shared/cf.log
+    volumes:
+      - cf-shared:/shared
+
 volumes:
   pg-data:
+  cf-shared:

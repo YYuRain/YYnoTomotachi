@@ -128,6 +128,36 @@ async def _cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """admin 用——返回当前 cloudflared 临时 admin UI URL（每次 cloudflared 重启会变）。"""
+    chat = update.effective_chat
+    if chat is None or not users.is_admin(chat.id):
+        return
+    import os, re
+    log_path = "/shared/cf.log"
+    url = ""
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
+            if m:
+                url = m.group(0)
+        except Exception:
+            pass
+    if not url:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="cloudflared 还没拿到 URL（可能刚重启），过 30 秒再试 /admin",
+        )
+        return
+    user_env = os.environ.get("ADMIN_UI_USER", "(未设)")
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"admin UI:\n{url}\n\n用户名 {user_env} / 密码 你知道的",
+    )
+
+
 async def _cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None or not users.is_admin(chat.id):
@@ -239,6 +269,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("myid", _cmd_myid))
     app.add_handler(CommandHandler("invite", _cmd_invite))
     app.add_handler(CommandHandler("users", _cmd_users))
+    app.add_handler(CommandHandler("admin", _cmd_admin))
     # 业务
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _on_message))
     app.add_handler(MessageHandler(filters.PHOTO, _on_photo))
