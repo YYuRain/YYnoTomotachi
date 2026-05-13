@@ -1,16 +1,10 @@
-"""测试 bot——为多用户模拟设计。
+"""测试 bot——多用户模拟 + 完整邀请码流程 + 清盘。
 
 接一个**独立** Telegram bot token，跟 prod bot 共享同一个 agent / 数据库。
-关键差异：身份与 telegram chat_id **解耦**。
-
-工作流：
-1. 用户在测试 bot 里 `/become <label>` 选一个虚拟身份（label 任意：alice/bob/数字）
-2. label → 一个虚拟 user_id（落在 [9_000_000_000, ...] 范围，避开真 telegram chat_id）
-3. 后续消息按这个虚拟身份路由进 `agent.handle_user_message(virtual_uid, ...)`
-4. 同一个 telegram 账户能在不同时刻 /become 切到别的 label，对应不同 user_id 的记忆/persona/兴趣
-
-不走邀请码门：测试 bot 永远 auto-activate /become 调用过的身份。
-scheduler 也不给 test 用户发 proactive（status='test' 不在 list_active 里）。
+关键差异：身份与 telegram chat_id **解耦**——`/become <label>` 选虚拟 user_id。
+注册走真实流程：选完身份后必须 `/start <邀请码>` 才能聊天。
+`/clear` 把当前虚拟身份的所有数据清空（SQLite + memU postgres + 进程内存），
+同时把 redeem 过的邀请码释放回去——这样可以反复测"邀请→激活→聊天→清盘"完整闭环。
 
 启用：在 .env 里设 `TEST_BOT_TOKEN=<另一个 bot 的 token>`。
 """
@@ -69,6 +63,25 @@ def _make_send_sticker(bot, chat_id: int) -> Callable[[Path], Awaitable[None]]:
 
 # =============== 命令 ===============
 
+async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    await ctx.bot.send_message(
+        chat_id=chat.id,
+        text=(
+            "测试 bot——多用户邀请码流程模拟\n\n"
+            "/become <label>     选个虚拟身份（alice / bob / 数字 都行）\n"
+            "/start <邀请码>      用当前虚拟身份激活（找 admin /invite 拿码）\n"
+            "/whoami             看当前虚拟 + 真实 chat_id\n"
+            "/clear              清空当前虚拟身份的全部数据，邀请码归还\n"
+            "/help               这条帮助\n\n"
+            "流程：/become alice → /start <code> → 直接聊 → 想换身份 /become bob → 走一遍\n"
+            "想测重新邀请：/clear 后重新 /start 就行"
+        ),
+    )
+
+
 async def _cmd_become(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -86,10 +99,53 @@ async def _cmd_become(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await ctx.bot.send_message(chat_id=chat.id, text="label 不能为空")
         return
     _identity[chat.id] = uid
-    users.ensure_test_user(uid, label)
+    if users.is_active(uid):
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"切到 user_id={uid}（label={label}）\n这个身份已激活，直接说话",
+        )
+    else:
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"切到 user_id={uid}（label={label}）\n"
+                f"这个身份还没激活——发 /start <邀请码> 注册（找 admin /invite 拿码）"
+            ),
+        )
+
+
+async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """走真实注册流程——但 redeem 用 _identity 里的虚拟 uid 而非真实 chat.id。"""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    uid = _identity.get(chat.id)
+    if not uid:
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text="先 /become <label> 选个虚拟身份再 /start <邀请码>",
+        )
+        return
+    args = ctx.args or []
+    if users.is_active(uid):
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"user_id={uid} 已经激活了，直接发消息聊就行",
+        )
+        return
+    if not args:
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"用 /start <邀请码> 激活 user_id={uid}（找 admin /invite 拿码）",
+        )
+        return
+    err = users.redeem(args[0], uid)
+    if err:
+        await ctx.bot.send_message(chat_id=chat.id, text=f"邀请码不对：{err}")
+        return
     await ctx.bot.send_message(
         chat_id=chat.id,
-        text=f"切到 user_id={uid}（label={label}）\n直接发消息即可。/become 别的 label 切别的身份",
+        text=f"搞定，user_id={uid} 注册成功。现在直接发消息开聊",
     )
 
 
@@ -98,24 +154,39 @@ async def _cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is None:
         return
     uid = _identity.get(chat.id, 0)
-    await ctx.bot.send_message(
-        chat_id=chat.id,
-        text=(f"虚拟身份：user_id={uid}" if uid else "未设。先 /become <label>")
-              + f"\n你的真实 chat_id：{chat.id}",
-    )
+    if uid:
+        active = users.is_active(uid)
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"虚拟身份：user_id={uid}\n"
+                f"激活状态：{'✓ active' if active else '× 未激活，发 /start <code>'}\n"
+                f"真实 chat_id：{chat.id}"
+            ),
+        )
+    else:
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"还没选身份。/become <label> 开始\n你的真实 chat_id：{chat.id}",
+        )
 
 
-async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """清空当前虚拟身份的所有数据。"""
     chat = update.effective_chat
     if chat is None:
         return
+    uid = _identity.get(chat.id)
+    if not uid:
+        await ctx.bot.send_message(chat_id=chat.id, text="还没选身份。/become <label>")
+        return
+    counts = users.wipe_user(uid)
+    summary = "\n".join(f"  {k}: {v}" for k, v in counts.items() if v)
     await ctx.bot.send_message(
         chat_id=chat.id,
         text=(
-            "测试 bot——多用户模拟。\n"
-            "/become <label>  选个身份（alice / bob / 1 / 2 都行）\n"
-            "/whoami          看当前身份\n"
-            "选了身份后直接发消息聊；切别的 label = 切别的人。"
+            f"清空 user_id={uid} 完成：\n{summary or '  （没有数据）'}\n\n"
+            f"邀请码已释放可以重用。重新 /start <code> 即可再走一遍流程"
         ),
     )
 
@@ -128,7 +199,16 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     uid = _identity.get(chat.id)
     if not uid:
-        await ctx.bot.send_message(chat_id=chat.id, text="先 /become <label> 选个身份")
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text="先 /become <label> 选个虚拟身份；/help 看流程",
+        )
+        return
+    if not users.is_active(uid):
+        await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"user_id={uid} 还没激活，发 /start <邀请码>",
+        )
         return
     msg = update.effective_message
     if msg is None or not msg.text:
@@ -156,6 +236,9 @@ async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = _identity.get(chat.id)
     if not uid:
         await ctx.bot.send_message(chat_id=chat.id, text="先 /become <label>")
+        return
+    if not users.is_active(uid):
+        await ctx.bot.send_message(chat_id=chat.id, text=f"user_id={uid} 还没激活，/start <code>")
         return
     msg = update.effective_message
     if msg is None or not msg.photo:
@@ -207,10 +290,11 @@ def build_application() -> Application | None:
             HTTPXRequest(proxy=s.telegram_proxy, connect_timeout=20, read_timeout=35)
         )
     app = builder.build()
-    app.add_handler(CommandHandler("start", _cmd_help))
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("become", _cmd_become))
+    app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("whoami", _cmd_whoami))
+    app.add_handler(CommandHandler("clear", _cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _on_message))
     app.add_handler(MessageHandler(filters.PHOTO, _on_photo))
     _app = app

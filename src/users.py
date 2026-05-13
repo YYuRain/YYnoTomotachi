@@ -101,22 +101,75 @@ def redeem(code: str, chat_id: int) -> Optional[str]:
     return None
 
 
-def ensure_test_user(chat_id: int, label: str) -> None:
-    """test bot 用——把虚拟 uid 落到 users 表，status='test'。
+def wipe_user(user_id: int) -> dict[str, int]:
+    """删除一个用户的全部数据，返回每张表删了多少行。供 test bot /clear 用。
 
-    'test' 状态不进 list_active（scheduler 不会给 test 用户发 proactive），
-    但 agent / memory / interests 等模块对所有 user_id 一视同仁，照常路由。
+    清除范围：
+    - SQLite：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots / users
+    - SQLite：invite_codes 中由该 uid redeem 过的码 → used_by/used_at 设回 NULL（让同一 code 可重新激活）
+    - memU postgres：所有带 user_id 列的表，DELETE WHERE user_id = str(uid)
+    - 进程内存：agent._recent_per_user / memory._buffer_per_user / _last_flush_ts_per_user
+    - data/recent.json：重写
     """
+    from datetime import datetime as _dt  # 防与上方 import 冲突
+    from sqlalchemy import delete, update as _update
+    from .config import settings as _settings
+    from .storage import (
+        Interest, ReplySample, LastInteraction, ProactiveFire,
+        PersonaSnapshot, InviteCode,
+    )
+    counts: dict[str, int] = {}
+    # SQLite
     with session() as s:
-        row = s.get(User, chat_id)
-        if row is None:
-            s.add(User(
-                chat_id=chat_id,
-                status="test",
-                created_at=datetime.utcnow(),
-                note=f"test:{label}"[:200],
-            ))
-            s.commit()
+        for tbl in (Interest, ReplySample, ProactiveFire, PersonaSnapshot):
+            res = s.execute(delete(tbl).where(tbl.user_id == user_id))
+            counts[tbl.__tablename__] = int(res.rowcount or 0)
+        res = s.execute(delete(LastInteraction).where(LastInteraction.user_id == user_id))
+        counts["last_interaction"] = int(res.rowcount or 0)
+        # 释放该用户用过的邀请码（让重新走一次注册流程）
+        res = s.execute(
+            _update(InviteCode)
+            .where(InviteCode.used_by == user_id)
+            .values(used_by=None, used_at=None)
+        )
+        counts["invite_codes_freed"] = int(res.rowcount or 0)
+        res = s.execute(delete(User).where(User.chat_id == user_id))
+        counts["users"] = int(res.rowcount or 0)
+        s.commit()
+
+    # memU postgres
+    s = _settings()
+    if s.memu_metadata_provider == "postgres" and s.memu_db_url:
+        try:
+            import psycopg  # type: ignore
+            dsn = s.memu_db_url.replace("postgresql+psycopg://", "postgresql://")
+            uid_str = str(user_id)
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                rows = conn.execute(
+                    "SELECT table_name FROM information_schema.columns "
+                    "WHERE column_name='user_id' AND table_schema='public'"
+                ).fetchall()
+                for (t,) in rows:
+                    res = conn.execute(f"DELETE FROM {t} WHERE user_id=%s", (uid_str,))
+                    counts[f"memu.{t}"] = res.rowcount or 0
+        except Exception as e:
+            log.exception("wipe_user memU err: %s", e)
+            counts["memu_error"] = -1
+
+    # 进程内存 + recent.json
+    try:
+        from . import agent, memory  # 延迟避免循环
+        uid_str = str(user_id)
+        agent._recent_per_user.pop(uid_str, None)
+        memory._buffer_per_user.pop(uid_str, None)
+        memory._last_flush_ts_per_user.pop(uid_str, None)
+        agent._save_recent()
+    except Exception as e:
+        log.debug("wipe_user in-memory cleanup err: %s", e)
+
+    audit("user_wiped", user_id=user_id, counts=counts)
+    log.info("user wiped uid=%d counts=%s", user_id, counts)
+    return counts
 
 
 def list_users_with_meta() -> list[dict]:
