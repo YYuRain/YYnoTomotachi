@@ -169,9 +169,10 @@ async def _cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
-            if m:
-                url = m.group(0)
+            # 取最后一个匹配——cloudflared 重启会 append 新 URL 到同一个 log 文件，旧的还在前面
+            matches = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
+            if matches:
+                url = matches[-1]
         except Exception:
             pass
     if not url:
