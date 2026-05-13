@@ -275,6 +275,10 @@ _INDEX_HTML = """<!doctype html>
     <label class="muted" style="font-size:12px">查看用户：</label>
     <select id="user-select" style="font:inherit;padding:4px 8px;border:1px solid var(--bd);border-radius:6px"></select>
   </div>
+  <div id="who" style="font-size:12px;color:var(--muted);display:flex;gap:10px;align-items:center;margin-left:14px">
+    <span id="who-label"></span>
+    <a href="/logout" id="logout" style="color:var(--accent);text-decoration:none">退出</a>
+  </div>
 </header>
 
 <nav>
@@ -656,8 +660,17 @@ async function initViewer() {
   try {
     const me = await fetch('/api/me').then(r => r.json());
     _isAdmin = !!me.is_admin;
+    $('#who-label').textContent = _isAdmin ? '身份：管理员' : `身份：user_id=${me.user_id}`;
+    // 退出按钮：触发 401 然后跳回首页让浏览器重新弹凭证框
+    $('#logout').addEventListener('click', async (e) => {
+      e.preventDefault();
+      try { await fetch('/logout', { credentials: 'include' }); } catch (_) {}
+      // 重新加载让浏览器再 prompt 一次（部分浏览器对相同 host 仍会用旧凭证——
+      // 兜底提示用户开无痕窗或手动清浏览器密码）
+      alert('已发出退出请求。如果刷新后仍是原身份，开无痕窗口或手动清浏览器保存的密码再访问。');
+      window.location.href = '/';
+    });
     if (!_isAdmin) {
-      // 普通用户：固定看自己
       _currentUid = String(me.user_id || '');
       return;
     }
@@ -711,6 +724,19 @@ def build_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(viewer: int | None = Depends(_get_viewer)) -> HTMLResponse:
         return HTMLResponse(_INDEX_HTML)
+
+    @app.get("/logout")
+    async def logout() -> HTMLResponse:
+        """退出：返回 401 + 新 realm，让浏览器忘记之前的 Basic Auth 凭证。
+
+        WebKit/Chrome/Firefox 看到 realm 不同会丢掉缓存。配合用户自己再访问 /
+        重新输凭证。
+        """
+        raise HTTPException(
+            status_code=401,
+            detail="logged out",
+            headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin (logged out)"'},
+        )
 
     @app.get("/api/me")
     async def whoami(viewer: int | None = Depends(_get_viewer)) -> dict[str, Any]:
