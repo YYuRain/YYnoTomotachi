@@ -143,9 +143,13 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if err:
         await ctx.bot.send_message(chat_id=chat.id, text=f"邀请码不对：{err}")
         return
+    pw = users.get_webui_password(uid) or "(无)"
     await ctx.bot.send_message(
         chat_id=chat.id,
-        text=f"搞定，user_id={uid} 注册成功。现在直接发消息开聊",
+        text=(
+            f"搞定，user_id={uid} 注册成功。直接发消息开聊。\n"
+            f"webUI：用户名 = {uid}，密码 = {pw}"
+        ),
     )
 
 

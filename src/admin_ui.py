@@ -36,25 +36,43 @@ from sqlalchemy import create_engine, text
 from .config import settings
 
 
-# HTTP Basic Auth：设了 ADMIN_UI_USER + ADMIN_UI_PASSWORD 才启用；空值=不鉴权（兼容本机开发）
+# HTTP Basic Auth + 多用户隔离：
+# - admin（环境变量 ADMIN_UI_USER/PASSWORD）登入 → 看全部数据，可下拉切某用户
+# - 普通用户（用户名 = 自己 chat_id，密码 = users.webui_password）登入 → 只看自己
+# - admin 凭证 + 普通用户凭证 都没匹配 → 401
+# - 两个 env 变量都空 = dev 模式不鉴权，当作 admin 看全部
 _security = HTTPBasic(auto_error=False)
 
 
-def _check_auth(creds: HTTPBasicCredentials | None = Depends(_security)) -> None:
-    user = os.environ.get("ADMIN_UI_USER", "")
-    pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
-    if not user or not pwd:
-        return  # 没设凭证 = 不鉴权
-    if (
-        creds is None
-        or not secrets.compare_digest(creds.username, user)
-        or not secrets.compare_digest(creds.password, pwd)
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="auth required",
-            headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin"'},
-        )
+def _get_viewer(creds: HTTPBasicCredentials | None = Depends(_security)) -> int | None:
+    """返回 viewer 的 user_id；None 表示 admin（看全部，可加 ?user_id 过滤）。
+
+    raise 401 凭证不对。
+    """
+    from . import users  # 延迟避免循环
+    admin_user = os.environ.get("ADMIN_UI_USER", "")
+    admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
+
+    # dev 模式：env 没设 → 任意访问当 admin
+    if not admin_user and not admin_pwd:
+        return None
+
+    if creds is not None:
+        # admin 凭证
+        if (admin_user and admin_pwd
+                and secrets.compare_digest(creds.username, admin_user)
+                and secrets.compare_digest(creds.password, admin_pwd)):
+            return None
+        # 普通用户
+        uid = users.authenticate_webui(creds.username, creds.password)
+        if uid is not None:
+            return uid
+
+    raise HTTPException(
+        status_code=401,
+        detail="auth required",
+        headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin"'},
+    )
 
 log = logging.getLogger(__name__)
 
@@ -253,6 +271,10 @@ _INDEX_HTML = """<!doctype html>
     <span>资源 <b id="s-res">—</b></span>
     <span>审计 <b id="s-audit">—</b></span>
   </div>
+  <div id="user-switch" style="margin-left:auto;display:none">
+    <label class="muted" style="font-size:12px">查看用户：</label>
+    <select id="user-select" style="font:inherit;padding:4px 8px;border:1px solid var(--bd);border-radius:6px"></select>
+  </div>
 </header>
 
 <nav>
@@ -355,6 +377,14 @@ const el = (tag, attrs = {}, text = '') => {
   if (text) e.textContent = text;
   return e;
 };
+
+// === viewer 状态：admin 可切，普通用户固定自己 ===
+let _isAdmin = false;
+let _currentUid = '';   // 空 = 不过滤（admin 全看）；否则带 ?user_id=
+const withUid = (qs = '') => {
+  const sep = qs ? '&' : '';
+  return _currentUid ? qs + sep + 'user_id=' + encodeURIComponent(_currentUid) : qs;
+};
 const fmt = ts => ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
 const toast = (msg) => { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); setTimeout(() => t.classList.remove('on'), 1600); };
 
@@ -376,7 +406,7 @@ $('#modal-save').addEventListener('click', async () => {
 });
 
 async function loadStats() {
-  const r = await fetch('/api/stats'); const j = await r.json();
+  const r = await fetch('/api/stats?' + withUid()); const j = await r.json();
   $('#s-cats').textContent = j.categories;
   $('#s-items').textContent = j.items;
   $('#s-res').textContent = j.resources;
@@ -384,7 +414,7 @@ async function loadStats() {
 }
 
 async function loadCats() {
-  const r = await fetch('/api/categories'); const j = await r.json();
+  const r = await fetch('/api/categories?' + withUid()); const j = await r.json();
   const tb = $('#cats-tbody'); tb.innerHTML = '';
   if (!j.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">空</td></tr>'; return; }
   for (const c of j) {
@@ -427,7 +457,7 @@ async function loadCats() {
 async function loadItems() {
   const q = encodeURIComponent($('#q').value || '');
   const t = encodeURIComponent($('#type-filter').value || '');
-  const r = await fetch(`/api/items?q=${q}&type=${t}&limit=200`); const j = await r.json();
+  const r = await fetch(`/api/items?q=${q}&type=${t}&limit=200&` + withUid()); const j = await r.json();
   $('#items-hint').textContent = `${j.length} 条`;
   const tb = $('#items-tbody'); tb.innerHTML = '';
   if (!j.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">没命中</td></tr>'; return; }
@@ -467,7 +497,7 @@ async function loadItems() {
 }
 
 async function loadResources() {
-  const r = await fetch('/api/resources?limit=200'); const j = await r.json();
+  const r = await fetch('/api/resources?limit=200&' + withUid()); const j = await r.json();
   const tb = $('#res-tbody'); tb.innerHTML = '';
   if (!j.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">空</td></tr>'; return; }
   for (const x of j) {
@@ -563,6 +593,7 @@ async function loadAudit() {
   const params = new URLSearchParams();
   if (ev) params.set('event', ev);
   if (lim) params.set('limit', lim);
+  if (_currentUid) params.set('user_id', _currentUid);
   let j;
   try {
     j = await fetch('/api/audit?' + params).then(r => r.json());
@@ -621,49 +652,133 @@ closeModal = () => {
 
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
-loadStats();
-loadCats();
+async function initViewer() {
+  try {
+    const me = await fetch('/api/me').then(r => r.json());
+    _isAdmin = !!me.is_admin;
+    if (!_isAdmin) {
+      // 普通用户：固定看自己
+      _currentUid = String(me.user_id || '');
+      return;
+    }
+    // admin：拉用户列表填下拉
+    const us = await fetch('/api/users').then(r => r.json());
+    const sel = $('#user-select');
+    const optAll = el('option', { value: '' }, '全部用户');
+    sel.appendChild(optAll);
+    for (const u of us) {
+      const label = String(u.chat_id) + (u.note ? ` (${u.note})` : '') + (u.status === 'test' ? ' [test]' : '');
+      const o = el('option', { value: String(u.chat_id) }, label);
+      sel.appendChild(o);
+    }
+    $('#user-switch').style.display = '';
+    sel.addEventListener('change', () => {
+      _currentUid = sel.value;
+      // 刷新当前 tab
+      const cur = document.querySelector('nav button.active')?.dataset.tab;
+      loadStats();
+      if (cur === 'cats') loadCats();
+      else if (cur === 'items') loadItems();
+      else if (cur === 'res') loadResources();
+      else if (cur === 'audit') loadAudit();
+    });
+  } catch (e) {
+    console.warn('initViewer err', e);
+  }
+}
+
+initViewer().then(() => { loadStats(); loadCats(); });
 </script>
 
 </body></html>
 """
 
 
+def _resolve_uid(viewer: int | None, q_uid: int | None) -> str | None:
+    """决定查询的 user_id 过滤值（memU TEXT；str 形式）。
+    - viewer is None（admin）：用 q_uid；q_uid 也 None → None（不过滤，看全部）
+    - 普通用户：忽略 q_uid，强制用自己的 viewer_id（防越权）
+    """
+    if viewer is None:
+        return str(q_uid) if q_uid else None
+    return str(viewer)
+
+
 def build_app() -> FastAPI:
-    app = FastAPI(title="AIDemo Memory Admin", dependencies=[Depends(_check_auth)])
+    app = FastAPI(title="AIDemo Memory Admin")
     eng = _engine()
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
+    async def index(viewer: int | None = Depends(_get_viewer)) -> HTMLResponse:
         return HTMLResponse(_INDEX_HTML)
 
+    @app.get("/api/me")
+    async def whoami(viewer: int | None = Depends(_get_viewer)) -> dict[str, Any]:
+        """前端用：知道当前是 admin 还是普通用户，用来决定显示用户下拉。"""
+        return {"is_admin": viewer is None, "user_id": viewer}
+
+    @app.get("/api/users")
+    async def list_users(viewer: int | None = Depends(_get_viewer)) -> list[dict[str, Any]]:
+        """admin 下拉用——active + test 用户都列。普通用户只看自己。"""
+        from . import users as _users
+        if viewer is not None:
+            return [{"chat_id": viewer, "status": "active", "note": "you"}]
+        return _users.list_users_with_meta()
+
     @app.get("/api/stats")
-    async def stats() -> dict[str, int]:
+    async def stats(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, int]:
+        uid = _resolve_uid(viewer, user_id)
         with eng.connect() as c:
-            mem_stats = {
-                "categories": int(c.execute(text("SELECT count(*) FROM memory_categories")).scalar() or 0),
-                "items": int(c.execute(text("SELECT count(*) FROM memory_items")).scalar() or 0),
-                "resources": int(c.execute(text("SELECT count(*) FROM resources")).scalar() or 0),
-            }
+            if uid is None:
+                mem_stats = {
+                    "categories": int(c.execute(text("SELECT count(*) FROM memory_categories")).scalar() or 0),
+                    "items": int(c.execute(text("SELECT count(*) FROM memory_items")).scalar() or 0),
+                    "resources": int(c.execute(text("SELECT count(*) FROM resources")).scalar() or 0),
+                }
+            else:
+                mem_stats = {
+                    "categories": int(c.execute(text("SELECT count(*) FROM memory_categories WHERE user_id=:u"), {"u": uid}).scalar() or 0),
+                    "items": int(c.execute(text("SELECT count(*) FROM memory_items WHERE user_id=:u"), {"u": uid}).scalar() or 0),
+                    "resources": int(c.execute(text("SELECT count(*) FROM resources WHERE user_id=:u"), {"u": uid}).scalar() or 0),
+                }
+        # audit 计数：按 user_id 过滤的行
         audit_count = 0
         path = settings().root / "data" / "audit.jsonl"
         if path.exists():
             try:
-                with path.open("rb") as f:
-                    audit_count = sum(1 for _ in f)
+                if uid is None:
+                    with path.open("rb") as f:
+                        audit_count = sum(1 for _ in f)
+                else:
+                    with path.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                            except Exception:
+                                continue
+                            if str(d.get("user_id", "")) == uid:
+                                audit_count += 1
             except Exception:
                 pass
         return {**mem_stats, "audit": audit_count}
 
     @app.get("/api/audit")
     async def audit_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
         limit: int = Query(300, ge=1, le=5000),
         event: str = Query("", max_length=64),
     ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
         path = settings().root / "data" / "audit.jsonl"
         if not path.exists():
             return []
-        # 简单实现：全文 readlines（一天约 50KB-500KB，无需 mmap 倒读）
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except Exception as e:
@@ -680,30 +795,51 @@ def build_app() -> FastAPI:
                 continue
             if event and d.get("event") != event:
                 continue
+            if uid is not None and str(d.get("user_id", "")) != uid:
+                continue
             out.append(d)
-        # 倒序，取最近 limit 条
         out.reverse()
         return out[:limit]
 
     @app.get("/api/categories")
-    async def categories() -> list[dict[str, Any]]:
-        sql = text("""
-            SELECT c.id, c.name, c.description, c.summary, c.updated_at,
-              (SELECT count(*) FROM category_items ci WHERE ci.category_id = c.id) AS item_count
-            FROM memory_categories c
-            ORDER BY c.updated_at DESC NULLS LAST
-        """)
+    async def categories(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            sql = text("""
+                SELECT c.id, c.name, c.description, c.summary, c.updated_at,
+                  (SELECT count(*) FROM category_items ci WHERE ci.category_id = c.id) AS item_count
+                FROM memory_categories c
+                ORDER BY c.updated_at DESC NULLS LAST
+            """)
+            params: dict[str, Any] = {}
+        else:
+            sql = text("""
+                SELECT c.id, c.name, c.description, c.summary, c.updated_at,
+                  (SELECT count(*) FROM category_items ci WHERE ci.category_id = c.id) AS item_count
+                FROM memory_categories c
+                WHERE c.user_id = :u
+                ORDER BY c.updated_at DESC NULLS LAST
+            """)
+            params = {"u": uid}
         with eng.connect() as c:
-            rows = c.execute(sql).mappings().all()
+            rows = c.execute(sql, params).mappings().all()
         return [dict(r) for r in rows]
 
     @app.get("/api/items")
     async def items_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
         q: str = Query("", max_length=200),
         type: str = Query("", max_length=32),
         limit: int = Query(200, ge=1, le=1000),
     ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
         where, params = [], {"limit": limit}
+        if uid is not None:
+            where.append("user_id = :u"); params["u"] = uid
         if q.strip():
             where.append("summary ILIKE :q"); params["q"] = f"%{q.strip()}%"
         if type.strip():
@@ -718,18 +854,44 @@ def build_app() -> FastAPI:
         return [dict(r) for r in rows]
 
     @app.get("/api/resources")
-    async def resources(limit: int = Query(200, ge=1, le=1000)) -> list[dict[str, Any]]:
-        sql = text(
-            "SELECT id, modality, url, created_at FROM resources ORDER BY created_at DESC LIMIT :limit"
-        )
+    async def resources(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            sql = text("SELECT id, modality, url, created_at FROM resources ORDER BY created_at DESC LIMIT :limit")
+            params: dict[str, Any] = {"limit": limit}
+        else:
+            sql = text("SELECT id, modality, url, created_at FROM resources WHERE user_id=:u ORDER BY created_at DESC LIMIT :limit")
+            params = {"limit": limit, "u": uid}
         with eng.connect() as c:
-            rows = c.execute(sql, {"limit": limit}).mappings().all()
+            rows = c.execute(sql, params).mappings().all()
         return [dict(r) for r in rows]
 
-    # ============ 编辑接口 ============
+    # ============ 编辑接口（普通用户只能改自己的；admin 不限）============
+
+    def _check_owns(uid_filter: str | None, table: str, row_id: str) -> None:
+        """非 admin（uid_filter 非 None）必须确认要改的行属于自己。"""
+        if uid_filter is None:
+            return
+        with eng.connect() as c:
+            owner = c.execute(
+                text(f"SELECT user_id FROM {table} WHERE id = :id"), {"id": row_id}
+            ).scalar()
+        if owner is None:
+            raise HTTPException(404, "not found")
+        if str(owner) != uid_filter:
+            raise HTTPException(403, "not yours")
 
     @app.patch("/api/items/{item_id}")
-    async def patch_item(item_id: str, body: ItemPatch) -> dict[str, Any]:
+    async def patch_item(
+        item_id: str, body: ItemPatch,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, None)
+        _check_owns(uid, "memory_items", item_id)
         new_summary = body.summary.strip()
         vec = await _embed_one(new_summary)
         params: dict[str, Any] = {"id": item_id, "summary": new_summary}
@@ -750,7 +912,12 @@ def build_app() -> FastAPI:
         return {"ok": True, "embedded": vec is not None}
 
     @app.delete("/api/items/{item_id}")
-    async def delete_item(item_id: str) -> dict[str, Any]:
+    async def delete_item(
+        item_id: str,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, None)
+        _check_owns(uid, "memory_items", item_id)
         with eng.begin() as c:
             r = c.execute(text("DELETE FROM memory_items WHERE id = :id"), {"id": item_id})
             if r.rowcount == 0:
@@ -758,7 +925,12 @@ def build_app() -> FastAPI:
         return {"ok": True}
 
     @app.patch("/api/categories/{cat_id}")
-    async def patch_category(cat_id: str, body: CategoryPatch) -> dict[str, Any]:
+    async def patch_category(
+        cat_id: str, body: CategoryPatch,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, None)
+        _check_owns(uid, "memory_categories", cat_id)
         sets: list[str] = []
         params: dict[str, Any] = {"id": cat_id}
         embed_source: str | None = None
@@ -791,7 +963,12 @@ def build_app() -> FastAPI:
         return {"ok": True, "embedded": embedded}
 
     @app.delete("/api/categories/{cat_id}")
-    async def delete_category(cat_id: str) -> dict[str, Any]:
+    async def delete_category(
+        cat_id: str,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, None)
+        _check_owns(uid, "memory_categories", cat_id)
         with eng.begin() as c:
             # 先手动删 category_items（避免外键约束）
             c.execute(text("DELETE FROM category_items WHERE category_id = :id"), {"id": cat_id})

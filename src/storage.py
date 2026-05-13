@@ -70,6 +70,8 @@ class User(Base):
     status = Column(String, nullable=False, default="active")  # active | banned (预留)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     note = Column(String, nullable=True)  # admin 备注用
+    # webUI 登录密码（明文，每用户一个；admin 走 env 不用这个字段）
+    webui_password = Column(String, nullable=True)
 
 
 class InviteCode(Base):
@@ -91,7 +93,20 @@ def engine():
     if _engine is None:
         _engine = create_engine(f"sqlite:///{settings().app_db_path}", future=True)
         Base.metadata.create_all(_engine)
+        _ensure_columns(_engine)
     return _engine
+
+
+def _ensure_columns(eng) -> None:
+    """SQLite-friendly ALTER TABLE：给已有数据库补上模型新增的 nullable 列。
+    Base.metadata.create_all 只建缺的表，不动已有表的列。"""
+    from sqlalchemy import inspect, text
+    insp = inspect(eng)
+    if "users" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("users")}
+        if "webui_password" not in cols:
+            with eng.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN webui_password TEXT"))
 
 
 def session():

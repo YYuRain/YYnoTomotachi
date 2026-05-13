@@ -29,6 +29,35 @@ def _gen_code() -> str:
     return "".join(secrets.choice(_ALPHA) for _ in range(8))
 
 
+def _gen_webui_password() -> str:
+    return "".join(secrets.choice(_ALPHA) for _ in range(8))
+
+
+def get_webui_password(chat_id: int) -> Optional[str]:
+    """读这个用户的 webUI 登录密码（admin 走 env 不在这里）。"""
+    with session() as s:
+        row = s.get(User, chat_id)
+        return row.webui_password if row else None
+
+
+def authenticate_webui(username: str, password: str) -> Optional[int]:
+    """webUI Basic Auth 校验普通用户。返回 chat_id 或 None。
+    用户名 = 用户的 chat_id（数字字符串），密码 = users.webui_password。
+    admin（环境变量凭证）由 admin_ui.py 自己处理，不进这里。"""
+    if not username or not username.lstrip("-").isdigit():
+        return None
+    chat_id = int(username)
+    with session() as s:
+        row = s.get(User, chat_id)
+        if row is None or row.status != "active":
+            return None
+        if not row.webui_password:
+            return None
+        if secrets.compare_digest(row.webui_password, password):
+            return chat_id
+    return None
+
+
 def is_active(chat_id: int) -> bool:
     with session() as s:
         row = s.get(User, chat_id)
@@ -83,17 +112,21 @@ def redeem(code: str, chat_id: int) -> Optional[str]:
             return "邀请码不存在"
         if row.used_by is not None:
             return "邀请码已被使用"
-        # 标记 + 激活
+        # 标记 + 激活；同步生成 webUI 密码
         row.used_by = chat_id
         row.used_at = datetime.utcnow()
+        webui_pw = _gen_webui_password()
         if existing_user:
             existing_user.status = "active"
+            if not existing_user.webui_password:
+                existing_user.webui_password = webui_pw
         else:
             s.add(User(
                 chat_id=chat_id,
                 status="active",
                 created_at=datetime.utcnow(),
                 note=f"redeemed:{code}",
+                webui_password=webui_pw,
             ))
         s.commit()
     audit("user_activated", user_id=chat_id, via_code=code)

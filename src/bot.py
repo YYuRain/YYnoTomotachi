@@ -93,9 +93,25 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if err:
         await context.bot.send_message(chat_id=chat_id, text=f"邀请码不对：{err}")
         return
+    pw = users.get_webui_password(chat_id) or "(无)"
     await context.bot.send_message(
         chat_id=chat_id,
-        text="搞定。\n你可以直接发消息聊了——不用再打 / 命令。",
+        text=(
+            "搞定。\n你可以直接发消息聊了——不用再打 / 命令。\n\n"
+            f"webUI 登录：用户名 = {chat_id}，密码 = {pw}\n"
+            "（用 /mypw 随时再看）"
+        ),
+    )
+
+
+async def _cmd_mypw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None or not users.is_active(chat.id):
+        return
+    pw = users.get_webui_password(chat.id) or "(无)"
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"webUI 登录：\n用户名 = {chat.id}\n密码 = {pw}",
     )
 
 
@@ -265,6 +281,7 @@ def build_application() -> Application:
     # 命令在前
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("myid", _cmd_myid))
+    app.add_handler(CommandHandler("mypw", _cmd_mypw))
     app.add_handler(CommandHandler("invite", _cmd_invite))
     app.add_handler(CommandHandler("users", _cmd_users))
     app.add_handler(CommandHandler("admin", _cmd_admin))
