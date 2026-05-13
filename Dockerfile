@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir -e ".[persist]" "huggingface-hub[cli]"
 
-# bge-small-zh 烤进镜像（~100MB）
-RUN huggingface-cli download BAAI/bge-small-zh-v1.5 \
+# bge-small-zh 烤进镜像（~100MB）。新版 huggingface_hub 用 `hf`（旧 `huggingface-cli` 已移除）
+RUN hf download BAAI/bge-small-zh-v1.5 \
     --local-dir /opt/hf/bge-small-zh-v1.5
 
 ENV HF_HOME=/opt/hf \
