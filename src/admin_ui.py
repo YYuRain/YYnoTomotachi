@@ -685,7 +685,10 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 
 async function initViewer() {
   try {
-    const r = await fetch('/api/me');
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch('/api/me', { signal: ctl.signal, credentials: 'same-origin' });
+    clearTimeout(t);
     if (r.status === 401) { location.href = '/login'; return; }
     const me = await r.json();
     _isAdmin = !!me.is_admin;
@@ -718,6 +721,12 @@ async function initViewer() {
     });
   } catch (e) {
     console.warn('initViewer err', e);
+    // 8s timeout / 网络挂了：给个能看到的兜底页，免得手机一直白屏
+    document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#888;font-size:14px">'
+      + '加载超时。可能是 cookie 没存住——回 Telegram 重发 /memory 拿新链接，'
+      + '或长按链接选 “在浏览器中打开”。'
+      + '<br><br><a href="/login" style="color:#1a6cff">回登录页</a>'
+      + '</div>';
   }
 }
 
@@ -757,23 +766,40 @@ def build_app() -> FastAPI:
         return HTMLResponse(_LOGIN_HTML)
 
     @app.get("/login-by-token")
-    async def login_by_token(t: str = Query(..., max_length=2048)) -> RedirectResponse:
-        """点 Telegram /memory 给的链接进来。token 校验通过 → set cookie → 跳主页。"""
+    async def login_by_token(t: str = Query(..., max_length=2048)) -> HTMLResponse:
+        """点 Telegram /memory 给的链接进来。token 校验通过 → set cookie 在 HTML 响应里 → JS 跳主页。
+
+        不用 302 redirect 是因为部分手机浏览器（iOS Telegram 内嵌、SFSafariViewController）
+        对 "redirect 响应里设的 cookie" 处理不稳定，会出现 cookie 没存住、跳主页又被弹回登录的循环。
+        改成 HTML 响应：cookie 通过 Set-Cookie 头 + 页面渲染后 JS 直接 location.href = '/'，
+        cookie 已经被浏览器接收并存好。
+        """
         from . import users as _users
         payload = _users.verify_session_token(t)
         if payload is None:
-            return RedirectResponse("/login?err=expired", status_code=302)
-        # 续期到完整 session TTL
+            return HTMLResponse(
+                '<meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/login?err=expired">',
+                status_code=200,
+            )
         cookie_token = _users.make_session_token(
             payload.get("v"),
             bool(payload.get("a")),
             ttl=_SESSION_TTL,
         )
-        resp = RedirectResponse("/", status_code=302)
+        # 极简 HTML：先把 cookie set 上、再 JS 跳主页（同时 meta-refresh 兜底）
+        body = (
+            '<!doctype html><html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta http-equiv="refresh" content="0;url=/">'
+            '<title>登录中…</title>'
+            '<style>body{font:14px -apple-system,sans-serif;color:#888;margin:40px;text-align:center}</style>'
+            '</head><body>登录中…<script>location.replace("/");</script></body></html>'
+        )
+        resp = HTMLResponse(body, status_code=200)
         resp.set_cookie(
             _SESSION_COOKIE, cookie_token,
             max_age=_SESSION_TTL, httponly=True, samesite="lax",
-            secure=False,  # cloudflare HTTPS → origin HTTP，secure=True 会让 cookie 不发回
+            secure=False, path="/",
         )
         return resp
 
