@@ -1,0 +1,19 @@
+# 不让任何敏感/无用文件烤进镜像。运行时 .env 由 docker-compose 的 env_file 注入。
+.env
+.env.*
+.git
+.gitignore
+.venv
+.venv*/
+.claude
+.obsidian
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+data/
+me/img/
+Pasted image *.png
+Pasted image *.jpg
+*.bak.*
+.DS_Store
