@@ -101,6 +101,24 @@ def redeem(code: str, chat_id: int) -> Optional[str]:
     return None
 
 
+def ensure_test_user(chat_id: int, label: str) -> None:
+    """test bot 用——把虚拟 uid 落到 users 表，status='test'。
+
+    'test' 状态不进 list_active（scheduler 不会给 test 用户发 proactive），
+    但 agent / memory / interests 等模块对所有 user_id 一视同仁，照常路由。
+    """
+    with session() as s:
+        row = s.get(User, chat_id)
+        if row is None:
+            s.add(User(
+                chat_id=chat_id,
+                status="test",
+                created_at=datetime.utcnow(),
+                note=f"test:{label}"[:200],
+            ))
+            s.commit()
+
+
 def list_users_with_meta() -> list[dict]:
     """admin 看 /users 时用——返回 [{chat_id, status, created_at, note}, ...]。"""
     with session() as s:

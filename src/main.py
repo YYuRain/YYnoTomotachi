@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 
-from . import bot, embed_server, llm, llm_proxy, scheduler, storage
+from . import bot, embed_server, llm, llm_proxy, scheduler, storage, test_bot
 from .audit_log import audit
 from .config import settings
 
@@ -69,8 +69,13 @@ async def _main() -> None:
     await _wait_port(s.llm_proxy_host, s.llm_proxy_port, timeout=15.0)
     log.info("llm proxy ready @ %s:%d", s.llm_proxy_host, s.llm_proxy_port)
 
-    # Telegram application
+    # Telegram application（主 bot）
     app = bot.build_application()
+
+    # 可选：测试 bot（多用户模拟，TEST_BOT_TOKEN 设了才启）
+    test_app = test_bot.build_application()
+    if test_app is not None:
+        log.info("test bot 启用（多用户模拟，身份与 telegram chat 解耦）")
 
     # Scheduler——多用户版每个 job 内部按 user 构造 send/typing
     sched = scheduler.build()
@@ -91,6 +96,10 @@ async def _main() -> None:
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+    if test_app is not None:
+        await test_app.initialize()
+        await test_app.start()
+        await test_app.updater.start_polling()
     sched.start()
     log.info("ready")
 
@@ -104,6 +113,14 @@ async def _main() -> None:
             await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        if test_app is not None:
+            try:
+                if test_app.updater:
+                    await test_app.updater.stop()
+                await test_app.stop()
+                await test_app.shutdown()
+            except Exception as e:
+                log.debug("test bot shutdown err: %s", e)
         embed_task.cancel()
         proxy_task.cancel()
         for t in (embed_task, proxy_task):
