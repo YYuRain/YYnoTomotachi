@@ -23,13 +23,38 @@ import json
 import logging
 from typing import Any
 
+import os
+import secrets
+
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
 from .config import settings
+
+
+# HTTP Basic Auth：设了 ADMIN_UI_USER + ADMIN_UI_PASSWORD 才启用；空值=不鉴权（兼容本机开发）
+_security = HTTPBasic(auto_error=False)
+
+
+def _check_auth(creds: HTTPBasicCredentials | None = Depends(_security)) -> None:
+    user = os.environ.get("ADMIN_UI_USER", "")
+    pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
+    if not user or not pwd:
+        return  # 没设凭证 = 不鉴权
+    if (
+        creds is None
+        or not secrets.compare_digest(creds.username, user)
+        or not secrets.compare_digest(creds.password, pwd)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="auth required",
+            headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin"'},
+        )
 
 log = logging.getLogger(__name__)
 
@@ -519,7 +544,7 @@ loadCats();
 
 
 def build_app() -> FastAPI:
-    app = FastAPI(title="AIDemo Memory Admin")
+    app = FastAPI(title="AIDemo Memory Admin", dependencies=[Depends(_check_auth)])
     eng = _engine()
 
     @app.get("/", response_class=HTMLResponse)

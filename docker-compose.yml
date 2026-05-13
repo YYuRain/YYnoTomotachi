@@ -1,4 +1,14 @@
 services:
+  mihomo:
+    # Clash 内核（开源 mihomo）。HK 服务器需要它把 OpenRouter / Anthropic 调用转出去
+    # （某些区域 IP 被 Anthropic 限制）。订阅 yaml 挂在 ./clash-config.yaml
+    image: metacubex/mihomo:latest
+    container_name: aidemo-mihomo
+    restart: unless-stopped
+    volumes:
+      - ./clash-config.yaml:/root/.config/mihomo/config.yaml:ro
+    # 不暴露端口到宿主——只在 compose 内网由 bot/admin 访问 mihomo:9981
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: memu-postgres
@@ -23,6 +33,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      mihomo:
+        condition: service_started
     env_file: .env
     environment:
       # 容器内连同网内的 postgres
@@ -30,6 +42,8 @@ services:
       # bge 模型在镜像 build 时已下载到 /opt/hf/bge-small-zh-v1.5（不是 HF cache 布局），
       # 直接给 SentenceTransformer 绝对路径，避开 cache 找不到
       EMBED_MODEL_NAME: /opt/hf/bge-small-zh-v1.5
+      # 出口走 compose 内网 mihomo（Clash 订阅，US 节点）；Anthropic 模型对 HK IP 403
+      TELEGRAM_PROXY: http://mihomo:9981
     volumes:
       - ./data:/app/data
       - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
@@ -50,8 +64,9 @@ services:
       - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
     command: ["python", "-m", "scripts.admin"]
     ports:
-      # 只绑 127.0.0.1，外网访问靠 ssh -L 18081:127.0.0.1:18081 user@host
-      - "127.0.0.1:18081:18081"
+      # 公开监听；admin UI 走 HTTP Basic Auth（ADMIN_UI_USER / ADMIN_UI_PASSWORD）
+      # 内网用建议改回 "127.0.0.1:18081:18081" 走 SSH 隧道
+      - "0.0.0.0:18081:18081"
 
 volumes:
   pg-data:
