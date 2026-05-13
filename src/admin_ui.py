@@ -23,56 +23,86 @@ import json
 import logging
 from typing import Any
 
+import hmac
+import hashlib
+import json as _json
 import os
 import secrets
+import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
 from .config import settings
 
 
-# HTTP Basic Auth + 多用户隔离：
-# - admin（环境变量 ADMIN_UI_USER/PASSWORD）登入 → 看全部数据，可下拉切某用户
-# - 普通用户（用户名 = 自己 chat_id，密码 = users.webui_password）登入 → 只看自己
-# - admin 凭证 + 普通用户凭证 都没匹配 → 401
-# - 两个 env 变量都空 = dev 模式不鉴权，当作 admin 看全部
-_security = HTTPBasic(auto_error=False)
+# Cookie session（替代 Basic Auth；Basic Auth 在浏览器退不干净，
+# admin 凭证记完后切换普通用户体验很差）：
+# - POST /login JSON {username,password} → 验证 → set cookie aidemo_session（HMAC 签名）
+# - GET /logout → 删 cookie + 跳 /login
+# - GET / → cookie 无效就重定向 /login；有效就返回主页
+# - /api/* → cookie 无效返 401，前端识别后跳 /login
+_SESSION_COOKIE = "aidemo_session"
+_SESSION_TTL = 7 * 86400
+_session_secret: bytes | None = None
 
 
-def _get_viewer(creds: HTTPBasicCredentials | None = Depends(_security)) -> int | None:
-    """返回 viewer 的 user_id；None 表示 admin（看全部，可加 ?user_id 过滤）。
+def _get_secret() -> bytes:
+    """进程级随机密钥；重启会让所有现有 session 失效——可接受。"""
+    global _session_secret
+    if _session_secret is None:
+        _session_secret = secrets.token_bytes(32)
+    return _session_secret
 
-    raise 401 凭证不对。
-    """
-    from . import users  # 延迟避免循环
-    admin_user = os.environ.get("ADMIN_UI_USER", "")
-    admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
 
-    # dev 模式：env 没设 → 任意访问当 admin
-    if not admin_user and not admin_pwd:
+def _sign_session(payload: dict) -> str:
+    body = urlsafe_b64encode(_json.dumps(payload).encode()).rstrip(b"=").decode()
+    sig = hmac.new(_get_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def _verify_session(token: str) -> dict | None:
+    if not token or "." not in token:
+        return None
+    try:
+        body, sig = token.rsplit(".", 1)
+        expected = hmac.new(_get_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        padded = body + "=" * ((4 - len(body) % 4) % 4)
+        payload = _json.loads(urlsafe_b64decode(padded.encode()))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
         return None
 
-    if creds is not None:
-        # admin 凭证
-        if (admin_user and admin_pwd
-                and secrets.compare_digest(creds.username, admin_user)
-                and secrets.compare_digest(creds.password, admin_pwd)):
-            return None
-        # 普通用户
-        uid = users.authenticate_webui(creds.username, creds.password)
-        if uid is not None:
-            return uid
 
-    raise HTTPException(
-        status_code=401,
-        detail="auth required",
-        headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin"'},
-    )
+def _session_from_request(request: Request) -> dict | None:
+    return _verify_session(request.cookies.get(_SESSION_COOKIE, ""))
+
+
+def _get_viewer(request: Request) -> int | None:
+    """返回 viewer 的 user_id；None 表示 admin（看全部，可加 ?user_id 过滤）。
+
+    没登录 / cookie 失效 → 401。前端 fetch 收到 401 跳 /login。
+    """
+    admin_user = os.environ.get("ADMIN_UI_USER", "")
+    admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
+    # dev 模式：env 都没设 → 不鉴权，当 admin
+    if not admin_user and not admin_pwd:
+        return None
+    p = _session_from_request(request)
+    if p is None:
+        raise HTTPException(status_code=401, detail="login required")
+    if p.get("a"):
+        return None  # admin
+    v = p.get("v")
+    return int(v) if v is not None else None
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +147,64 @@ class ItemPatch(BaseModel):
 class CategoryPatch(BaseModel):
     summary: str | None = None
     description: str | None = None
+
+
+_LOGIN_HTML = """<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIDemo · 登录</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 -apple-system, "PingFang SC", system-ui, sans-serif; color:#222; margin:0;
+         background:#fafafa; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .card { background:white; padding:28px 26px; border-radius:10px; border:1px solid #e4e4e4;
+          box-shadow:0 4px 16px rgba(0,0,0,.04); width:100%; max-width:340px; }
+  h1 { margin:0 0 6px; font-size:16px; font-weight:600; }
+  p.hint { margin:0 0 18px; color:#888; font-size:12px; }
+  label { display:block; font-size:12px; color:#666; margin-bottom:4px; }
+  input { width:100%; padding:10px 12px; border:1px solid #e4e4e4; border-radius:6px; font:inherit; font-size:16px; }
+  input:focus { outline:none; border-color:#1a6cff; }
+  .row { margin-bottom:14px; }
+  button { width:100%; padding:10px; background:#1a6cff; color:white; border:none; border-radius:6px;
+           font:inherit; font-weight:600; cursor:pointer; }
+  button:hover { background:#1558d6; }
+  .err { color:#d9554f; font-size:12px; margin-top:10px; min-height:18px; }
+</style>
+</head><body>
+<form class="card" id="f">
+  <h1>AIDemo · 登录</h1>
+  <p class="hint">管理员用 env 凭证；普通用户的用户名是 chat_id（在 Telegram 发 /mypw 拿密码）</p>
+  <div class="row">
+    <label>用户名</label>
+    <input name="username" autocomplete="username" autofocus required>
+  </div>
+  <div class="row">
+    <label>密码</label>
+    <input name="password" type="password" autocomplete="current-password" required>
+  </div>
+  <button type="submit">登录</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+const f = document.getElementById('f'), err = document.getElementById('err');
+f.onsubmit = async (e) => {
+  e.preventDefault();
+  err.textContent = '';
+  const r = await fetch('/login', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ username: f.username.value, password: f.password.value })
+  });
+  if (r.ok) { location.href = '/'; }
+  else {
+    let m = '登录失败';
+    try { m = (await r.json()).detail || m; } catch (_) {}
+    err.textContent = m;
+  }
+};
+</script>
+</body></html>
+"""
 
 
 _INDEX_HTML = """<!doctype html>
@@ -658,18 +746,12 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 
 async function initViewer() {
   try {
-    const me = await fetch('/api/me').then(r => r.json());
+    const r = await fetch('/api/me');
+    if (r.status === 401) { location.href = '/login'; return; }
+    const me = await r.json();
     _isAdmin = !!me.is_admin;
     $('#who-label').textContent = _isAdmin ? '身份：管理员' : `身份：user_id=${me.user_id}`;
-    // 退出按钮：触发 401 然后跳回首页让浏览器重新弹凭证框
-    $('#logout').addEventListener('click', async (e) => {
-      e.preventDefault();
-      try { await fetch('/logout', { credentials: 'include' }); } catch (_) {}
-      // 重新加载让浏览器再 prompt 一次（部分浏览器对相同 host 仍会用旧凭证——
-      // 兜底提示用户开无痕窗或手动清浏览器密码）
-      alert('已发出退出请求。如果刷新后仍是原身份，开无痕窗口或手动清浏览器保存的密码再访问。');
-      window.location.href = '/';
-    });
+    // /logout 自身就 set-cookie 删 + 302 → /login，链接默认行为足够
     if (!_isAdmin) {
       _currentUid = String(me.user_id || '');
       return;
@@ -722,21 +804,56 @@ def build_app() -> FastAPI:
     eng = _engine()
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(viewer: int | None = Depends(_get_viewer)) -> HTMLResponse:
+    async def index(request: Request) -> HTMLResponse:
+        # 没登录跳 /login（不能用 Depends(_get_viewer) 因为它 raise 401，浏览器会显示 JSON）
+        admin_user = os.environ.get("ADMIN_UI_USER", "")
+        admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
+        if admin_user or admin_pwd:
+            if _session_from_request(request) is None:
+                return RedirectResponse("/login", status_code=302)
         return HTMLResponse(_INDEX_HTML)
 
-    @app.get("/logout")
-    async def logout() -> HTMLResponse:
-        """退出：返回 401 + 新 realm，让浏览器忘记之前的 Basic Auth 凭证。
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page() -> HTMLResponse:
+        return HTMLResponse(_LOGIN_HTML)
 
-        WebKit/Chrome/Firefox 看到 realm 不同会丢掉缓存。配合用户自己再访问 /
-        重新输凭证。
-        """
-        raise HTTPException(
-            status_code=401,
-            detail="logged out",
-            headers={"WWW-Authenticate": 'Basic realm="AIDemo Admin (logged out)"'},
+    @app.post("/login")
+    async def login_submit(request: Request, response: Response) -> dict:
+        body = await request.json()
+        username = (body.get("username") or "").strip()
+        password = body.get("password") or ""
+        admin_user = os.environ.get("ADMIN_UI_USER", "")
+        admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
+
+        viewer: int | None
+        is_admin: bool
+        if (admin_user and admin_pwd
+                and secrets.compare_digest(username, admin_user)
+                and secrets.compare_digest(password, admin_pwd)):
+            viewer, is_admin = None, True
+        else:
+            from . import users as _users
+            uid = _users.authenticate_webui(username, password)
+            if uid is None:
+                raise HTTPException(401, "用户名或密码错误")
+            viewer, is_admin = uid, False
+
+        payload = {"v": viewer, "a": is_admin, "exp": int(time.time()) + _SESSION_TTL}
+        token = _sign_session(payload)
+        response.set_cookie(
+            _SESSION_COOKIE, token,
+            max_age=_SESSION_TTL, httponly=True, samesite="lax",
+            # secure=True 在 HTTPS 必须；HTTP 直连 18081 时设 True 浏览器不发送 cookie。
+            # cloudflared 给我们 HTTPS，但 Cloudflare 后到 origin 是 HTTP——这里设 False 兼容两边
+            secure=False,
         )
+        return {"ok": True, "is_admin": is_admin, "user_id": viewer}
+
+    @app.get("/logout")
+    async def logout() -> RedirectResponse:
+        resp = RedirectResponse("/login", status_code=302)
+        resp.delete_cookie(_SESSION_COOKIE)
+        return resp
 
     @app.get("/api/me")
     async def whoami(viewer: int | None = Depends(_get_viewer)) -> dict[str, Any]:
