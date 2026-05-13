@@ -27,6 +27,9 @@ services:
     environment:
       # 容器内连同网内的 postgres
       MEMU_DB_URL: postgresql+psycopg://postgres:postgres@postgres:5432/memu
+      # bge 模型在镜像 build 时已下载到 /opt/hf/bge-small-zh-v1.5（不是 HF cache 布局），
+      # 直接给 SentenceTransformer 绝对路径，避开 cache 找不到
+      EMBED_MODEL_NAME: /opt/hf/bge-small-zh-v1.5
     volumes:
       - ./data:/app/data
       - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
