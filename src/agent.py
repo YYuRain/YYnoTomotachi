@@ -364,6 +364,32 @@ async def _post_turn(user_id: int, user_text: str, reply: str) -> None:
         log.debug("post_turn availability err: %s", e)
 
 
+async def generate_welcome(user_id: int) -> str:
+    """新用户激活后的第一条 AI 消息——目的是让对方愿意继续聊。
+
+    - 不召回记忆（新人没记忆）
+    - 不带兴趣（没素材）
+    - 用 WELCOME_OPENER_INSTRUCTIONS 指令套路
+    """
+    persona = load_persona_state(user_id)
+    sys_prompt = prompts.build_system_prompt(
+        persona=persona,
+        memories=[],
+        interests_top=[],
+        interests_cold=[],
+    )
+    bits = [f"现在 {clock.now_signal()}"]
+    hint = "[" + "｜".join(bits) + "]\n\n" + prompts.WELCOME_OPENER_INSTRUCTIONS
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": hint},
+    ]
+    text = await llm.chat(messages, temperature=1.0, max_tokens=300)
+    text = text.strip()
+    audit("welcome_generated", user_id=user_id, text=text)
+    return text
+
+
 async def generate_opener(user_id: int, context: dict | None = None) -> str:
     """scheduler 主动发起时用这个。
     context 由 proactive.decide 提供：user_probably_doing / opener_angle / recent_topics。

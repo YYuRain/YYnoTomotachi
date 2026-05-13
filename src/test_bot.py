@@ -27,6 +27,7 @@ from telegram.request import HTTPXRequest
 
 from . import agent, users
 from .config import settings
+from .rhythm import deliver
 
 log = logging.getLogger(__name__)
 _app: Application | None = None
@@ -145,11 +146,21 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await ctx.bot.send_message(
         chat_id=chat.id,
-        text=(
-            f"搞定，user_id={uid} 注册成功。直接发消息开聊。\n"
-            f"想看 webUI 发 /memory"
-        ),
+        text=f"搞定，user_id={uid} 注册成功。/memory 看 webUI",
     )
+    # AI 给新用户的第一条招呼
+    try:
+        text = await agent.generate_welcome(uid)
+        if text:
+            async def _send(t: str) -> None:
+                await ctx.bot.send_message(chat_id=chat.id, text=t)
+
+            async def _typing() -> None:
+                await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+
+            await deliver(text, _send, _typing, max_piece_chars=60, merge_up_to=12)
+    except Exception as e:
+        log.exception("welcome generation err: %s", e)
 
 
 async def _cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

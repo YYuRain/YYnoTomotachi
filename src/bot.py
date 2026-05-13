@@ -22,6 +22,7 @@ from telegram.request import HTTPXRequest
 
 from . import agent, users
 from .config import settings
+from .rhythm import deliver
 
 
 log = logging.getLogger(__name__)
@@ -93,13 +94,24 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if err:
         await context.bot.send_message(chat_id=chat_id, text=f"邀请码不对：{err}")
         return
+    # 系统级"激活成功"提示
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "搞定。\n你可以直接发消息聊了——不用再打 / 命令。\n\n"
-            "想看自己的记忆/persona？发 /memory 拿 webUI 链接"
-        ),
+        text="搞定。/memory 看自己的记忆，其它直接说话就行。",
     )
+    # 立刻让 AI 生成一条"拉对方进对话"的开场白
+    try:
+        text = await agent.generate_welcome(chat_id)
+        if text:
+            async def _send(t: str) -> None:
+                await context.bot.send_message(chat_id=chat_id, text=t)
+
+            async def _typing() -> None:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+            await deliver(text, _send, _typing, max_piece_chars=60, merge_up_to=12)
+    except Exception as e:
+        log.exception("welcome generation err: %s", e)
 
 
 async def _cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
