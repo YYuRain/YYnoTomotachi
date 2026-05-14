@@ -326,6 +326,32 @@ async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # =============== 构造 Application ===============
 
+def real_chat_id_for(virtual_uid: int) -> int | None:
+    """虚拟 uid → 该会话当前的 real chat_id（test bot 用）；未找到返 None。
+    scheduler 用这个判断要不要给虚拟用户发 proactive，以及发到哪里。"""
+    for real, virt in _identity.items():
+        if virt == virtual_uid:
+            return real
+    return None
+
+
+def make_send_and_typing(chat_id: int) -> tuple[
+    Callable[[str], Awaitable[None]], Callable[[], Awaitable[None]]
+]:
+    """供 scheduler 给 test bot 用户发 proactive 用——按 real chat_id 走 test bot Application。"""
+    app = build_application()
+    if app is None:
+        raise RuntimeError("test bot not enabled (TEST_BOT_TOKEN missing)")
+
+    async def send(text: str) -> None:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
+    async def typing() -> None:
+        await app.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    return send, typing
+
+
 def build_application() -> Application | None:
     """如果 TEST_BOT_TOKEN 没设，返回 None；调用方判断后跳过启动。"""
     global _app

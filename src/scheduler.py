@@ -14,9 +14,31 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from . import bot as bot_mod
-from . import interests, memory, persona, proactive, users
+from . import interests, memory, persona, proactive, test_bot, users
 from .agent import generate_opener
 from .rhythm import deliver
+
+# 虚拟 user_id 起点——test_bot 给虚拟身份分配的 uid 都在这之上
+_TEST_UID_BASE = 9_000_000_000
+
+
+def _resolve_send_typing(uid: int):
+    """决定 proactive 怎么把消息发给 user_id；返回 (send, typing) 或 None（无法路由就跳过）。
+
+    - 真 telegram chat_id（< _TEST_UID_BASE）：走 prod bot
+    - 虚拟 test 身份：必须能在 test_bot._identity 里反查到当前 real chat_id；
+      否则跳过（test bot 没启 / 用户没 /become / bot 重启了 _identity 丢）。
+      防止给虚拟 chat_id 发 telegram 消息抛异常浪费 LLM 调用。
+    """
+    if uid < _TEST_UID_BASE:
+        return bot_mod.make_send_and_typing(uid)
+    real = test_bot.real_chat_id_for(uid)
+    if real is None:
+        return None
+    try:
+        return test_bot.make_send_and_typing(real)
+    except RuntimeError:
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -62,10 +84,15 @@ def build() -> AsyncIOScheduler:
             decision = await proactive.decide(uid)
             if decision is None:
                 return
+            # 先确认能不能发；不能发就别浪费 LLM 调用 generate_opener
+            route = _resolve_send_typing(uid)
+            if route is None:
+                log.info("proactive skip uid=%d: no telegram route (test 身份无 _identity 反查)", uid)
+                return
+            send, typing = route
             text = await generate_opener(uid, context=decision)
             if not text:
                 return
-            send, typing = bot_mod.make_send_and_typing(uid)
             await deliver(text, send, typing)
             proactive.record_fire(
                 uid,
