@@ -1,36 +1,46 @@
 # AIDemo — Companion Agent
 
-陪伴型 Telegram agent（非助手/非咨询师）。单用户 MVP，本地部署。
+陪伴型 Telegram agent（非助手/非咨询师）。**多用户邀请制**（5–50 人），单实例。
+本地开发或腾讯香港云 Docker Compose 部署。
 
 ## 仓库
 
 GitHub（私有）：https://github.com/YYuRain/YYnoTomotachi，branch = `main`
 
 ```bash
-git add -p && git commit -m "..." && git push
+git add -p && git commit -m "..." && git push -c http.proxy=http://127.0.0.1:7897   # 本地需 Clash
 ```
 
-`.gitignore` 已排除：`.env`、`data/`、`.venv/`、`.obsidian/`、`.claude/`、`Pasted image *.png`
+`.dockerignore` 已让 `.env` / `data/` / `.git` 不进镜像；`.gitignore` 排除：`.env`、`data/`、`.venv/`、`.obsidian/`、`.claude/`、`Pasted image *.png`、`*.bak.*`
 
 ---
 
 ## 启动
 
+**本地开发**：
 ```bash
-docker start memu-postgres          # memU 持久化（postgres）
-.venv/bin/python -m src.main        # bot + embed server(:18080) + scheduler
-.venv/bin/python -m scripts.admin   # 记忆浏览 UI(:18081)，可选
+docker start memu-postgres        # memU 持久化（postgres）
+.venv/bin/python -m src.main      # prod bot (+ test bot 若 TEST_BOT_TOKEN 设了) + embed :18080 + llm_proxy :18082 + scheduler
+.venv/bin/python -m scripts.admin # 记忆浏览 UI :18081，可选
 ```
 
-详见 `document/running.md`。
+**云部署**（腾讯 HK 当前生产）：
+```bash
+docker compose build && docker compose up -d
+docker compose logs -f bot   # 看 ready
+```
+
+详见 `document/running.md`（本地）和 `document/deployment.md`（云端 + mihomo + cloudflared）。
 
 ## 关键环境变量（`.env`）
 
 | 变量 | 说明 |
 |------|------|
-| `TELEGRAM_BOT_TOKEN` | Bot token |
-| `TELEGRAM_ALLOWED_CHAT_ID` | 白名单单用户 chat id |
-| `TELEGRAM_PROXY` | `http://127.0.0.1:7897`（Clash） |
+| `TELEGRAM_BOT_TOKEN` | 主 bot token |
+| `ADMIN_CHAT_ID` | admin 用户的 chat_id（生成邀请码、看 /users）。兼容旧 `TELEGRAM_ALLOWED_CHAT_ID` |
+| `TEST_BOT_TOKEN` | 可选——第二个 bot token（多用户模拟，`/become` 切虚拟身份） |
+| `TELEGRAM_PROXY` | 本机 `http://127.0.0.1:7897`（Clash）；HK 云直连留空；compose 内 bot 设 `http://mihomo:9981` |
+| `ADMIN_UI_USER` / `ADMIN_UI_PASSWORD` | 备用 admin 凭证（主登录路径已不用密码，靠 Telegram `/memory` 一键登录链接） |
 | `MINIMAX_API_KEY` | MiniMax key |
 | `MINIMAX_GROUP_ID` | MiniMax group id |
 | `MINIMAX_CHAT_MODEL` | 默认 `MiniMax-M2` |
@@ -55,7 +65,9 @@ docker start memu-postgres          # memU 持久化（postgres）
 | 文件 | 一句话 |
 |------|--------|
 | `src/config.py` | `.env` → Settings |
-| `src/storage.py` | SQLite 表定义（interests/availability/proactive） |
+| `src/storage.py` | SQLite 表定义；多用户起所有表带 `user_id`，加 `users` / `invite_codes` |
+| `src/users.py` | 邀请码 + 准入 + `wipe_user`（test bot /clear）；webUI 共享 HMAC token（`make_session_token`/`verify_session_token`，密钥落盘 `data/.webui_secret`） |
+| `src/test_bot.py` | 可选——TEST_BOT_TOKEN 设了启用；`/become <label>` 选虚拟 user_id，走完整邀请码流程，`/clear` 清盘 |
 | `src/llm.py` | LLM 统一门面（openrouter/minimax/anthropic 分发，支持 tier） |
 | `src/minimax.py` | MiniMax chat/chat_json/embed |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
@@ -69,11 +81,11 @@ docker start memu-postgres          # memU 持久化（postgres）
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
-| `src/agent.py` | 对话 turn 流水线 + generate_opener；`_recent` 持久化 `data/recent.json`（重启接续短期上下文） |
+| `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
 | `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate |
-| `src/bot.py` | python-telegram-bot |
+| `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI，:18081） |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应 |
 | `src/memu_prompts_zh.py` | memU 中文化 prompt 模板（extraction/category_summary） |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
@@ -81,11 +93,29 @@ docker start memu-postgres          # memU 持久化（postgres）
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests, reply_samples, last_interaction, proactive_fires, persona_snapshots
-- **memU** via **Postgres** `localhost:5432/memu`（容器 `memu-postgres`）
-- **HuggingFace 模型缓存**：`~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`
-- **本地状态文件**：`data/recent.json`（短期上下文 12 轮）；`data/audit.jsonl`（审计事件流）
-- **静态资源**：`data/stickers/*` 表情包（文件名当 tag）；`data/eval/run_*.{jsonl,md}` 模型评测产物
+- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes`
+- **memU** via **Postgres**：本地 `localhost:5432/memu`（容器 `memu-postgres`）；compose 内是服务名 `postgres:5432`
+- **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
+- **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
+- **静态资源**：`data/stickers/*`（文件名当 tag）；`data/eval/run_*.{jsonl,md}`（模型评测）
+
+## Telegram 命令
+
+**主 bot**（所有用户）：
+- `/start <code>` 邀请码激活（激活后会立刻收到 AI 生成的欢迎开场白）
+- `/myid` 返回自己 chat_id
+- `/memory` 拿 webUI 一键登录链接（10min 内有效；admin 进去看全部，普通用户只看自己）
+
+**主 bot**（admin 专属，对应 `ADMIN_CHAT_ID`）：
+- `/invite [n]` 生成 n 个邀请码（默认 1）
+- `/users` 看注册用户列表
+
+**test bot**（如启用）：
+- `/become <label>` 选虚拟身份（label = alice/bob/数字）
+- `/start <code>` 走完整邀请流程激活当前虚拟身份
+- `/whoami` 看当前虚拟 + 真实 chat_id
+- `/clear` 清空当前虚拟身份的所有数据（SQLite + memU + 内存），邀请码归还
+- `/memory` 拿当前虚拟身份的 webUI 链接
 
 ## Agent Reach 工具
 
@@ -115,7 +145,8 @@ docker start memu-postgres          # memU 持久化（postgres）
 | `document/agent-reach-integration.md` | 工具集成：xhs/Exa/yt-dlp |
 | `document/minimax-integration.md` | MiniMax 接入与坑点 |
 | `document/memu-setup.md` | memU 配置 + Postgres 持久化 |
-| `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测都已落地，多用户未做） |
+| `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测/多用户都已落地） |
+| `document/deployment.md` | 云部署（Docker Compose + mihomo + cloudflared + 多用户测试流程） |
 | `document/persona-evolution.md` | 人格演化：traits/mood/observations/milestones 设计 |
 | `document/eval-system.md` | 模型评测系统（OpenRouter 多模型横向 + LLM judge） |
 | `document/session-log.md` | 搭建流水 |

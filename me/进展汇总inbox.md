@@ -24,3 +24,16 @@
 - 写迁移脚本 `scripts/migrate_to_multiuser.py`：备份 → 加 `user_id` 列 → 复制旧 me 数据归到 admin → wrap recent.json → UPDATE memU postgres
 - 部署形态：Docker Compose（bot + postgres + admin），HF 模型烤进镜像
 - 本地迁移并冒烟通过：旧 me 数据（144 interests / 314 reply_samples / 552 memU 行 / 24 短期上下文）全部归到 admin chat_id 名下，单用户路径仍跑得通
+
+## 2026-05-14
+
+- 项目部署到腾讯香港云（Docker Compose：bot + admin + postgres + mihomo + cloudflared）
+- HK 出口 IP 被 OpenRouter 拒 Anthropic 模型（403），加 mihomo 容器走 Clash 订阅美区出口
+- admin webUI HTTPS 化：cloudflared 临时 tunnel `*.trycloudflare.com`，零配置
+- webUI 鉴权改造两次最终落地：HMAC token URL 一键登录（bot `/memory` 命令铸链接，admin 容器解 token 设 cookie；密钥靠 `data/.webui_secret` 进程间共享）
+- webUI 分用户视图：admin 看全部 + 下拉切换；普通用户只看自己；移动端表格转卡片
+- 命令重命名：`/admin` → `/memory`；新增 `/mypw`（后又因切 token 路径删掉）
+- 新增测试 bot（TEST_BOT_TOKEN 可选）：`/become` 选虚拟身份、`/clear` 清盘、走完整邀请码流程
+- 用户激活后 AI 立刻发"开场白"（welcome opener，新指令 + `agent.generate_welcome`）
+- 容器时区设为 Asia/Shanghai（Dockerfile + scheduler）
+- 修一系列上云/部署期 bug：`huggingface-cli` → `hf`、`.env` 烤进镜像被 dotenv override（加 `.dockerignore`）、`EMBED_MODEL_NAME` 改绝对路径、`/myid` Markdown 解析 chat_id 下划线挂、cloudflared 必须 root 才能写共享卷、cf.log 取最后一个 URL（不是第一个，cloudflared 重启 append 不截断）、login-by-token 用 200 HTML+JS 跳代替 302（移动端 cookie 更稳）

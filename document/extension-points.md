@@ -101,12 +101,16 @@ class EmotionSignal:
 
 ---
 
-## 多用户（较大重构，不在预留范围）
+## 多用户 ✅（2026-05-13 接入）
 
-现在所有状态单用户写死：
-- memU `user_id = "me"`
-- interests/availability 全表单行单人
-- Telegram `TELEGRAM_ALLOWED_CHAT_ID` 白名单
+5–50 个邀请制用户，单实例。已落地的事：
 
-**真要做多用户**需要：interests/reply_samples 加 `user_id` 列；memory 按 chat_id 派生 user_id；
-agent 流水线改成实例化对象而不是模块级变量。**这条不是"下一期"的目标，按需再拆。**
+- **存储**：5 张 SQLite 表（interests/reply_samples/last_interaction/proactive_fires/persona_snapshots）全部加 `user_id` 列；新增 `users(chat_id, status, created_at, note, webui_password)` 和 `invite_codes(code, created_by, created_at, used_by, used_at)`。memU postgres 表已有 `user_id TEXT`，调用 SDK 时传 `str(chat_id)`。
+- **进程内存**：`agent._recent_per_user: dict[str, list]`、`memory._buffer_per_user: dict[str, list]`、`_last_flush_ts_per_user: dict[str, float]`。`data/recent.json` schema 是 `{<uid>: [msgs]}`。
+- **scheduler**：4 个 job（decay / memu_flush / persona_consolidate / proactive）改成 `asyncio.gather` 遍历 `users.list_active()`，`Semaphore(5)` 限并发。
+- **bot 入口**：`/start <code>` 走邀请码激活；admin 专属 `/invite [n]` / `/users`；普通命令 `/myid` / `/memory`。未激活用户消息 silent drop。
+- **测试 bot**（`src/test_bot.py`）：可选第二个 token，`/become <label>` 选虚拟 user_id（avoid telegram chat_id 的解耦），`/clear` 清盘——同一个 telegram 账户能模拟多个用户。
+
+迁移：`scripts/migrate_to_multiuser.py` 把 "me" 单用户老库整体归到 `ADMIN_CHAT_ID`（SQLite 加列 + memU postgres `UPDATE WHERE user_id='me'`）。
+
+详细设计：`document/deployment.md`（部署 + 多用户测试流程），CLAUDE.md（env / 命令清单）。

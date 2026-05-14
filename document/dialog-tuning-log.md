@@ -7,6 +7,19 @@
 
 ---
 
+## 2026-05-13 — 用户激活后 AI 生成开场白（welcome opener）
+
+**触发**：上云后多人邀请制——一个新用户走完 `/start <code>` 激活后，仅有"搞定，可以聊了"的系统提示太干，对方很容易想不出说啥然后不聊了。
+
+**改动**：
+- `src/prompts.py::WELCOME_OPENER_INSTRUCTIONS` 写一份"对方刚加进来，AI 主动冒个头"的指令——明确禁用客服话术（"欢迎使用"），要求 1–3 句、抛具体小钩子、不要"你想聊什么"。
+- `src/agent.py::generate_welcome(user_id)`：新人专用——不召回记忆、不带兴趣、用 baseline persona + welcome 指令喂给主 LLM。
+- `src/bot.py` + `src/test_bot.py` 的 `/start <code>` 成功路径：先发系统提示，紧跟一条 `generate_welcome` 输出（走 rhythm.deliver 拆条）。
+
+**生效**：bot 镜像 build 后即可。后续可以在系统提示里调老奶人格的 baseline，开场白会跟着风格走。
+
+---
+
 ## 2026-05-12 — 日常态从 INTP 偏向略 ENTP
 
 **触发**：用户："日常态的聊天有些平淡，希望 AI 感到聊天还'蛮有意思'，偶尔抖抖机灵，但不要刻意做作。目前比较 INTP，希望可以 ENTP 一点点，但不要太多。"
