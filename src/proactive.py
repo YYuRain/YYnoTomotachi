@@ -31,9 +31,9 @@ from .storage import ProactiveFire, session
 log = logging.getLogger(__name__)
 
 # 硬门参数（夜间不再硬门——交给软门判断）
-MIN_GAP_FROM_USER_SEC = 1 * 3600       # 对方刚聊过 1h 内不主动（缩短自 2h）
-MIN_GAP_FROM_SELF_SEC = 90 * 60        # 自己上次主动 90min 内不连续（缩短自 3h）
-DAILY_CAP = 6                          # 每天最多主动 6 条（提高自 3）
+MIN_GAP_FROM_USER_SEC = 30 * 60        # 对方刚聊过 30min 内不主动（缩短自 1h，2026-05-14）
+MIN_GAP_FROM_SELF_SEC = 60 * 60        # 自己上次主动 60min 内不连续（缩短自 90min，2026-05-14）
+DAILY_CAP = 6                          # 每天最多主动 6 条
 
 
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
