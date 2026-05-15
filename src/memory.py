@@ -266,6 +266,18 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
 
     try:
         svc = _get_service()
+        # memU 1.5.1 多用户 bug 绕过：MemoryService 实例上的 ctx.category_name_to_id
+        # 缓存第一个 user 的 category UUIDs，后续用户的 memorize 用同一份缓存 →
+        # category_items.category_id FK 违反（指向其他人的 category UUID）。
+        # 强制 reset 让 _ensure_categories_ready 按当前 user_scope 重 init。
+        try:
+            ctx = svc._get_context()
+            ctx.categories_ready = False
+            ctx.category_init_task = None
+            ctx.category_name_to_id = {}
+            ctx.category_ids = []
+        except Exception as e:
+            log.debug("memU ctx reset skipped: %s", e)
         result = await svc.memorize(
             resource_url=str(path),
             modality="conversation",
