@@ -45,59 +45,32 @@ def _buffer_dir() -> Path:
 
 
 def _ensure_memu_postgres_schema() -> None:
-    """memU SDK 升级会加新列（最近 1.5.1 加了 happened_at + extra），但旧库没有 → INSERT 全报
-    UndefinedColumn → memorize 静默失败 → audit 一直 new_items=0。这里做尽力的自愈：
-    检查 memU 模型期望的列，缺的 ALTER 加上。失败静默——仅诊断用。"""
+    """memU SDK 升级会加新列（1.5.1 加了 memory_items.happened_at + extra），旧库没就 INSERT 全报
+    UndefinedColumn → memorize 静默失败。这里做最小自愈——硬编码已知缺的列，启动时尝试 ALTER。
+    失败静默；仅诊断用。"""
     s = settings()
     if s.memu_metadata_provider != "postgres" or not s.memu_db_url:
         return
     try:
         import psycopg  # type: ignore
-        from memu.database.postgres.models import MemoryItemModel  # type: ignore
     except Exception as e:
-        log.debug("memU schema check skipped: %s", e)
+        log.debug("memU schema check skipped (no psycopg): %s", e)
         return
-    expected_cols = {c.name for c in MemoryItemModel.__table__.columns}
+    # (table, column, type) — 已知 memU SDK 升级后会缺的列；以后再加只在这里追加
+    known_additions = [
+        ("memory_items", "happened_at", "TIMESTAMP WITHOUT TIME ZONE"),
+        ("memory_items", "extra", "JSONB"),
+    ]
     dsn = s.memu_db_url.replace("postgresql+psycopg://", "postgresql://")
     try:
         with psycopg.connect(dsn, autocommit=True) as conn:
-            actual = {r[0] for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name='memory_items'"
-            ).fetchall()}
-            missing = expected_cols - actual
-            if not missing:
-                return
-            for col in missing:
-                model_col = MemoryItemModel.__table__.columns[col]
-                col_type = model_col.type.compile(dialect=conn.adapters._dialect_obj if hasattr(conn.adapters, '_dialect_obj') else None) if False else _pg_type_for(model_col)
-                conn.execute(f'ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS "{col}" {col_type}')
-                log.warning("memU schema 自愈：memory_items 加列 %s %s", col, col_type)
+            for table, col, typ in known_additions:
+                try:
+                    conn.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{col}" {typ}')
+                except Exception as e:
+                    log.debug("memU schema add %s.%s skipped: %s", table, col, e)
     except Exception as e:
-        log.warning("memU schema 自愈失败（不致命，flush 时仍会按当前列尝试）：%s", e)
-
-
-def _pg_type_for(col) -> str:
-    """SQLAlchemy Column type → 兼容的 postgres 类型字符串。"""
-    from sqlalchemy import DateTime, Text, String
-    t = col.type.__class__.__name__
-    if t == "DateTime":
-        return "TIMESTAMP WITHOUT TIME ZONE"
-    if t == "JSONB":
-        return "JSONB"
-    if t == "JSON":
-        return "JSONB"
-    if t in ("String", "Text"):
-        return "TEXT"
-    if t == "Integer":
-        return "INTEGER"
-    if t == "BigInteger":
-        return "BIGINT"
-    if t == "Boolean":
-        return "BOOLEAN"
-    if t == "Vector":
-        return "vector"
-    return "TEXT"  # 兜底
+        log.warning("memU schema 自愈失败（不致命）：%s", e)
 
 
 def _get_service():
