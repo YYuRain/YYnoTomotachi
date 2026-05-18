@@ -149,8 +149,8 @@ def migrate_recent_json(root: Path, admin_id: int) -> None:
 
 def migrate_memu_postgres(admin_id: int) -> None:
     s = settings()
-    if s.memu_metadata_provider != "postgres" or not s.memu_db_url:
-        log.info("memU 不是 postgres provider，跳过 --migrate-memu")
+    if not s.memu_db_url:
+        log.info("MEMU_DB_URL 未配置，跳过 --migrate-memu")
         return
 
     # 用 psycopg 直连，绕过 memU SDK

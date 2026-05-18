@@ -19,8 +19,8 @@ git add -p && git commit -m "..." && git push -c http.proxy=http://127.0.0.1:789
 
 **本地开发**：
 ```bash
-docker start memu-postgres        # memU 持久化（postgres）
-.venv/bin/python -m src.main      # prod bot (+ test bot 若 TEST_BOT_TOKEN 设了) + embed :18080 + llm_proxy :18082 + scheduler
+docker start memu-postgres        # 记忆栈持久化（postgres + pgvector，容器名沿用旧名）
+.venv/bin/python -m src.main      # prod bot (+ test bot 若 TEST_BOT_TOKEN 设了) + embed :18080 + scheduler
 .venv/bin/python -m scripts.admin # 记忆浏览 UI :18081，可选
 ```
 
@@ -49,11 +49,9 @@ docker compose logs -f bot   # 看 ready
 | `ANTHROPIC_API_KEY` | Claude key（LLM_PROVIDER=anthropic 时） |
 | `ANTHROPIC_MODEL` | 默认 `claude-opus-4-6` |
 | `ANTHROPIC_MODEL_AUX` | 默认 `claude-sonnet-4-6`（辅助 tier） |
-| `MEMU_METADATA_PROVIDER` | `postgres` |
-| `MEMU_DB_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/memu` |
-| `MEMU_CHAT_MODEL` | memU 抽取/分类模型；设了 → shim 走 OpenRouter（当前 `deepseek/deepseek-v4-flash`）；空 → 走 MiniMax（旧路径） |
+| `MEMU_DB_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/memu`（自搭记忆栈也用这个 env，容器/库名都沿用旧名） |
+| `MEMU_CHAT_MODEL` | 记忆抽取模型（OpenAI 兼容，走 OpenRouter）；当前 `deepseek/deepseek-v4-flash` |
 | `JINA_API_KEY` | Jina Reader 鉴权 key（网页正文读取，匿名易被 401）。免费注册：https://jina.ai/reader/ |
-| `LLM_PROXY_HOST` / `LLM_PROXY_PORT` | 默认 `127.0.0.1` / `18082`（strip-think shim） |
 | `OPENROUTER_API_KEY` | OpenRouter key（主聊天 + `scripts/eval_*`） |
 | `OPENROUTER_BASE_URL` | 默认 `https://openrouter.ai/api/v1` |
 | `EVAL_MODELS` | 评测候选模型，逗号分隔，`<provider>/<model_id>` 格式 |
@@ -70,9 +68,11 @@ docker compose logs -f bot   # 看 ready
 | `src/test_bot.py` | 可选——TEST_BOT_TOKEN 设了启用；`/become <label>` 选虚拟 user_id，走完整邀请码流程，`/clear` 清盘 |
 | `src/llm.py` | LLM 统一门面（openrouter/minimax/anthropic 分发，支持 tier） |
 | `src/minimax.py` | MiniMax chat/chat_json/embed |
+| `src/embed_client.py` | 本地 :18080 embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
-| `src/llm_proxy.py` | 本地 memU 上游 shim（:18082）：按 `MEMU_CHAT_MODEL` 路由 OpenRouter（带 Clash）/MiniMax，永远剥 `<think>` |
-| `src/memory.py` | memU 封装（recall/memorize/flush）；recall 输出每条带形成日期 `(YYYY-MM-DD)` |
+| `src/memory_store.py` | 自搭记忆栈：`memories` 表 ORM + engine + pgvector 索引 |
+| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event 一次性 JSON 输出） |
+| `src/memory.py` | recall（pgvector cosine RAG）+ note_turn（短期 buffer）+ maybe_flush（抽取入库） |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
@@ -85,8 +85,7 @@ docker compose logs -f bot   # 看 ready
 | `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应 |
-| `src/memu_prompts_zh.py` | memU 中文化 prompt 模板（extraction/category_summary） |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；只剩「记忆项」+「审计」两个 tab |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
 | `src/openrouter.py` | OpenAI 兼容客户端，主聊天（LLM_PROVIDER=openrouter）+ `scripts/eval_*`；走 Clash 代理 |
@@ -94,7 +93,7 @@ docker compose logs -f bot   # 看 ready
 ## 数据存储
 
 - **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes`
-- **memU** via **Postgres**：本地 `localhost:5432/memu`（容器 `memu-postgres`）；compose 内是服务名 `postgres:5432`
+- **记忆栈** via **Postgres + pgvector**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（schema 见 `src/memory_store.py`）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
 - **静态资源**：`data/stickers/*`（文件名当 tag）；`data/eval/run_*.{jsonl,md}`（模型评测）
@@ -132,8 +131,8 @@ docker compose logs -f bot   # 看 ready
 
 - **Telegram 超时**：Clash 未开
 - **502 错误**：NO_PROXY 未生效，检查 `main.py::_purge_proxy_env`
-- **端口 18080 / 18082 占用**：`pkill -f "src\.main"` + `pkill -f uvicorn`（embed shim=18080，strip-think shim=18082）
-- **记忆不生效**：memU postgres 容器未起 → `docker start memu-postgres`
+- **端口 18080 占用**：`pkill -f "src\.main"` + `pkill -f uvicorn`（embed shim）
+- **记忆不生效**：postgres 容器未起 → `docker start memu-postgres`（容器名沿用旧名）
 
 ## 文档索引
 

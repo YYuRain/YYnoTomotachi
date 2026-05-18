@@ -1,9 +1,8 @@
 """把 postgres 里已有的英文记忆翻译成中文。
 
-- 遍历 memory_items.summary、memory_categories.summary、memory_categories.description。
-- 用 llm.chat（当前 provider）翻译；跳过已经是中文的（CJK 字符占比 ≥30%）。
-- 翻译完顺手调本地 embed server 重算向量，否则检索会对不上新文本。
-- 每次间隔 1.5s 避免 MiniMax 529；遇到 529 自动退避重试 2 次。
+- 遍历 memories.summary（自搭记忆栈，2026-05-18 起；旧 memU 的 categories 已退役）
+- 用 llm.chat 翻译；跳过已经是中文的（CJK 字符占比 ≥10%）
+- 翻译完调本地 embed server 重算向量，否则检索会对不上新文本
 
 用法：
   .venv/bin/python -m scripts.translate_memory_to_zh          # 正式跑
@@ -107,34 +106,23 @@ async def main() -> None:
     from src.config import settings
 
     s = settings()
-    if s.memu_metadata_provider != "postgres" or not s.memu_db_url:
-        raise SystemExit("需要 MEMU_METADATA_PROVIDER=postgres + MEMU_DB_URL")
+    if not s.memu_db_url:
+        raise SystemExit("需要 MEMU_DB_URL（postgres URL）")
     eng = create_engine(s.memu_db_url, future=True)
     embed_url = f"http://{s.embed_server_host}:{s.embed_server_port}/v1/embeddings"
 
-    # 收集任务
     with eng.connect() as c:
         items = c.execute(
-            text("SELECT id, memory_type, summary FROM memory_items ORDER BY created_at")
-        ).mappings().all()
-        cats = c.execute(
-            text("SELECT id, name, summary, description FROM memory_categories ORDER BY name")
+            text("SELECT id::text AS id, memory_type, summary FROM memories ORDER BY created_at")
         ).mappings().all()
 
     tasks: list[tuple[str, str, str, str]] = []  # (kind, id, field, current_text)
     for it in items:
         if _is_english(it["summary"] or ""):
             tasks.append(("item", it["id"], "summary", it["summary"]))
-    for c in cats:
-        if c["summary"] and _is_english(c["summary"]):
-            tasks.append(("cat", c["id"], "summary", c["summary"]))
-        if c["description"] and _is_english(c["description"]):
-            tasks.append(("cat", c["id"], "description", c["description"]))
 
     total = len(tasks)
-    print(f"待翻译：{total} 条")
-    print(f"  - memory_items.summary: {sum(1 for t in tasks if t[0] == 'item')}")
-    print(f"  - memory_categories.summary / description: {sum(1 for t in tasks if t[0] == 'cat')}")
+    print(f"待翻译：{total} 条 memories.summary")
     if args.dry:
         for i, (kind, _id, field, txt) in enumerate(tasks, 1):
             print(f"  [{i}/{total}] {kind}.{field} · {txt[:70]}…")
@@ -156,33 +144,18 @@ async def main() -> None:
                     fail += 1
                     await asyncio.sleep(args.sleep); continue
 
-                vec = await _embed_one(translated, embed_url) if field == "summary" else None
+                vec = await _embed_one(translated, embed_url)
                 with eng.begin() as conn:
-                    if kind == "item" and field == "summary":
-                        if vec is not None:
-                            conn.execute(
-                                text("UPDATE memory_items SET summary=:s, embedding=(:v)::vector, updated_at=NOW() WHERE id=:id"),
-                                {"s": translated, "v": _vec_literal(vec), "id": row_id},
-                            )
-                        else:
-                            conn.execute(
-                                text("UPDATE memory_items SET summary=:s, updated_at=NOW() WHERE id=:id"),
-                                {"s": translated, "id": row_id},
-                            )
-                    elif kind == "cat" and field == "summary":
-                        if vec is not None:
-                            conn.execute(
-                                text("UPDATE memory_categories SET summary=:s, embedding=(:v)::vector, updated_at=NOW() WHERE id=:id"),
-                                {"s": translated, "v": _vec_literal(vec), "id": row_id},
-                            )
-                        else:
-                            conn.execute(
-                                text("UPDATE memory_categories SET summary=:s, updated_at=NOW() WHERE id=:id"),
-                                {"s": translated, "id": row_id},
-                            )
-                    elif kind == "cat" and field == "description":
+                    if vec is not None:
                         conn.execute(
-                            text("UPDATE memory_categories SET description=:s, updated_at=NOW() WHERE id=:id"),
+                            text("UPDATE memories SET summary=:s, embedding=CAST(:v AS vector), "
+                                 "updated_at=NOW() WHERE id=CAST(:id AS uuid)"),
+                            {"s": translated, "v": _vec_literal(vec), "id": row_id},
+                        )
+                    else:
+                        conn.execute(
+                            text("UPDATE memories SET summary=:s, updated_at=NOW() "
+                                 "WHERE id=CAST(:id AS uuid)"),
                             {"s": translated, "id": row_id},
                         )
                 ok += 1

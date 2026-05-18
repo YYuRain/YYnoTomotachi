@@ -1,19 +1,13 @@
-"""极简记忆浏览 + 编辑 UI + 审计日志查看。
+"""极简记忆浏览 + 编辑 UI + 审计日志查看（自搭记忆栈版本，2026-05-18 起）。
 
-独立跑，不走 memU SDK，直接读写 postgres。
-- `/` 一页 HTML。
-- 读：`/api/stats` `/api/categories` `/api/items` `/api/resources` `/api/audit`。
+只面对一张 `memories` 表（schema 见 src/memory_store.py）。
+- `/` 一页 HTML——只有「记忆项」和「审计」两个 tab（之前的「分类」「资源」随 memU 一起退役）。
+- 读：`/api/stats` `/api/items` `/api/audit`
 - 写：
   - `PATCH /api/items/{id}` body `{summary: str}` —— 改记忆文本，自动重新 embedding。
-  - `DELETE /api/items/{id}` —— 删条目（级联删 category_items 关联）。
-  - `PATCH /api/categories/{id}` body `{summary?, description?}` —— 改分类摘要，重新 embedding。
-  - `DELETE /api/categories/{id}` —— 删分类及其 items 关联。
+  - `DELETE /api/items/{id}` —— 删条目。
 
-embedding 改写通过 HTTP 调 `http://127.0.0.1:18080/v1/embeddings`（即 bot 启动时的 embed_server）；
-若 embed server 不在，PATCH 会跳过 embedding 更新并在响应里警告，
-检索质量会轻微下滑直到下次该条被 memU 重算。
-
-审计日志读 `data/audit.jsonl`（bot 进程 audit_log 模块产出），只读不改。
+Embedding 走 `src.embed_client`（共享 :18080 调用），失败时降级为只更新文本。
 
 启动：`.venv/bin/python -m scripts.admin`
 """
@@ -21,17 +15,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
-import os
-import time
-
-import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
+from . import embed_client
 from .config import settings
 
 
@@ -70,44 +62,13 @@ log = logging.getLogger(__name__)
 
 def _engine():
     s = settings()
-    if s.memu_metadata_provider != "postgres" or not s.memu_db_url:
-        raise RuntimeError("admin UI 需要 MEMU_METADATA_PROVIDER=postgres 和 MEMU_DB_URL")
+    if not s.memu_db_url:
+        raise RuntimeError("admin UI 需要 MEMU_DB_URL（postgres）")
     return create_engine(s.memu_db_url, future=True)
-
-
-def _embed_url() -> str:
-    s = settings()
-    return f"http://{s.embed_server_host}:{s.embed_server_port}/v1/embeddings"
-
-
-async def _embed_one(text_: str) -> list[float] | None:
-    """调本地 embed server 给一段文本生成向量；失败返 None。"""
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=10) as c:
-            r = await c.post(
-                _embed_url(),
-                json={"model": "any", "input": [text_]},
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["data"][0]["embedding"]
-    except Exception as e:
-        log.warning("embed server 不可达，跳过 embedding：%s", e)
-        return None
-
-
-def _vec_literal(vec: list[float]) -> str:
-    """pgvector 接受 '[0.1, 0.2, ...]' 字面量。"""
-    return "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
 
 
 class ItemPatch(BaseModel):
     summary: str = Field(min_length=1, max_length=4000)
-
-
-class CategoryPatch(BaseModel):
-    summary: str | None = None
-    description: str | None = None
 
 
 _LOGIN_HTML = """<!doctype html>
@@ -230,7 +191,7 @@ _INDEX_HTML = """<!doctype html>
     /* 表格 → 卡片栈 */
     .tab { overflow-x: visible; }
     .tab table { display: block; background: transparent; border: none; min-width: 0; border-radius: 0; }
-    .tab thead { display: none; }  /* 列头隐藏 */
+    .tab thead { display: none; }
     .tab tbody { display: block; }
     .tab tr {
       display: block;
@@ -259,7 +220,6 @@ _INDEX_HTML = """<!doctype html>
       white-space: normal;
     }
     .tab td.ops button.op { margin-left: 0; margin-right: 6px; }
-    /* data-label 当字段标签显示在每个 td 前 */
     .tab td[data-label]::before {
       content: attr(data-label) "  ";
       display: inline-block;
@@ -269,14 +229,12 @@ _INDEX_HTML = """<!doctype html>
       margin-right: 8px;
       vertical-align: top;
     }
-    /* 长文本字段：label 放上一行，正文换行 */
     .tab td.summary[data-label]::before,
     .tab td.audit-summary[data-label]::before {
       display: block;
       margin-bottom: 2px;
       min-width: 0;
     }
-    /* empty / 空表 row 不变卡片，保留居中提示 */
     .tab tr td.empty { text-align: center; padding: 30px 8px; color: var(--muted); }
     .tab tr td.empty::before { display: none; }
   }
@@ -293,9 +251,7 @@ _INDEX_HTML = """<!doctype html>
 <header>
   <h1>AIDemo · 记忆浏览</h1>
   <div class="stats">
-    <span>分类 <b id="s-cats">—</b></span>
     <span>记忆项 <b id="s-items">—</b></span>
-    <span>资源 <b id="s-res">—</b></span>
     <span>审计 <b id="s-audit">—</b></span>
   </div>
   <div id="user-switch" style="margin-left:auto;display:none">
@@ -309,21 +265,12 @@ _INDEX_HTML = """<!doctype html>
 </header>
 
 <nav>
-  <button data-tab="cats" class="active">分类</button>
-  <button data-tab="items">记忆项</button>
-  <button data-tab="res">资源</button>
+  <button data-tab="items" class="active">记忆项</button>
   <button data-tab="audit">审计</button>
 </nav>
 
 <main>
-  <div id="tab-cats" class="tab">
-    <table>
-      <thead><tr><th style="width:140px">名字</th><th style="width:80px">条目</th><th>摘要</th><th style="width:140px" class="mono">更新</th><th style="width:140px"></th></tr></thead>
-      <tbody id="cats-tbody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
-    </table>
-  </div>
-
-  <div id="tab-items" class="tab" style="display:none">
+  <div id="tab-items" class="tab">
     <div class="toolbar">
       <input type="search" id="q" placeholder="搜索记忆内容（对 summary ILIKE）" />
       <select id="type-filter">
@@ -336,13 +283,6 @@ _INDEX_HTML = """<!doctype html>
     <table>
       <thead><tr><th style="width:80px">类型</th><th>内容</th><th style="width:130px" class="mono">时间</th><th style="width:140px"></th></tr></thead>
       <tbody id="items-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
-    </table>
-  </div>
-
-  <div id="tab-res" class="tab" style="display:none">
-    <table>
-      <thead><tr><th style="width:100px">模态</th><th>URL</th><th class="mono" style="width:140px">创建</th></tr></thead>
-      <tbody id="res-tbody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -387,10 +327,6 @@ _INDEX_HTML = """<!doctype html>
       <label class="muted" id="modal-label">摘要</label>
       <textarea id="modal-text"></textarea>
     </div>
-    <div class="row" id="modal-desc-row" style="display:none">
-      <label class="muted">描述</label>
-      <textarea id="modal-desc" style="min-height:60px"></textarea>
-    </div>
     <div class="actions">
       <button onclick="closeModal()">取消</button>
       <button class="primary" id="modal-save">保存</button>
@@ -409,9 +345,8 @@ const el = (tag, attrs = {}, text = '') => {
   return e;
 };
 
-// === viewer 状态：admin 可切，普通用户固定自己 ===
 let _isAdmin = false;
-let _currentUid = '';   // 空 = 不过滤（admin 全看）；否则带 ?user_id=
+let _currentUid = '';
 const withUid = (qs = '') => {
   const sep = qs ? '&' : '';
   return _currentUid ? qs + sep + 'user_id=' + encodeURIComponent(_currentUid) : qs;
@@ -419,70 +354,24 @@ const withUid = (qs = '') => {
 const fmt = ts => ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
 const toast = (msg) => { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); setTimeout(() => t.classList.remove('on'), 1600); };
 
-let _modalCtx = null; // { kind: 'item'|'cat', id, onSave(summary, description?) }
-function openModal(title, summary, opts = {}) {
+let _modalCtx = null;
+function openModal(title, summary) {
   $('#modal-title').textContent = title;
   $('#modal-text').value = summary || '';
-  $('#modal-desc-row').style.display = opts.withDesc ? '' : 'none';
-  $('#modal-desc').value = opts.description || '';
   $('#modal').classList.add('on');
 }
 function closeModal() { $('#modal').classList.remove('on'); _modalCtx = null; }
 $('#modal-save').addEventListener('click', async () => {
   if (!_modalCtx) return;
   const s = $('#modal-text').value.trim();
-  const d = $('#modal-desc').value.trim();
-  await _modalCtx.onSave(s, d);
+  await _modalCtx.onSave(s);
   closeModal();
 });
 
 async function loadStats() {
   const r = await fetch('/api/stats?' + withUid()); const j = await r.json();
-  $('#s-cats').textContent = j.categories;
   $('#s-items').textContent = j.items;
-  $('#s-res').textContent = j.resources;
   $('#s-audit').textContent = j.audit ?? '—';
-}
-
-async function loadCats() {
-  const r = await fetch('/api/categories?' + withUid()); const j = await r.json();
-  const tb = $('#cats-tbody'); tb.innerHTML = '';
-  if (!j.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">空</td></tr>'; return; }
-  for (const c of j) {
-    const tr = el('tr');
-    tr.appendChild(el('td', { 'data-label': '名字' }, c.name || '（未命名）'));
-    tr.appendChild(el('td', { 'data-label': '条目' }, String(c.item_count || 0)));
-    const td = el('td', { class: 'summary', 'data-label': '摘要' });
-    td.textContent = (c.summary || c.description || '').slice(0, 400);
-    tr.appendChild(td);
-    tr.appendChild(el('td', { class: 'mono', 'data-label': '更新' }, fmt(c.updated_at)));
-    const ops = el('td', { class: 'ops' });
-    const bEdit = el('button', { class: 'op' }, '编辑');
-    bEdit.onclick = () => {
-      _modalCtx = {
-        kind: 'cat', id: c.id,
-        onSave: async (summary, description) => {
-          const r = await fetch(`/api/categories/${encodeURIComponent(c.id)}`, {
-            method: 'PATCH', headers: {'content-type': 'application/json'},
-            body: JSON.stringify({ summary, description }),
-          });
-          if (r.ok) { toast('已保存'); loadCats(); }
-          else { toast('失败：' + r.status); }
-        },
-      };
-      openModal(`编辑分类：${c.name}`, c.summary || '', { withDesc: true, description: c.description || '' });
-    };
-    const bDel = el('button', { class: 'op danger' }, '删除');
-    bDel.onclick = async () => {
-      if (!confirm(`删除分类「${c.name}」？关联的 items 记录不会删，但会失去与该分类的关联。`)) return;
-      const r = await fetch(`/api/categories/${encodeURIComponent(c.id)}`, { method: 'DELETE' });
-      if (r.ok) { toast('已删除'); loadCats(); loadStats(); }
-      else toast('失败：' + r.status);
-    };
-    ops.appendChild(bEdit); ops.appendChild(bDel);
-    tr.appendChild(ops);
-    tb.appendChild(tr);
-  }
 }
 
 async function loadItems() {
@@ -527,28 +416,13 @@ async function loadItems() {
   }
 }
 
-async function loadResources() {
-  const r = await fetch('/api/resources?limit=200&' + withUid()); const j = await r.json();
-  const tb = $('#res-tbody'); tb.innerHTML = '';
-  if (!j.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">空</td></tr>'; return; }
-  for (const x of j) {
-    const tr = el('tr');
-    tr.appendChild(el('td', { 'data-label': '模态' }, x.modality || ''));
-    tr.appendChild(el('td', { class: 'summary', 'data-label': 'URL' }, x.url || ''));
-    tr.appendChild(el('td', { class: 'mono', 'data-label': '创建' }, fmt(x.created_at)));
-    tb.appendChild(tr);
-  }
-}
-
 document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
   const tab = b.dataset.tab;
   document.querySelectorAll('.tab').forEach(t => t.style.display = 'none');
   $('#tab-' + tab).style.display = '';
-  if (tab === 'cats') loadCats();
   if (tab === 'items') loadItems();
-  if (tab === 'res') loadResources();
   if (tab === 'audit') loadAudit();
   toggleAuditAutoRefresh(tab === 'audit' && $('#audit-auto').checked);
 }));
@@ -645,7 +519,6 @@ async function loadAudit() {
     tr.querySelector('button').addEventListener('click', () => {
       $('#modal-title').textContent = `${d.event} · ${auditTimeFmt(d.ts)}`;
       $('#modal-text').style.display = 'none';
-      $('#modal-desc-row').style.display = 'none';
       $('#modal-save').style.display = 'none';
       let detail = $('#modal-detail');
       if (!detail) {
@@ -671,7 +544,6 @@ $('#audit-filter').addEventListener('change', loadAudit);
 $('#audit-limit').addEventListener('change', loadAudit);
 $('#audit-auto').addEventListener('change', e => toggleAuditAutoRefresh(e.target.checked));
 
-// 关 modal 时还原 modal-text 的显示，避免下次编辑变 audit-detail 模式
 const _origCloseModal = closeModal;
 closeModal = () => {
   _origCloseModal();
@@ -693,12 +565,10 @@ async function initViewer() {
     const me = await r.json();
     _isAdmin = !!me.is_admin;
     $('#who-label').textContent = _isAdmin ? '身份：管理员' : `身份：user_id=${me.user_id}`;
-    // /logout 自身就 set-cookie 删 + 302 → /login，链接默认行为足够
     if (!_isAdmin) {
       _currentUid = String(me.user_id || '');
       return;
     }
-    // admin：拉用户列表填下拉
     const us = await fetch('/api/users').then(r => r.json());
     const sel = $('#user-select');
     const optAll = el('option', { value: '' }, '全部用户');
@@ -711,40 +581,36 @@ async function initViewer() {
     $('#user-switch').style.display = '';
     sel.addEventListener('change', () => {
       _currentUid = sel.value;
-      // 刷新当前 tab
       const cur = document.querySelector('nav button.active')?.dataset.tab;
       loadStats();
-      if (cur === 'cats') loadCats();
-      else if (cur === 'items') loadItems();
-      else if (cur === 'res') loadResources();
+      if (cur === 'items') loadItems();
       else if (cur === 'audit') loadAudit();
     });
   } catch (e) {
     console.warn('initViewer err', e);
-    // 8s timeout / 网络挂了：给个能看到的兜底页，免得手机一直白屏
     document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#888;font-size:14px">'
       + '加载超时。可能是 cookie 没存住——回 Telegram 重发 /memory 拿新链接，'
-      + '或长按链接选 “在浏览器中打开”。'
+      + '或长按链接选 "在浏览器中打开"。'
       + '<br><br><a href="/login" style="color:#1a6cff">回登录页</a>'
       + '</div>';
   }
 }
 
-initViewer().then(() => { loadStats(); loadCats(); });
+initViewer().then(() => { loadStats(); loadItems(); });
 </script>
 
 </body></html>
 """
 
 
-def _resolve_uid(viewer: int | None, q_uid: int | None) -> str | None:
-    """决定查询的 user_id 过滤值（memU TEXT；str 形式）。
+def _resolve_uid(viewer: int | None, q_uid: int | None) -> int | None:
+    """决定查询的 user_id 过滤值（新 schema 是 BIGINT）。
     - viewer is None（admin）：用 q_uid；q_uid 也 None → None（不过滤，看全部）
     - 普通用户：忽略 q_uid，强制用自己的 viewer_id（防越权）
     """
     if viewer is None:
-        return str(q_uid) if q_uid else None
-    return str(viewer)
+        return q_uid
+    return viewer
 
 
 def build_app() -> FastAPI:
@@ -753,7 +619,6 @@ def build_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
-        # 没登录跳 /login（不能用 Depends(_get_viewer) 因为它 raise 401，浏览器会显示 JSON）
         admin_user = os.environ.get("ADMIN_UI_USER", "")
         admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
         if admin_user or admin_pwd:
@@ -767,13 +632,6 @@ def build_app() -> FastAPI:
 
     @app.get("/login-by-token")
     async def login_by_token(t: str = Query(..., max_length=2048)) -> HTMLResponse:
-        """点 Telegram /memory 给的链接进来。token 校验通过 → set cookie 在 HTML 响应里 → JS 跳主页。
-
-        不用 302 redirect 是因为部分手机浏览器（iOS Telegram 内嵌、SFSafariViewController）
-        对 "redirect 响应里设的 cookie" 处理不稳定，会出现 cookie 没存住、跳主页又被弹回登录的循环。
-        改成 HTML 响应：cookie 通过 Set-Cookie 头 + 页面渲染后 JS 直接 location.href = '/'，
-        cookie 已经被浏览器接收并存好。
-        """
         from . import users as _users
         payload = _users.verify_session_token(t)
         if payload is None:
@@ -786,7 +644,6 @@ def build_app() -> FastAPI:
             bool(payload.get("a")),
             ttl=_SESSION_TTL,
         )
-        # 极简 HTML：先把 cookie set 上、再 JS 跳主页（同时 meta-refresh 兜底）
         body = (
             '<!doctype html><html><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -811,12 +668,10 @@ def build_app() -> FastAPI:
 
     @app.get("/api/me")
     async def whoami(viewer: int | None = Depends(_get_viewer)) -> dict[str, Any]:
-        """前端用：知道当前是 admin 还是普通用户，用来决定显示用户下拉。"""
         return {"is_admin": viewer is None, "user_id": viewer}
 
     @app.get("/api/users")
     async def list_users(viewer: int | None = Depends(_get_viewer)) -> list[dict[str, Any]]:
-        """admin 下拉用——active + test 用户都列。普通用户只看自己。"""
         from . import users as _users
         if viewer is not None:
             return [{"chat_id": viewer, "status": "active", "note": "you"}]
@@ -830,17 +685,12 @@ def build_app() -> FastAPI:
         uid = _resolve_uid(viewer, user_id)
         with eng.connect() as c:
             if uid is None:
-                mem_stats = {
-                    "categories": int(c.execute(text("SELECT count(*) FROM memory_categories")).scalar() or 0),
-                    "items": int(c.execute(text("SELECT count(*) FROM memory_items")).scalar() or 0),
-                    "resources": int(c.execute(text("SELECT count(*) FROM resources")).scalar() or 0),
-                }
+                items = int(c.execute(text("SELECT count(*) FROM memories")).scalar() or 0)
             else:
-                mem_stats = {
-                    "categories": int(c.execute(text("SELECT count(*) FROM memory_categories WHERE user_id=:u"), {"u": uid}).scalar() or 0),
-                    "items": int(c.execute(text("SELECT count(*) FROM memory_items WHERE user_id=:u"), {"u": uid}).scalar() or 0),
-                    "resources": int(c.execute(text("SELECT count(*) FROM resources WHERE user_id=:u"), {"u": uid}).scalar() or 0),
-                }
+                items = int(c.execute(
+                    text("SELECT count(*) FROM memories WHERE user_id=:u"),
+                    {"u": uid},
+                ).scalar() or 0)
         # audit 计数：按 user_id 过滤的行
         audit_count = 0
         path = settings().root / "data" / "audit.jsonl"
@@ -850,6 +700,7 @@ def build_app() -> FastAPI:
                     with path.open("rb") as f:
                         audit_count = sum(1 for _ in f)
                 else:
+                    uid_str = str(uid)
                     with path.open("r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
@@ -859,11 +710,11 @@ def build_app() -> FastAPI:
                                 d = json.loads(line)
                             except Exception:
                                 continue
-                            if str(d.get("user_id", "")) == uid:
+                            if str(d.get("user_id", "")) == uid_str:
                                 audit_count += 1
             except Exception:
                 pass
-        return {**mem_stats, "audit": audit_count}
+        return {"items": items, "audit": audit_count}
 
     @app.get("/api/audit")
     async def audit_list(
@@ -881,6 +732,7 @@ def build_app() -> FastAPI:
         except Exception as e:
             log.warning("audit read err: %s", e)
             return []
+        uid_str = str(uid) if uid is not None else None
         out: list[dict[str, Any]] = []
         for line in lines:
             line = line.strip()
@@ -892,38 +744,11 @@ def build_app() -> FastAPI:
                 continue
             if event and d.get("event") != event:
                 continue
-            if uid is not None and str(d.get("user_id", "")) != uid:
+            if uid_str is not None and str(d.get("user_id", "")) != uid_str:
                 continue
             out.append(d)
         out.reverse()
         return out[:limit]
-
-    @app.get("/api/categories")
-    async def categories(
-        viewer: int | None = Depends(_get_viewer),
-        user_id: int | None = Query(None),
-    ) -> list[dict[str, Any]]:
-        uid = _resolve_uid(viewer, user_id)
-        if uid is None:
-            sql = text("""
-                SELECT c.id, c.name, c.description, c.summary, c.updated_at,
-                  (SELECT count(*) FROM category_items ci WHERE ci.category_id = c.id) AS item_count
-                FROM memory_categories c
-                ORDER BY c.updated_at DESC NULLS LAST
-            """)
-            params: dict[str, Any] = {}
-        else:
-            sql = text("""
-                SELECT c.id, c.name, c.description, c.summary, c.updated_at,
-                  (SELECT count(*) FROM category_items ci WHERE ci.category_id = c.id) AS item_count
-                FROM memory_categories c
-                WHERE c.user_id = :u
-                ORDER BY c.updated_at DESC NULLS LAST
-            """)
-            params = {"u": uid}
-        with eng.connect() as c:
-            rows = c.execute(sql, params).mappings().all()
-        return [dict(r) for r in rows]
 
     @app.get("/api/items")
     async def items_list(
@@ -934,7 +759,8 @@ def build_app() -> FastAPI:
         limit: int = Query(200, ge=1, le=1000),
     ) -> list[dict[str, Any]]:
         uid = _resolve_uid(viewer, user_id)
-        where, params = [], {"limit": limit}
+        where: list[str] = []
+        params: dict[str, Any] = {"limit": limit}
         if uid is not None:
             where.append("user_id = :u"); params["u"] = uid
         if q.strip():
@@ -943,43 +769,27 @@ def build_app() -> FastAPI:
             where.append("memory_type = :t"); params["t"] = type.strip()
         wh = f"WHERE {' AND '.join(where)}" if where else ""
         sql = text(
-            f"SELECT id, memory_type, summary, created_at FROM memory_items {wh} "
+            f"SELECT id, memory_type, summary, created_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )
         with eng.connect() as c:
             rows = c.execute(sql, params).mappings().all()
         return [dict(r) for r in rows]
 
-    @app.get("/api/resources")
-    async def resources(
-        viewer: int | None = Depends(_get_viewer),
-        user_id: int | None = Query(None),
-        limit: int = Query(200, ge=1, le=1000),
-    ) -> list[dict[str, Any]]:
-        uid = _resolve_uid(viewer, user_id)
-        if uid is None:
-            sql = text("SELECT id, modality, url, created_at FROM resources ORDER BY created_at DESC LIMIT :limit")
-            params: dict[str, Any] = {"limit": limit}
-        else:
-            sql = text("SELECT id, modality, url, created_at FROM resources WHERE user_id=:u ORDER BY created_at DESC LIMIT :limit")
-            params = {"limit": limit, "u": uid}
-        with eng.connect() as c:
-            rows = c.execute(sql, params).mappings().all()
-        return [dict(r) for r in rows]
-
     # ============ 编辑接口（普通用户只能改自己的；admin 不限）============
 
-    def _check_owns(uid_filter: str | None, table: str, row_id: str) -> None:
-        """非 admin（uid_filter 非 None）必须确认要改的行属于自己。"""
-        if uid_filter is None:
+    def _check_owns(viewer: int | None, item_id: str) -> None:
+        """非 admin 必须确认要改的行属于自己。"""
+        if viewer is None:
             return
         with eng.connect() as c:
             owner = c.execute(
-                text(f"SELECT user_id FROM {table} WHERE id = :id"), {"id": row_id}
+                text("SELECT user_id FROM memories WHERE id = CAST(:id AS uuid)"),
+                {"id": item_id},
             ).scalar()
         if owner is None:
             raise HTTPException(404, "not found")
-        if str(owner) != uid_filter:
+        if int(owner) != viewer:
             raise HTTPException(403, "not yours")
 
     @app.patch("/api/items/{item_id}")
@@ -987,20 +797,20 @@ def build_app() -> FastAPI:
         item_id: str, body: ItemPatch,
         viewer: int | None = Depends(_get_viewer),
     ) -> dict[str, Any]:
-        uid = _resolve_uid(viewer, None)
-        _check_owns(uid, "memory_items", item_id)
+        _check_owns(viewer, item_id)
         new_summary = body.summary.strip()
-        vec = await _embed_one(new_summary)
+        vec = await embed_client.embed_one(new_summary)
         params: dict[str, Any] = {"id": item_id, "summary": new_summary}
         if vec is not None:
             sql = text(
-                "UPDATE memory_items SET summary = :summary, embedding = (:vec)::vector, "
-                "updated_at = NOW() WHERE id = :id"
+                "UPDATE memories SET summary = :summary, embedding = CAST(:vec AS vector), "
+                "updated_at = NOW() WHERE id = CAST(:id AS uuid)"
             )
-            params["vec"] = _vec_literal(vec)
+            params["vec"] = embed_client.vec_literal(vec)
         else:
             sql = text(
-                "UPDATE memory_items SET summary = :summary, updated_at = NOW() WHERE id = :id"
+                "UPDATE memories SET summary = :summary, updated_at = NOW() "
+                "WHERE id = CAST(:id AS uuid)"
             )
         with eng.begin() as c:
             r = c.execute(sql, params)
@@ -1013,63 +823,12 @@ def build_app() -> FastAPI:
         item_id: str,
         viewer: int | None = Depends(_get_viewer),
     ) -> dict[str, Any]:
-        uid = _resolve_uid(viewer, None)
-        _check_owns(uid, "memory_items", item_id)
+        _check_owns(viewer, item_id)
         with eng.begin() as c:
-            r = c.execute(text("DELETE FROM memory_items WHERE id = :id"), {"id": item_id})
-            if r.rowcount == 0:
-                raise HTTPException(404, "not found")
-        return {"ok": True}
-
-    @app.patch("/api/categories/{cat_id}")
-    async def patch_category(
-        cat_id: str, body: CategoryPatch,
-        viewer: int | None = Depends(_get_viewer),
-    ) -> dict[str, Any]:
-        uid = _resolve_uid(viewer, None)
-        _check_owns(uid, "memory_categories", cat_id)
-        sets: list[str] = []
-        params: dict[str, Any] = {"id": cat_id}
-        embed_source: str | None = None
-        if body.summary is not None:
-            sets.append("summary = :summary")
-            params["summary"] = body.summary.strip()
-            embed_source = params["summary"]
-        if body.description is not None:
-            sets.append("description = :description")
-            params["description"] = body.description.strip()
-            # 优先用 summary 做 embedding；没有的话用 description
-            if embed_source is None:
-                embed_source = params["description"]
-        if not sets:
-            raise HTTPException(400, "nothing to update")
-
-        embedded = False
-        if embed_source:
-            vec = await _embed_one(embed_source)
-            if vec is not None:
-                sets.append("embedding = (:vec)::vector")
-                params["vec"] = _vec_literal(vec)
-                embedded = True
-        sets.append("updated_at = NOW()")
-        sql = text(f"UPDATE memory_categories SET {', '.join(sets)} WHERE id = :id")
-        with eng.begin() as c:
-            r = c.execute(sql, params)
-            if r.rowcount == 0:
-                raise HTTPException(404, "not found")
-        return {"ok": True, "embedded": embedded}
-
-    @app.delete("/api/categories/{cat_id}")
-    async def delete_category(
-        cat_id: str,
-        viewer: int | None = Depends(_get_viewer),
-    ) -> dict[str, Any]:
-        uid = _resolve_uid(viewer, None)
-        _check_owns(uid, "memory_categories", cat_id)
-        with eng.begin() as c:
-            # 先手动删 category_items（避免外键约束）
-            c.execute(text("DELETE FROM category_items WHERE category_id = :id"), {"id": cat_id})
-            r = c.execute(text("DELETE FROM memory_categories WHERE id = :id"), {"id": cat_id})
+            r = c.execute(
+                text("DELETE FROM memories WHERE id = CAST(:id AS uuid)"),
+                {"id": item_id},
+            )
             if r.rowcount == 0:
                 raise HTTPException(404, "not found")
         return {"ok": True}

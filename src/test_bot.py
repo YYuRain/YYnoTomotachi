@@ -186,39 +186,60 @@ async def _cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """返回当前虚拟身份的 webUI 一键登录链接。"""
+    """返回当前虚拟身份的 webUI 一键登录链接。
+
+    admin chat（settings.admin_chat_id）特例：返回 admin token，可看全部用户 + 切下拉。
+    本地开发优先用 ADMIN_UI_BASE_URL（默认 http://127.0.0.1:18081）拼链接；
+    云端不设这个 env，则回退到 cloudflared `/shared/cf.log` 里的最新 URL。
+    """
     chat = update.effective_chat
     if chat is None:
         return
-    uid = _identity.get(chat.id)
-    if not uid or not users.is_active(uid):
-        await ctx.bot.send_message(
-            chat_id=chat.id,
-            text="先 /become <label> + /start <邀请码> 激活，再 /memory 拿 webUI",
-        )
-        return
+
+    s = settings()
+    is_admin_chat = chat.id == s.admin_chat_id
+
+    if is_admin_chat:
+        # admin 视角：不需要 /become，直接给 admin token
+        target_uid = s.admin_chat_id
+        is_admin_token = True
+        view_label = "admin（全部用户）"
+    else:
+        uid = _identity.get(chat.id)
+        if not uid or not users.is_active(uid):
+            await ctx.bot.send_message(
+                chat_id=chat.id,
+                text="先 /become <label> + /start <邀请码> 激活，再 /memory 拿 webUI",
+            )
+            return
+        target_uid = uid
+        is_admin_token = False
+        view_label = f"user_id={uid}"
+
     import os, re
-    log_path = "/shared/cf.log"
-    url = ""
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            matches = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
-            if matches:
-                url = matches[-1]
-        except Exception:
-            pass
-    if not url:
+    base = os.environ.get("ADMIN_UI_BASE_URL", "").rstrip("/")
+    if not base:
+        log_path = "/shared/cf.log"
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                matches = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
+                if matches:
+                    base = matches[-1]
+            except Exception:
+                pass
+    if not base:
         await ctx.bot.send_message(chat_id=chat.id, text="webUI 还没就绪，过 30 秒再试")
         return
-    token = users.make_session_token(uid, is_admin=False)
-    login_url = f"{url}/login-by-token?t={token}"
+
+    token = users.make_session_token(target_uid, is_admin=is_admin_token)
+    login_url = f"{base}/login-by-token?t={token}"
     await ctx.bot.send_message(
         chat_id=chat.id,
         text=(
             f"{login_url}\n\n"
-            f"点开直接进 user_id={uid} 视图（10 分钟内有效，登进去保 7 天）"
+            f"点开直接进 {view_label} 视图（10 分钟内有效，登进去保 7 天）"
         ),
     )
 

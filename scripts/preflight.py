@@ -1,25 +1,20 @@
-"""联调前的最小回环：MiniMax chat / embed / memU memorize+retrieve。
+"""联调前的最小回环：MiniMax chat / 本地 embed server / 自搭记忆栈往返。
 
 用法：
   .venv/bin/python -m scripts.preflight
 
 需要先在 .env 填齐 MiniMax 的所有字段。Telegram 字段不会被用到。
-
 每步失败会直接抛，便于定位。成功就打印 ✅。
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import socket
-import tempfile
 import time
-from pathlib import Path
 
-from src import embed_server, minimax
+from src import embed_server, memory, memory_store, minimax
 from src.config import settings
-from src.memory import _get_service  # noqa: PLC2701
 
 
 async def step_chat() -> None:
@@ -50,31 +45,26 @@ async def step_embed_local(host: str, port: int) -> None:
     print(f"✅ -> dim={len(vecs[0])}, n={len(vecs)}")
 
 
-async def step_memu() -> None:
-    print("[3/3] memU memorize + retrieve ...", end=" ", flush=True)
-    svc = _get_service()
+async def step_memory() -> None:
+    """自搭记忆栈往返：写 → flush → recall。用沙箱 uid，跑完清理。"""
+    print("[3/3] memory flush + recall ...", end=" ", flush=True)
+    SANDBOX = 9_999_999_999
+    eng = memory_store.engine()
+    from sqlalchemy import text as sql_text
+    with eng.begin() as conn:
+        conn.execute(sql_text("DELETE FROM memories WHERE user_id=:u"), {"u": SANDBOX})
 
-    sample = [
-        {"role": "user", "content": "我叫阿禹，最近在学做菜，特别喜欢做番茄炒蛋。"},
-        {"role": "assistant", "content": "哦，加糖还是加盐？"},
-        {"role": "user", "content": "我加糖。我觉得咸的番茄炒蛋是异端。"},
-    ]
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-        json.dump(sample, f, ensure_ascii=False)
-        path = f.name
-    try:
-        await svc.memorize(resource_url=path, modality="conversation", user={"user_id": "preflight"})
-        result = await svc.retrieve(
-            queries=[{"role": "user", "content": {"text": "我喜欢什么菜"}}],
-            where={"user_id": "preflight"},
-        )
-        n_items = len(result.get("items") or [])
-        n_cats = len(result.get("categories") or [])
-        print(f"✅ -> items={n_items}, categories={n_cats}")
-        if n_items == 0 and n_cats == 0:
-            print("  ⚠️  未召回任何内容（可能 embedding 兼容性异常，见 document/memu-setup.md 风险表）")
-    finally:
-        Path(path).unlink(missing_ok=True)
+    memory.note_turn(SANDBOX, "我叫阿禹，最近在学做菜，特别喜欢做番茄炒蛋。", "哦，加糖还是加盐？")
+    memory.note_turn(SANDBOX, "我加糖。我觉得咸的番茄炒蛋是异端。", "懂了。")
+    ok = await memory.maybe_flush(SANDBOX, force=True)
+    if not ok:
+        raise RuntimeError("flush 没触发")
+    snippets = await memory.recall(SANDBOX, "用户喜欢什么菜")
+    print(f"✅ -> {len(snippets)} hits: {snippets[:1]}")
+    if not snippets:
+        print("  ⚠️  recall 0 命中——检查 embed_server / pgvector")
+    with eng.begin() as conn:
+        conn.execute(sql_text("DELETE FROM memories WHERE user_id=:u"), {"u": SANDBOX})
 
 
 async def _wait_port(host: str, port: int, timeout: float = 120.0) -> None:
@@ -104,7 +94,7 @@ async def main() -> None:
 
         await step_chat()
         await step_embed_local(s.embed_server_host, s.embed_server_port)
-        await step_memu()
+        await step_memory()
     finally:
         task.cancel()
         try:

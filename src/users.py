@@ -216,9 +216,10 @@ def wipe_user(user_id: int) -> dict[str, int]:
         counts["users"] = int(res.rowcount or 0)
         s.commit()
 
-    # memU postgres
+    # 记忆栈 postgres：把所有带 user_id 的表都按 uid 清掉
+    # （包括新表 memories 和遗留的 memU 表 memory_items/memory_categories/...）
     s = _settings()
-    if s.memu_metadata_provider == "postgres" and s.memu_db_url:
+    if s.memu_db_url:
         try:
             import psycopg  # type: ignore
             dsn = s.memu_db_url.replace("postgresql+psycopg://", "postgresql://")
