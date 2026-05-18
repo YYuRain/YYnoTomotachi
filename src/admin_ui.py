@@ -112,6 +112,7 @@ _INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>AIDemo · 记忆浏览</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   :root { --fg:#222; --muted:#777; --bd:#e4e4e4; --bg:#fafafa; --accent:#1a6cff; --danger:#d9554f; }
   * { box-sizing: border-box; }
@@ -271,6 +272,7 @@ _INDEX_HTML = """<!doctype html>
 
 <nav>
   <button data-tab="items" class="active">记忆项</button>
+  <button data-tab="graph">图谱</button>
   <button data-tab="audit">审计</button>
 </nav>
 
@@ -295,6 +297,28 @@ _INDEX_HTML = """<!doctype html>
       <thead><tr><th style="width:80px">类型</th><th style="width:90px">状态</th><th>内容</th><th style="width:130px" class="mono">时间</th><th style="width:140px"></th></tr></thead>
       <tbody id="items-tbody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
     </table>
+  </div>
+
+  <div id="tab-graph" class="tab" style="display:none">
+    <div class="toolbar">
+      <select id="graph-type-filter">
+        <option value="">全部类型</option>
+        <option value="profile">profile</option>
+        <option value="event">event</option>
+      </select>
+      <label class="muted"><input type="checkbox" id="graph-only-deps" /> 只看有依赖关系的节点</label>
+      <span class="muted" id="graph-hint">拖动节点可调整 · 滚轮缩放 · 鼠标悬停看内容</span>
+    </div>
+    <div id="graph-container" style="position:relative;width:100%;height:calc(100vh - 240px);background:#fff;border:1px solid var(--bd);border-radius:6px;overflow:hidden">
+      <svg id="graph-svg" style="width:100%;height:100%;display:block"></svg>
+      <div id="graph-tip" style="position:absolute;pointer-events:none;background:rgba(20,20,20,.92);color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;line-height:1.5;max-width:320px;display:none;z-index:5"></div>
+      <div id="graph-legend" style="position:absolute;left:12px;bottom:12px;background:rgba(255,255,255,.92);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:11px;line-height:1.6;color:#555">
+        <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#1a8a3a;margin-right:6px;vertical-align:middle"></span>confirmed</div>
+        <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#b56500;margin-right:6px;vertical-align:middle"></span>to_verify</div>
+        <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-right:6px;vertical-align:middle"></span>stale</div>
+        <div style="margin-top:4px;color:#999">边方向：B → A 表示 B 依赖于 A</div>
+      </div>
+    </div>
   </div>
 
   <div id="tab-audit" class="tab" style="display:none">
@@ -401,7 +425,21 @@ async function loadItems() {
     const stPill = el('span', { class: 'st ' + (it.status || 'confirmed') }, it.status || 'confirmed');
     if (it.confidence !== undefined && it.confidence < 1) stPill.title = `confidence=${Number(it.confidence).toFixed(2)}`;
     const tdSt = el('td', { 'data-label': '状态' }); tdSt.appendChild(stPill); tr.appendChild(tdSt);
-    tr.appendChild(el('td', { class: 'summary', 'data-label': '内容' }, it.summary || ''));
+    const tdSummary = el('td', { class: 'summary', 'data-label': '内容' });
+    tdSummary.appendChild(document.createTextNode(it.summary || ''));
+    if (it.depends_on && it.depends_on.length) {
+      const depRow = el('div', { class: 'muted', style: 'margin-top:4px;font-size:11px' });
+      depRow.appendChild(document.createTextNode('依赖：'));
+      it.depends_on.forEach((depId, idx) => {
+        if (idx > 0) depRow.appendChild(document.createTextNode(' · '));
+        const a = el('a', { href: '#', style: 'color:var(--accent);font-family:ui-monospace,Menlo,monospace;text-decoration:none' }, depId.slice(0, 8));
+        a.title = '跳到这条事实';
+        a.onclick = (e) => { e.preventDefault(); _focusItem(depId); };
+        depRow.appendChild(a);
+      });
+      tdSummary.appendChild(depRow);
+    }
+    tr.appendChild(tdSummary);
     tr.appendChild(el('td', { class: 'mono', 'data-label': '时间' }, fmt(it.created_at)));
     const ops = el('td', { class: 'ops' });
     const bEdit = el('button', { class: 'op' }, '编辑');
@@ -439,9 +477,144 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   document.querySelectorAll('.tab').forEach(t => t.style.display = 'none');
   $('#tab-' + tab).style.display = '';
   if (tab === 'items') loadItems();
+  if (tab === 'graph') loadGraph();
   if (tab === 'audit') loadAudit();
   toggleAuditAutoRefresh(tab === 'audit' && $('#audit-auto').checked);
 }));
+
+// items 内点 deps id：切回 items tab，搜框塞 short id 过滤定位
+function _focusItem(fullId) {
+  const itemsBtn = document.querySelector('nav button[data-tab="items"]');
+  if (itemsBtn && !itemsBtn.classList.contains('active')) itemsBtn.click();
+  const short = (fullId || '').slice(0, 8);
+  $('#q').value = short;
+  loadItems();
+}
+
+// ============ graph tab（D3 force-directed） ============
+let _graphSim = null;
+
+const GRAPH_COLOR = {
+  confirmed: '#1a8a3a',
+  to_verify: '#b56500',
+  stale: '#888',
+};
+
+async function loadGraph() {
+  if (typeof d3 === 'undefined') {
+    $('#graph-hint').textContent = 'D3 库加载失败（需要联网拉 CDN）';
+    return;
+  }
+  const t = encodeURIComponent($('#graph-type-filter').value || '');
+  const r = await fetch(`/api/items?q=&type=${t}&limit=1000&` + withUid());
+  const items = await r.json();
+
+  const idSet = new Set(items.map(it => it.id));
+  let nodes = items.map(it => ({
+    id: it.id,
+    summary: it.summary || '',
+    type: it.memory_type || 'profile',
+    status: it.status || 'confirmed',
+    confidence: it.confidence,
+    deps: it.depends_on || [],
+  }));
+  const links = [];
+  for (const n of nodes) {
+    for (const dep of (n.deps || [])) {
+      // 边方向 source=B(依赖者) → target=A(被依赖)
+      if (idSet.has(dep)) links.push({ source: n.id, target: dep });
+    }
+  }
+
+  if ($('#graph-only-deps').checked) {
+    const inEdges = new Set();
+    links.forEach(l => { inEdges.add(l.source); inEdges.add(l.target); });
+    nodes = nodes.filter(n => inEdges.has(n.id));
+  }
+
+  $('#graph-hint').textContent = `${nodes.length} 节点 · ${links.length} 条依赖 · 拖动 / 滚轮 / 悬停`;
+  _renderGraph(nodes, links);
+}
+
+function _renderGraph(nodes, links) {
+  const svgEl = document.getElementById('graph-svg');
+  const tip = document.getElementById('graph-tip');
+  const w = svgEl.clientWidth, h = svgEl.clientHeight;
+  const svg = d3.select(svgEl);
+  svg.selectAll('*').remove();
+  if (_graphSim) { _graphSim.stop(); _graphSim = null; }
+  if (!nodes.length) {
+    svg.append('text').attr('x', w/2).attr('y', h/2)
+       .attr('text-anchor', 'middle').attr('fill', '#aaa').attr('font-size', 14)
+       .text('没有节点（切换用户或调整过滤）');
+    return;
+  }
+
+  // arrow marker（指向被依赖方）
+  const defs = svg.append('defs');
+  defs.append('marker')
+      .attr('id', 'arrow').attr('viewBox', '0 -5 10 10').attr('refX', 14).attr('refY', 0)
+      .attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#bbb');
+
+  const root = svg.append('g');
+  svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (e) => root.attr('transform', e.transform)));
+
+  const link = root.append('g').attr('stroke', '#bbb').attr('stroke-opacity', 0.6).attr('stroke-width', 1.2)
+    .selectAll('line').data(links).join('line').attr('marker-end', 'url(#arrow)');
+
+  const nodeG = root.append('g').selectAll('g').data(nodes).join('g')
+    .style('cursor', 'grab')
+    .call(d3.drag()
+      .on('start', (ev, d) => { if (!ev.active) _graphSim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
+      .on('end', (ev, d) => { if (!ev.active) _graphSim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+  nodeG.append('circle')
+    .attr('r', d => d.type === 'profile' ? 8 : 6)
+    .attr('fill', d => GRAPH_COLOR[d.status] || '#aaa')
+    .attr('stroke', '#fff').attr('stroke-width', 1.5)
+    .on('mouseover', (ev, d) => {
+      tip.style.display = 'block';
+      tip.innerHTML =
+        `<div style="font-weight:600;margin-bottom:2px">${d.type} · <span style="color:${GRAPH_COLOR[d.status]}">${d.status}</span>${d.confidence < 1 ? ` · c=${Number(d.confidence).toFixed(2)}` : ''}</div>` +
+        `<div>${escapeHtml(d.summary)}</div>` +
+        (d.deps && d.deps.length ? `<div style="margin-top:4px;color:#bbb;font-size:11px">依赖 ${d.deps.length} 条</div>` : '');
+    })
+    .on('mousemove', (ev) => {
+      const rect = document.getElementById('graph-container').getBoundingClientRect();
+      tip.style.left = (ev.clientX - rect.left + 14) + 'px';
+      tip.style.top = (ev.clientY - rect.top + 14) + 'px';
+    })
+    .on('mouseout', () => { tip.style.display = 'none'; })
+    .on('dblclick', (ev, d) => _focusItem(d.id));
+
+  nodeG.append('text')
+    .attr('dx', 11).attr('dy', 4).attr('font-size', 10).attr('fill', '#444')
+    .text(d => d.summary.length > 18 ? d.summary.slice(0, 17) + '…' : d.summary);
+
+  _graphSim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(80).strength(0.7))
+    .force('charge', d3.forceManyBody().strength(-220))
+    .force('center', d3.forceCenter(w/2, h/2))
+    .force('collide', d3.forceCollide().radius(28))
+    .on('tick', () => {
+      link
+        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      nodeG.attr('transform', d => `translate(${d.x},${d.y})`);
+    });
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s || '';
+  return div.innerHTML;
+}
+
+$('#graph-type-filter').addEventListener('change', loadGraph);
+$('#graph-only-deps').addEventListener('change', loadGraph);
 
 let _deb;
 $('#q').addEventListener('input', () => { clearTimeout(_deb); _deb = setTimeout(loadItems, 250); });
@@ -607,6 +780,7 @@ async function initViewer() {
       const cur = document.querySelector('nav button.active')?.dataset.tab;
       loadStats();
       if (cur === 'items') loadItems();
+      else if (cur === 'graph') loadGraph();
       else if (cur === 'audit') loadAudit();
     });
   } catch (e) {
@@ -788,7 +962,10 @@ def build_app() -> FastAPI:
         if uid is not None:
             where.append("user_id = :u"); params["u"] = uid
         if q.strip():
-            where.append("summary ILIKE :q"); params["q"] = f"%{q.strip()}%"
+            # 既匹配 summary 文本，也匹配 id 前缀（让 deps 链接能跳定位）
+            where.append("(summary ILIKE :q OR id::text ILIKE :qp)")
+            params["q"] = f"%{q.strip()}%"
+            params["qp"] = f"{q.strip()}%"
         if type.strip():
             where.append("memory_type = :t"); params["t"] = type.strip()
         if status.strip():
@@ -796,12 +973,20 @@ def build_app() -> FastAPI:
         wh = f"WHERE {' AND '.join(where)}" if where else ""
         sql = text(
             f"SELECT id, memory_type, summary, status, confidence, "
-            f"last_verified_at, created_at, updated_at FROM memories {wh} "
+            f"last_verified_at, depends_on, created_at, updated_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )
         with eng.connect() as c:
             rows = c.execute(sql, params).mappings().all()
-        return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            # depends_on 是 UUID[]，FastAPI 不会自动 stringify UUID 元素
+            deps = d.get("depends_on")
+            if deps:
+                d["depends_on"] = [str(x) for x in deps]
+            out.append(d)
+        return out
 
     # ============ 编辑接口（普通用户只能改自己的；admin 不限）============
 

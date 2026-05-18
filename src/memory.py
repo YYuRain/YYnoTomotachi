@@ -344,12 +344,18 @@ async def _check_conflicts_for_one(
                 )
             elif verdict in ("to_verify", "stale"):
                 new_conf = 0.0 if verdict == "stale" else 0.5
+                # 把触发该变化的新事实 id 追加进 old.depends_on（去重，COALESCE 处理 NULL）
                 conn.execute(
                     sql_text(
                         "UPDATE memories SET status = :s, confidence = :c, "
-                        "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                        "updated_at = :ts, "
+                        "depends_on = (SELECT ARRAY(SELECT DISTINCT unnest("
+                        "  COALESCE(depends_on, ARRAY[]::uuid[]) || ARRAY[CAST(:dep AS uuid)]"
+                        ")) FROM memories WHERE id = CAST(:id AS uuid)) "
+                        "WHERE id = CAST(:id AS uuid)"
                     ),
-                    {"s": verdict, "c": new_conf, "ts": now, "id": old_id},
+                    {"s": verdict, "c": new_conf, "ts": now,
+                     "id": old_id, "dep": new_id},
                 )
                 flips.append((old_id, verdict))
 
