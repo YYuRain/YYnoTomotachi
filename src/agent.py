@@ -194,13 +194,22 @@ async def _safe_recall(user_id: int, user_text: str) -> list[str]:
 
 _TOOL_DETECT_SYSTEM = """你是工具调用判断助手。判断用户这条消息是否需要查询实时信息才能更好地回复。
 
-需要查询的情况：用户想了解某平台上的内容、问某件具体事实、提到了某个网址、想知道最近流行什么。
-不需要查询的情况：闲聊、情绪倾诉、回忆往事、问观点/建议、日常打招呼。
+需要查询的情况（必须 needed=true）：
+- 问某人最近做了什么、去了哪里、说了什么（公众人物动态）
+- 问实时数据：股价、行情、天气、汇率
+- 问最新新闻、近期事件、周末/昨天/今天发生的事
+- 用户想了解某平台（小红书/微博等）上的内容 → xhs_search
+- 提到了某个网址 → read_url
+- 问某件具体事实但答案可能在近期变化
+
+不需要查询的情况：闲聊、情绪倾诉、回忆往事、问观点/建议、日常打招呼、问你个人感受。
+
+如果用户问的是最近/实时的事情，优先 needed=true，不要因为"不确定有没有结果"而放弃搜索。
 
 输出严格 JSON（无其他文字）：
 {"needed": true/false, "tool": "xhs_search|web_search|read_url", "query": "搜索词或URL"}
 
-needed 为 false 时 tool 和 query 可省略。宁可少搜也不要滥搜。"""
+needed 为 false 时 tool 和 query 可省略。"""
 
 _TOOL_FUNCS = {
     "xhs_search": tools.search_xhs,
