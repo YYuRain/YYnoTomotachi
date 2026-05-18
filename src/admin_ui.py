@@ -135,6 +135,11 @@ _INDEX_HTML = """<!doctype html>
   td.summary { max-width: 700px; }
   td.ops { text-align: right; white-space: nowrap; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; background: #eef4ff; color: var(--accent); font-size: 12px; }
+  /* status 三态色（PRD v2 / 5.1） */
+  .st { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .st.confirmed { background: #ecf8ee; color: #1a8a3a; }
+  .st.to_verify { background: #fff3e0; color: #b56500; }
+  .st.stale { background: #f0f0f0; color: #888; text-decoration: line-through; }
   .empty { color: var(--muted); text-align: center; padding: 40px; }
   .muted { color: var(--muted); }
   button.op { border: 1px solid var(--bd); background: white; padding: 3px 9px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 12px; color: #444; margin-left: 4px; }
@@ -154,7 +159,7 @@ _INDEX_HTML = """<!doctype html>
   /* audit tab：事件 chip 着色，按事件类别 */
   .ev { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .ev.user_msg, .ev.assistant_reply { background: #eef4ff; color: #1a6cff; }
-  .ev.memory_recall, .ev.memory_flush { background: #ecf8ee; color: #1a8a3a; }
+  .ev.memory_recall, .ev.memory_flush, .ev.memory_conflict_check { background: #ecf8ee; color: #1a8a3a; }
   .ev.persona_update, .ev.persona_consolidate { background: #f5edff; color: #7a3fcc; }
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
@@ -278,11 +283,17 @@ _INDEX_HTML = """<!doctype html>
         <option value="profile">profile</option>
         <option value="event">event</option>
       </select>
+      <select id="status-filter">
+        <option value="">全部状态</option>
+        <option value="confirmed">confirmed</option>
+        <option value="to_verify">to_verify</option>
+        <option value="stale">stale</option>
+      </select>
       <span class="muted" id="items-hint"></span>
     </div>
     <table>
-      <thead><tr><th style="width:80px">类型</th><th>内容</th><th style="width:130px" class="mono">时间</th><th style="width:140px"></th></tr></thead>
-      <tbody id="items-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th style="width:80px">类型</th><th style="width:90px">状态</th><th>内容</th><th style="width:130px" class="mono">时间</th><th style="width:140px"></th></tr></thead>
+      <tbody id="items-tbody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -294,6 +305,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="assistant_reply">assistant_reply</option>
         <option value="memory_recall">memory_recall</option>
         <option value="memory_flush">memory_flush</option>
+        <option value="memory_conflict_check">memory_conflict_check</option>
         <option value="persona_update">persona_update</option>
         <option value="persona_consolidate">persona_consolidate</option>
         <option value="proactive_decision">proactive_decision</option>
@@ -377,14 +389,18 @@ async function loadStats() {
 async function loadItems() {
   const q = encodeURIComponent($('#q').value || '');
   const t = encodeURIComponent($('#type-filter').value || '');
-  const r = await fetch(`/api/items?q=${q}&type=${t}&limit=200&` + withUid()); const j = await r.json();
+  const st = encodeURIComponent($('#status-filter').value || '');
+  const r = await fetch(`/api/items?q=${q}&type=${t}&status=${st}&limit=200&` + withUid()); const j = await r.json();
   $('#items-hint').textContent = `${j.length} 条`;
   const tb = $('#items-tbody'); tb.innerHTML = '';
-  if (!j.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">没命中</td></tr>'; return; }
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">没命中</td></tr>'; return; }
   for (const it of j) {
     const tr = el('tr');
     const pill = el('span', { class: 'pill' }, it.memory_type || '');
     const tdT = el('td', { 'data-label': '类型' }); tdT.appendChild(pill); tr.appendChild(tdT);
+    const stPill = el('span', { class: 'st ' + (it.status || 'confirmed') }, it.status || 'confirmed');
+    if (it.confidence !== undefined && it.confidence < 1) stPill.title = `confidence=${Number(it.confidence).toFixed(2)}`;
+    const tdSt = el('td', { 'data-label': '状态' }); tdSt.appendChild(stPill); tr.appendChild(tdSt);
     tr.appendChild(el('td', { class: 'summary', 'data-label': '内容' }, it.summary || ''));
     tr.appendChild(el('td', { class: 'mono', 'data-label': '时间' }, fmt(it.created_at)));
     const ops = el('td', { class: 'ops' });
@@ -430,6 +446,7 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
 let _deb;
 $('#q').addEventListener('input', () => { clearTimeout(_deb); _deb = setTimeout(loadItems, 250); });
 $('#type-filter').addEventListener('change', loadItems);
+$('#status-filter').addEventListener('change', loadItems);
 
 // ============ audit tab ============
 const truncate = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + '…' : s; };
@@ -461,6 +478,12 @@ function summarizeAudit(d) {
     case 'memory_flush':
       return `<span class="k">${d.msgs} 消息 → +${d.new_items||0} 项</span>` +
              ((d.new_item_summaries||[]).slice(0,2).map(s=>'「'+t(s,40)+'」').join(' · '));
+    case 'memory_conflict_check': {
+      const flips = d.flips || [];
+      if (!flips.length) return `<span class="k">${d.candidates} 候选 · 无变更</span>「${t(d.new_summary, 50)}」`;
+      const flipStr = flips.slice(0,3).map(f => `${(f.id||'').slice(0,6)}→${f.verdict}`).join(' ');
+      return `<span class="k">+1「${t(d.new_summary, 40)}」</span>触发 ${flips.length} 改: ${flipStr}`;
+    }
     case 'persona_update': {
       const deltas = Object.entries(d.trait_deltas || {}).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' ');
       const obs = (d.new_observations || []).length;
@@ -756,6 +779,7 @@ def build_app() -> FastAPI:
         user_id: int | None = Query(None),
         q: str = Query("", max_length=200),
         type: str = Query("", max_length=32),
+        status: str = Query("", max_length=16),
         limit: int = Query(200, ge=1, le=1000),
     ) -> list[dict[str, Any]]:
         uid = _resolve_uid(viewer, user_id)
@@ -767,9 +791,12 @@ def build_app() -> FastAPI:
             where.append("summary ILIKE :q"); params["q"] = f"%{q.strip()}%"
         if type.strip():
             where.append("memory_type = :t"); params["t"] = type.strip()
+        if status.strip():
+            where.append("status = :st"); params["st"] = status.strip()
         wh = f"WHERE {' AND '.join(where)}" if where else ""
         sql = text(
-            f"SELECT id, memory_type, summary, created_at FROM memories {wh} "
+            f"SELECT id, memory_type, summary, status, confidence, "
+            f"last_verified_at, created_at, updated_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )
         with eng.connect() as c:

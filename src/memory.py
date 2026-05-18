@@ -68,6 +68,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
     """语义召回 top_k 条记忆，每条带形成日期。失败返回空 list，不阻塞主流程。
 
     格式：`(2026-05-15) 用户最近在减肥`
+    to_verify 的条目带 `[待确认]` 前缀让主 LLM 自己拿捏；stale 完全不召回（PRD v2 / 5.1）。
     """
     uid_str = _uid(user_id)
     snippets: list[str] = []
@@ -80,16 +81,18 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             with eng.connect() as conn:
                 rows = conn.execute(
                     sql_text(
-                        "SELECT summary, created_at FROM memories "
-                        "WHERE user_id = :uid "
+                        "SELECT summary, created_at, status FROM memories "
+                        "WHERE user_id = :uid AND status != 'stale' "
                         "ORDER BY embedding <=> CAST(:q AS vector) "
                         "LIMIT :k"
                     ),
                     {"uid": user_id, "q": embed_client.vec_literal(vec), "k": top_k},
                 ).fetchall()
-            for summary, created_at in rows:
+            for summary, created_at, status in rows:
                 date = _fmt_date(created_at)
-                snippets.append(f"({date}) {summary}" if date else str(summary))
+                marker = "[待确认] " if status == "to_verify" else ""
+                base = f"({date}) {marker}{summary}" if date else f"{marker}{summary}"
+                snippets.append(base)
     except Exception as e:
         log.debug("recall uid=%s 失败：%s", uid_str, e)
 
@@ -191,13 +194,14 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
 
     # 入库
     try:
-        new_summaries = await _persist_items(user_id_int, items, evidence_ref=str(path))
+        new_records = await _persist_items(user_id_int, items, evidence_ref=str(path))
     except Exception as e:
         log.exception("persist failed uid=%s: %s", uid, e)
         audit("memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
               error=f"persist:{type(e).__name__}:{str(e)[:200]}")
         return False
 
+    new_summaries = [r["summary"] for r in new_records]
     log.info("memorize uid=%s ok (%d msgs) -> %s, +%d items",
              uid, len(batch), path.name, len(new_summaries))
     audit(
@@ -207,6 +211,7 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
     )
 
     _fire_persona_update(user_id_int, batch)
+    _fire_conflict_check(user_id_int, new_records)
     return True
 
 
@@ -227,6 +232,185 @@ def _fire_persona_update(user_id: int, batch: list[dict[str, str]]) -> None:
     except RuntimeError:
         # 没有 running loop（如脚本同步上下文调用），跳过
         pass
+
+
+def _fire_conflict_check(user_id: int, new_records: list[dict[str, Any]]) -> None:
+    """异步对每条新事实跑影响分析，把可能失效的旧 profile 标 to_verify / stale。
+
+    PRD v2 / 5.1：写入时筛 to_verify。
+
+    新事实和旧事实的关系组合：
+    - 新 profile / 新 event 都可能让旧 profile 失效（"我搬上海了" event → "住北京" profile stale）
+    - 旧 event 不会变 stale（历史时点不可被未来事件改写），所以候选 SQL 限定 profile
+    - 同 batch 同伴排除：4 条事实同一段对话里同时抽出的，本就 mutually consistent，
+      不应互判 to_verify（避免 LLM 把同时陈述的两个独立事实硬扯成依赖）
+
+    失败静默不阻塞 flush 主链路。
+    """
+    if not user_id or not new_records:
+        return
+    batch_ids = [r["id"] for r in new_records if r.get("id")]
+
+    async def _go():
+        try:
+            for new in new_records:
+                await _check_conflicts_for_one(user_id, new, exclude_ids=batch_ids)
+        except Exception as e:
+            log.debug("conflict check post-flush err: %s", e)
+
+    try:
+        asyncio.create_task(_go())
+    except RuntimeError:
+        pass
+
+
+CONFLICT_TOPK = 5  # 每条新 profile 召回多少旧 profile 候选做判断
+
+
+async def _check_conflicts_for_one(
+    user_id: int,
+    new: dict[str, Any],
+    *,
+    exclude_ids: list[str] | None = None,
+) -> None:
+    """对一条新事实：召回 top-N 旧 profile → LLM 判 verdicts → UPDATE 旧条目 status。
+
+    候选限定 profile（event 不变 stale），且排除 exclude_ids（同 batch 同伴）。
+    """
+    new_id = new.get("id")
+    new_summary = new.get("summary") or ""
+    vec = new.get("embedding")
+    if not new_id or not new_summary or vec is None:
+        return
+
+    exclude = list(exclude_ids or [])
+    if new_id not in exclude:
+        exclude.append(new_id)
+
+    eng = memory_store.engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            sql_text(
+                "SELECT id::text AS id, summary FROM memories "
+                "WHERE user_id = :uid AND memory_type = 'profile' "
+                "AND status != 'stale' "
+                "AND NOT (id::text = ANY(:excl)) "
+                "ORDER BY embedding <=> CAST(:q AS vector) "
+                "LIMIT :k"
+            ),
+            {"uid": user_id, "excl": exclude,
+             "q": embed_client.vec_literal(vec), "k": CONFLICT_TOPK},
+        ).fetchall()
+    candidates = [(r[0], r[1]) for r in rows]
+    if not candidates:
+        return
+
+    # LLM 判
+    s = settings()
+    model = s.memu_chat_model or s.openrouter_model
+    if not model:
+        return
+    prompt = memory_prompts.render_conflict_check(new_summary, candidates)
+    try:
+        from . import openrouter
+        res = await openrouter.chat(
+            [{"role": "user", "content": prompt}],
+            model=model, temperature=0.1, max_tokens=2048,
+        )
+        raw = res.get("text", "") if isinstance(res, dict) else ""
+    except Exception as e:
+        log.warning("conflict check LLM err uid=%s new=%s: %s", user_id, new_id[:8], e)
+        return
+
+    verdicts = _parse_verdicts(raw, valid_ids={c[0] for c in candidates})
+    if not verdicts:
+        if raw:
+            log.warning("conflict check 解析 0 verdicts uid=%s raw=%r", user_id, raw[:200])
+        return
+
+    # 真正更新
+    flips: list[tuple[str, str]] = []
+    now = datetime.now(timezone.utc)
+    with eng.begin() as conn:
+        for old_id, verdict in verdicts.items():
+            if verdict == "still_valid":
+                # 标 last_verified_at（5.2/5.3 才会读，但便宜就一并写了）
+                conn.execute(
+                    sql_text(
+                        "UPDATE memories SET last_verified_at = :ts "
+                        "WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"ts": now, "id": old_id},
+                )
+            elif verdict in ("to_verify", "stale"):
+                new_conf = 0.0 if verdict == "stale" else 0.5
+                conn.execute(
+                    sql_text(
+                        "UPDATE memories SET status = :s, confidence = :c, "
+                        "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"s": verdict, "c": new_conf, "ts": now, "id": old_id},
+                )
+                flips.append((old_id, verdict))
+
+    if flips:
+        log.info(
+            "conflict check uid=%s new=%s 触发 %d 个旧条目变更：%s",
+            user_id, new_id[:8], len(flips),
+            " | ".join(f"{oid[:8]}→{v}" for oid, v in flips[:5]),
+        )
+    audit(
+        "memory_conflict_check",
+        user_id=user_id,
+        new_id=new_id,
+        new_summary=new_summary[:200],
+        candidates=len(candidates),
+        flips=[{"id": oid, "verdict": v} for oid, v in flips],
+    )
+
+
+_VERDICT_RE = re.compile(
+    r'\{\s*"id"\s*:\s*"([^"]+)"\s*,\s*"verdict"\s*:\s*"(still_valid|to_verify|stale)"\s*\}',
+    re.DOTALL,
+)
+
+
+def _parse_verdicts(raw: str, *, valid_ids: set[str]) -> dict[str, str]:
+    """LLM 输出的 JSON → dict[id → verdict]。strict json 优先，失败回退 regex。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    out: dict[str, str] = {}
+    parsed: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                parsed = None
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list):
+        for v in parsed["verdicts"]:
+            if not isinstance(v, dict):
+                continue
+            cid = v.get("id")
+            verdict = v.get("verdict")
+            if cid in valid_ids and verdict in ("still_valid", "to_verify", "stale"):
+                out[cid] = verdict
+        return out
+
+    # 兜底
+    for m in _VERDICT_RE.finditer(raw):
+        cid, verdict = m.group(1), m.group(2)
+        if cid in valid_ids:
+            out[cid] = verdict
+    return out
 
 
 # ============ 抽取（LLM → JSON → list[(type, content)]）============
@@ -333,8 +517,12 @@ async def _persist_items(
     items: list[tuple[str, str]],
     *,
     evidence_ref: str | None = None,
-) -> list[str]:
-    """对每条 (type, content) 算 embedding 并 INSERT 到 memories。返回 summary 列表（用于 audit）。"""
+) -> list[dict[str, Any]]:
+    """对每条 (type, content) 算 embedding 并 INSERT 到 memories。
+
+    返回 list[dict]，每条 dict 含 id / summary / memory_type / embedding（可能 None）；
+    上层既用这个填 audit，也喂 _fire_conflict_check 复用 embedding。
+    """
     if not items or not user_id:
         return []
     summaries = [c for _t, c in items]
@@ -342,11 +530,12 @@ async def _persist_items(
 
     eng = memory_store.engine()
     now = datetime.now(timezone.utc)
-    inserted: list[str] = []
+    inserted: list[dict[str, Any]] = []
     with eng.begin() as conn:
         for (t, c), vec in zip(items, vecs):
+            new_id = str(_uuid.uuid4())
             params: dict[str, Any] = {
-                "id": str(_uuid.uuid4()),
+                "id": new_id,
                 "user_id": user_id,
                 "summary": c,
                 "memory_type": t,
@@ -375,5 +564,5 @@ async def _persist_items(
                     ),
                     params,
                 )
-            inserted.append(c)
+            inserted.append({"id": new_id, "summary": c, "memory_type": t, "embedding": vec})
     return inserted

@@ -19,9 +19,9 @@ from typing import Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    BigInteger, Column, DateTime, Index, String, Text, create_engine, text,
+    BigInteger, Column, DateTime, Float, Index, String, Text, create_engine, text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
@@ -46,10 +46,17 @@ class Memory(Base):
     embedding = Column(Vector(EMBED_DIM), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    evidence_ref = Column(Text, nullable=True)  # 来源对话文件路径，调试用
+    evidence_ref = Column(Text, nullable=True)
+
+    # PRD v2 字段（5.1 写入冲突检测 / 5.2 召回反验证 / 5.3 Auto Dream 用）
+    status = Column(String(16), nullable=False, default="confirmed")  # confirmed | to_verify | stale
+    confidence = Column(Float, nullable=False, default=1.0)
+    last_verified_at = Column(DateTime(timezone=True), nullable=True)
+    depends_on = Column(ARRAY(UUID(as_uuid=True)), nullable=True)  # 上游 memory id 列表
 
     __table_args__ = (
         Index("ix_memories_user_created", "user_id", "created_at"),
+        Index("ix_memories_user_status", "user_id", "status"),
     )
 
 
@@ -74,9 +81,34 @@ def engine():
     with _engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(_engine)
+    _ensure_v2_columns()
     _ensure_vector_index()
     log.info("memory_store engine ready (memories table)")
     return _engine
+
+
+def _ensure_v2_columns() -> None:
+    """老库已经有 memories 表但没 PRD v2 字段——一次性加列。
+
+    `Base.metadata.create_all` 只建不存在的表，已经存在的表它不会改 schema。所以新加的
+    status / confidence / last_verified_at / depends_on 必须自己 ALTER。
+    """
+    ddls = [
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS status VARCHAR(16) "
+        "NOT NULL DEFAULT 'confirmed'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION "
+        "NOT NULL DEFAULT 1.0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ NULL",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS depends_on UUID[] NULL",
+        "CREATE INDEX IF NOT EXISTS ix_memories_user_status "
+        "ON memories (user_id, status)",
+    ]
+    try:
+        with _engine.begin() as conn:  # type: ignore[union-attr]
+            for ddl in ddls:
+                conn.execute(text(ddl))
+    except Exception as e:
+        log.warning("memories v2 列升级失败：%s", e)
 
 
 def _ensure_vector_index() -> None:

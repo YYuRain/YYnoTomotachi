@@ -59,3 +59,62 @@ EXTRACT_PROMPT = """# 任务
 def render(resource: str) -> str:
     """填入对话文本 → 返回完整 user prompt 文本。"""
     return EXTRACT_PROMPT.format(resource=resource)
+
+
+# ============ 写入冲突检测（PRD v2 / 5.1）============
+
+CONFLICT_CHECK_PROMPT = """# 任务
+我们刚记下一条**新事实**关于用户。下面给你 N 条**已存在的旧事实**，你判断每条旧事实在
+新事实出现后**是否仍然成立**。
+
+## 新事实
+{new_fact}
+
+## 候选旧事实（按语义相似度从高到低排）
+{candidates}
+
+## 判定方法
+对每条旧事实输出 verdict ∈ {{still_valid, to_verify, stale}}：
+
+- **still_valid**：旧事实跟新事实**没有冲突或依赖**——它独立于新事实，照常成立。
+  例：新「用户搬上海了」 vs 旧「用户养了只猫」——猫不会因为搬家消失，still_valid。
+
+- **to_verify**：旧事实**依赖新事实涉及的前提**，但不一定立刻失效，需要后续确认。
+  例：新「用户搬上海了」 vs 旧「用户骑车上班 15 分钟」——通勤时长依赖居住地，
+  搬家后可能变了也可能没变，to_verify。
+
+- **stale**：旧事实**直接被新事实取代或推翻**。
+  例：新「用户搬上海了」 vs 旧「用户住在北京」——同一槽位被新值覆盖，stale。
+  例：新「用户分手了」 vs 旧「用户跟女友周末去了三亚」——历史事件**不要**标 stale，
+  那是过去发生的事；分手只让"用户当前有女友"这种 profile 失效，不让历史 event 失效。
+
+## 重要约束
+1. event 类（具体时点发生过的事，比如"昨天去爬山崴脚"）几乎不会因为新事实变 stale。
+   历史就是历史，发生过就发生过。除非新事实直接否定它（"我没去爬过山"），才标 stale。
+2. **拿不准就标 to_verify**——宁可多标也不要错标 stale。stale 会让记忆不再被召回，
+   误标的代价比 to_verify 大。
+3. 不要把不相关的旧事实硬扯成 to_verify。如果新事实跟旧事实**毫无依赖关系**，应该 still_valid。
+
+## 输出格式（严格 JSON，无任何额外文字、不包 ```json 围栏）
+
+```
+{{"verdicts": [
+  {{"id": "uuid-of-old-fact-1", "verdict": "still_valid"}},
+  {{"id": "uuid-of-old-fact-2", "verdict": "to_verify"}},
+  {{"id": "uuid-of-old-fact-3", "verdict": "stale"}}
+]}}
+```
+
+每条候选都必须有对应 verdict（按 id 一一映射）。"""
+
+
+def render_conflict_check(new_fact: str, candidates: list[tuple[str, str]]) -> str:
+    """new_fact: 新事实 summary。candidates: [(id_str, summary), ...]，已按相似度排好序。"""
+    cand_lines = "\n".join(
+        f"{i+1}. id={cid}\n   {summary}"
+        for i, (cid, summary) in enumerate(candidates)
+    )
+    return CONFLICT_CHECK_PROMPT.format(
+        new_fact=new_fact.strip(),
+        candidates=cand_lines,
+    )
