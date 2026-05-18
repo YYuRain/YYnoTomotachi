@@ -34,6 +34,11 @@ log = logging.getLogger(__name__)
 FLUSH_EVERY_N_TURNS = 6
 FLUSH_INTERVAL_SEC = 15 * 60  # 或 15 分钟强制一次
 
+# PRD v2 / 5.2：召回时反验证 to_verify 条目
+REVERIFY_COOLDOWN_SEC = 30 * 60  # 同一条 to_verify 30min 内最多反验证一次
+REVERIFY_TIMEOUT_SEC = 8.0       # 单条反验证 LLM 调用超时（保护 recall 整体延迟）
+REVERIFY_UPSTREAM_LIMIT = 3      # 喂给 LLM 的上游事实最多 3 条
+
 # user_id (str) → buffer of {role, content}
 _buffer_per_user: dict[str, list[dict[str, str]]] = {}
 _last_flush_ts_per_user: dict[str, float] = {}
@@ -67,8 +72,12 @@ def _fmt_date(dt) -> str:
 async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
     """语义召回 top_k 条记忆，每条带形成日期。失败返回空 list，不阻塞主流程。
 
-    格式：`(2026-05-15) 用户最近在减肥`
-    to_verify 的条目带 `[待确认]` 前缀让主 LLM 自己拿捏；stale 完全不召回（PRD v2 / 5.1）。
+    PRD v2 / 5.1：`status = 'stale'` 不召回。
+    PRD v2 / 5.2：召回结果中 `status = 'to_verify'` 且 30min 内没反验证过的，同步跑一次
+    LLM 反验证；still_valid 升回 confirmed，uncertain 保持 to_verify 但打 last_verified_at 戳
+    限速。返回时按最新 status 拼前缀（confirmed 不带，to_verify 带 `[待确认]`）。
+
+    格式：`(2026-05-15) 用户最近在减肥` 或 `(2026-05-15) [待确认] ...`
     """
     uid_str = _uid(user_id)
     snippets: list[str] = []
@@ -76,23 +85,77 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
         vec = await embed_client.embed_one(user_text)
         if vec is None:
             log.debug("recall uid=%s: embed 失败，跳过 RAG", uid_str)
-        else:
-            eng = memory_store.engine()
-            with eng.connect() as conn:
-                rows = conn.execute(
-                    sql_text(
-                        "SELECT summary, created_at, status FROM memories "
-                        "WHERE user_id = :uid AND status != 'stale' "
-                        "ORDER BY embedding <=> CAST(:q AS vector) "
-                        "LIMIT :k"
-                    ),
-                    {"uid": user_id, "q": embed_client.vec_literal(vec), "k": top_k},
-                ).fetchall()
-            for summary, created_at, status in rows:
-                date = _fmt_date(created_at)
-                marker = "[待确认] " if status == "to_verify" else ""
-                base = f"({date}) {marker}{summary}" if date else f"{marker}{summary}"
-                snippets.append(base)
+            audit("memory_recall", user_id=user_id, query=user_text[:200], hits=0, snippets=[])
+            return []
+
+        eng = memory_store.engine()
+        with eng.connect() as conn:
+            rows = conn.execute(
+                sql_text(
+                    "SELECT id::text AS id, summary, created_at, status, "
+                    "last_verified_at, depends_on FROM memories "
+                    "WHERE user_id = :uid AND status != 'stale' "
+                    "ORDER BY embedding <=> CAST(:q AS vector) "
+                    "LIMIT :k"
+                ),
+                {"uid": user_id, "q": embed_client.vec_literal(vec), "k": top_k},
+            ).fetchall()
+
+        items = [
+            {
+                "id": r[0], "summary": r[1], "created_at": r[2],
+                "status": r[3], "last_verified_at": r[4], "depends_on": r[5],
+            }
+            for r in rows
+        ]
+
+        # 5.2：找需要反验证的
+        now = datetime.now(timezone.utc)
+        cooldown_floor = now.timestamp() - REVERIFY_COOLDOWN_SEC
+        due: list[dict[str, Any]] = []
+        for it in items:
+            if it["status"] != "to_verify":
+                continue
+            lva = it.get("last_verified_at")
+            if lva is None or lva.timestamp() < cooldown_floor:
+                due.append(it)
+
+        if due:
+            results = await asyncio.gather(
+                *[_reverify_one(user_id, it, user_text) for it in due],
+                return_exceptions=True,
+            )
+            # 把验证结果写回 items（status 可能升级），UPDATE 数据库
+            with eng.begin() as conn:
+                for it, res in zip(due, results):
+                    if isinstance(res, Exception) or res is None:
+                        continue
+                    new_status = res
+                    if new_status == "still_valid":
+                        conn.execute(
+                            sql_text(
+                                "UPDATE memories SET status = 'confirmed', "
+                                "confidence = 1.0, last_verified_at = :ts, "
+                                "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                            ),
+                            {"ts": now, "id": it["id"]},
+                        )
+                        it["status"] = "confirmed"
+                    else:
+                        # uncertain：保持 to_verify，仅打 last_verified_at 限速戳
+                        conn.execute(
+                            sql_text(
+                                "UPDATE memories SET last_verified_at = :ts "
+                                "WHERE id = CAST(:id AS uuid)"
+                            ),
+                            {"ts": now, "id": it["id"]},
+                        )
+
+        for it in items:
+            date = _fmt_date(it["created_at"])
+            marker = "[待确认] " if it["status"] == "to_verify" else ""
+            base = f"({date}) {marker}{it['summary']}" if date else f"{marker}{it['summary']}"
+            snippets.append(base)
     except Exception as e:
         log.debug("recall uid=%s 失败：%s", uid_str, e)
 
@@ -379,6 +442,120 @@ _VERDICT_RE = re.compile(
     r'\{\s*"id"\s*:\s*"([^"]+)"\s*,\s*"verdict"\s*:\s*"(still_valid|to_verify|stale)"\s*\}',
     re.DOTALL,
 )
+
+_REVERIFY_RE = re.compile(
+    r'"verdict"\s*:\s*"(still_valid|uncertain)"',
+    re.DOTALL,
+)
+
+
+async def _reverify_one(
+    user_id: int, item: dict[str, Any], query: str,
+) -> str | None:
+    """对一条 to_verify 跑 LLM 反验证。返回 'still_valid' / 'uncertain' / None（失败）。
+
+    PRD v2 / 5.2：用 deps 上游 + 当前 query 喂 LLM。LLM 不能返 stale（保守约束在 prompt
+    里说明），调用方据此决定 UPDATE 行为。
+    """
+    fact = item.get("summary") or ""
+    if not fact:
+        return None
+
+    # 拉上游事实 summary（按 created_at desc，最近的 N 条）
+    upstream: list[str] = []
+    deps = item.get("depends_on") or []
+    if deps:
+        eng = memory_store.engine()
+        try:
+            with eng.connect() as conn:
+                rows = conn.execute(
+                    sql_text(
+                        "SELECT summary FROM memories "
+                        "WHERE id = ANY(:ids) "
+                        "ORDER BY created_at DESC LIMIT :n"
+                    ),
+                    {"ids": deps, "n": REVERIFY_UPSTREAM_LIMIT},
+                ).fetchall()
+            upstream = [r[0] for r in rows if r[0]]
+        except Exception as e:
+            log.debug("reverify pull upstream err uid=%s id=%s: %s",
+                      user_id, item["id"][:8], e)
+
+    s = settings()
+    model = s.memu_chat_model or s.openrouter_model
+    if not model:
+        return None
+    prompt = memory_prompts.render_reverify(fact, upstream, query)
+
+    started = time.time()
+    try:
+        from . import openrouter
+        res = await asyncio.wait_for(
+            openrouter.chat(
+                [{"role": "user", "content": prompt}],
+                model=model, temperature=0.1, max_tokens=512,
+            ),
+            timeout=REVERIFY_TIMEOUT_SEC,
+        )
+        raw = res.get("text", "") if isinstance(res, dict) else ""
+    except asyncio.TimeoutError:
+        log.warning("reverify timeout uid=%s id=%s", user_id, item["id"][:8])
+        audit("memory_reverify", user_id=user_id, fact_id=item["id"],
+              fact=fact[:200], verdict="timeout",
+              latency_ms=int((time.time() - started) * 1000))
+        return None
+    except Exception as e:
+        log.warning("reverify LLM err uid=%s id=%s: %s",
+                    user_id, item["id"][:8], e)
+        return None
+
+    verdict = _parse_reverify(raw)
+    latency_ms = int((time.time() - started) * 1000)
+    audit(
+        "memory_reverify",
+        user_id=user_id,
+        fact_id=item["id"],
+        fact=fact[:200],
+        upstream=[u[:200] for u in upstream],
+        query=(query or "")[:200],
+        verdict=verdict or "parse_fail",
+        latency_ms=latency_ms,
+    )
+    if verdict is None:
+        log.warning("reverify 解析失败 uid=%s id=%s raw=%r",
+                    user_id, item["id"][:8], raw[:160])
+    else:
+        log.info("reverify uid=%s id=%s → %s (%dms)",
+                 user_id, item["id"][:8], verdict, latency_ms)
+    return verdict
+
+
+def _parse_reverify(raw: str) -> str | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        d = json.loads(raw)
+        v = d.get("verdict") if isinstance(d, dict) else None
+        if v in ("still_valid", "uncertain"):
+            return v
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+            v = d.get("verdict") if isinstance(d, dict) else None
+            if v in ("still_valid", "uncertain"):
+                return v
+        except Exception:
+            pass
+    m = _REVERIFY_RE.search(raw)
+    if m:
+        return m.group(1)
+    return None
 
 
 def _parse_verdicts(raw: str, *, valid_ids: set[str]) -> dict[str, str]:

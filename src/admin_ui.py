@@ -160,7 +160,7 @@ _INDEX_HTML = """<!doctype html>
   /* audit tab：事件 chip 着色，按事件类别 */
   .ev { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .ev.user_msg, .ev.assistant_reply { background: #eef4ff; color: #1a6cff; }
-  .ev.memory_recall, .ev.memory_flush, .ev.memory_conflict_check { background: #ecf8ee; color: #1a8a3a; }
+  .ev.memory_recall, .ev.memory_flush, .ev.memory_conflict_check, .ev.memory_reverify { background: #ecf8ee; color: #1a8a3a; }
   .ev.persona_update, .ev.persona_consolidate { background: #f5edff; color: #7a3fcc; }
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
@@ -330,6 +330,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="memory_recall">memory_recall</option>
         <option value="memory_flush">memory_flush</option>
         <option value="memory_conflict_check">memory_conflict_check</option>
+        <option value="memory_reverify">memory_reverify</option>
         <option value="persona_update">persona_update</option>
         <option value="persona_consolidate">persona_consolidate</option>
         <option value="proactive_decision">proactive_decision</option>
@@ -656,6 +657,10 @@ function summarizeAudit(d) {
       if (!flips.length) return `<span class="k">${d.candidates} 候选 · 无变更</span>「${t(d.new_summary, 50)}」`;
       const flipStr = flips.slice(0,3).map(f => `${(f.id||'').slice(0,6)}→${f.verdict}`).join(' ');
       return `<span class="k">+1「${t(d.new_summary, 40)}」</span>触发 ${flips.length} 改: ${flipStr}`;
+    }
+    case 'memory_reverify': {
+      const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
+      return `<span class="k">${d.verdict || '?'}${lat}</span>「${t(d.fact, 60)}」`;
     }
     case 'persona_update': {
       const deltas = Object.entries(d.trait_deltas || {}).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' ');
