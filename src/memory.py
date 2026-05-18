@@ -39,6 +39,11 @@ REVERIFY_COOLDOWN_SEC = 30 * 60  # 同一条 to_verify 30min 内最多反验证�
 REVERIFY_TIMEOUT_SEC = 8.0       # 单条反验证 LLM 调用超时（保护 recall 整体延迟）
 REVERIFY_UPSTREAM_LIMIT = 3      # 喂给 LLM 的上游事实最多 3 条
 
+# PRD v2 / 5.3：Auto Dream 后台整理
+DREAM_NEIGHBOR_TOP_K = 5     # 每条 to_verify 拿多少邻居 confirmed 条目当上下文
+DREAM_BATCH_SLEEP_SEC = 0.5  # 同一用户内每条之间间隔（限速 LLM）
+DREAM_TIMEOUT_SEC = 15.0     # 单条 dream LLM 调用超时（后台允许更宽松）
+
 # user_id (str) → buffer of {role, content}
 _buffer_per_user: dict[str, list[dict[str, str]]] = {}
 _last_flush_ts_per_user: dict[str, float] = {}
@@ -556,6 +561,232 @@ def _parse_reverify(raw: str) -> str | None:
     if m:
         return m.group(1)
     return None
+
+
+# ============ Auto Dream（PRD v2 / 5.3）============
+
+_DREAM_RE = re.compile(
+    r'"verdict"\s*:\s*"(still_valid|uncertain|stale)"',
+    re.DOTALL,
+)
+
+
+def _parse_dream(raw: str) -> str | None:
+    """LLM 输出 → 'still_valid'|'uncertain'|'stale'|None。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        d = json.loads(raw)
+        v = d.get("verdict") if isinstance(d, dict) else None
+        if v in ("still_valid", "uncertain", "stale"):
+            return v
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+            v = d.get("verdict") if isinstance(d, dict) else None
+            if v in ("still_valid", "uncertain", "stale"):
+                return v
+        except Exception:
+            pass
+    m = _DREAM_RE.search(raw)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def _dream_one(
+    user_id: int, item: dict[str, Any],
+) -> str | None:
+    """对一条 to_verify 跑 dream 三态判定。返回 verdict 或 None（失败）。
+
+    与 _reverify_one 区别：
+    - 用 embedding 召回 top-K 同 user **confirmed** 条目作为上下文（不是 query）
+    - LLM 可输出 stale（5.3 是后台批处理，可激进）
+    - 超时窗口更宽松（15s vs 8s）
+    """
+    fact_id = item.get("id")
+    fact = item.get("summary") or ""
+    vec = item.get("embedding")
+    if not fact_id or not fact:
+        return None
+
+    eng = memory_store.engine()
+    upstream: list[str] = []
+    deps = item.get("depends_on") or []
+    if deps:
+        try:
+            with eng.connect() as conn:
+                rows = conn.execute(
+                    sql_text(
+                        "SELECT summary FROM memories WHERE id = ANY(:ids) "
+                        "ORDER BY created_at DESC LIMIT :n"
+                    ),
+                    {"ids": deps, "n": REVERIFY_UPSTREAM_LIMIT},
+                ).fetchall()
+            upstream = [r[0] for r in rows if r[0]]
+        except Exception as e:
+            log.debug("dream upstream pull err id=%s: %s", fact_id[:8], e)
+
+    # 召回邻居（同 user 同 type 的 confirmed 条目，不含自身）
+    neighbors: list[str] = []
+    if vec is not None:
+        try:
+            with eng.connect() as conn:
+                rows = conn.execute(
+                    sql_text(
+                        "SELECT summary FROM memories "
+                        "WHERE user_id = :uid AND status = 'confirmed' "
+                        "AND id != CAST(:fid AS uuid) "
+                        "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :k"
+                    ),
+                    {"uid": user_id, "fid": fact_id,
+                     "q": embed_client.vec_literal(vec),
+                     "k": DREAM_NEIGHBOR_TOP_K},
+                ).fetchall()
+            neighbors = [r[0] for r in rows if r[0]]
+        except Exception as e:
+            log.debug("dream neighbor pull err id=%s: %s", fact_id[:8], e)
+
+    s = settings()
+    model = s.memu_chat_model or s.openrouter_model
+    if not model:
+        return None
+    prompt = memory_prompts.render_dream(fact, upstream, neighbors)
+
+    started = time.time()
+    try:
+        from . import openrouter
+        res = await asyncio.wait_for(
+            openrouter.chat(
+                [{"role": "user", "content": prompt}],
+                model=model, temperature=0.1, max_tokens=512,
+            ),
+            timeout=DREAM_TIMEOUT_SEC,
+        )
+        raw = res.get("text", "") if isinstance(res, dict) else ""
+    except asyncio.TimeoutError:
+        log.warning("dream timeout uid=%s id=%s", user_id, fact_id[:8])
+        audit("memory_dream_one", user_id=user_id, fact_id=fact_id,
+              fact=fact[:200], verdict="timeout",
+              latency_ms=int((time.time() - started) * 1000))
+        return None
+    except Exception as e:
+        log.warning("dream LLM err uid=%s id=%s: %s", user_id, fact_id[:8], e)
+        return None
+
+    verdict = _parse_dream(raw)
+    latency_ms = int((time.time() - started) * 1000)
+    audit(
+        "memory_dream_one",
+        user_id=user_id,
+        fact_id=fact_id,
+        fact=fact[:200],
+        upstream=[u[:200] for u in upstream],
+        neighbors=[n[:200] for n in neighbors],
+        verdict=verdict or "parse_fail",
+        latency_ms=latency_ms,
+    )
+    if verdict is None:
+        log.warning("dream 解析失败 uid=%s id=%s raw=%r",
+                    user_id, fact_id[:8], raw[:160])
+    else:
+        log.info("dream uid=%s id=%s → %s (%dms)",
+                 user_id, fact_id[:8], verdict, latency_ms)
+    return verdict
+
+
+async def auto_dream(user_id: int) -> dict[str, Any]:
+    """对该用户所有 to_verify 条目跑一遍三态 dream 判定。
+
+    PRD v2 / 5.3：每天一次（搭便车 03:13 cron）。
+    - still_valid → 升 confirmed (conf=1.0, last_verified_at=now)
+    - stale → 降 stale (conf=0.0)
+    - uncertain → 仅 last_verified_at=now（不动 status）
+
+    返回汇总 dict 给 audit。
+    """
+    eng = memory_store.engine()
+    started = time.time()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            sql_text(
+                "SELECT id::text AS id, summary, embedding::text AS embedding, "
+                "depends_on FROM memories "
+                "WHERE user_id = :uid AND status = 'to_verify' "
+                "ORDER BY created_at"
+            ),
+            {"uid": user_id},
+        ).fetchall()
+    items = [
+        {"id": r[0], "summary": r[1], "embedding": r[2], "depends_on": r[3]}
+        for r in rows
+    ]
+    if not items:
+        log.info("auto_dream uid=%s: 0 条 to_verify，跳过", user_id)
+        return {"reviewed": 0, "to_confirmed": 0, "to_stale": 0,
+                "uncertain": 0, "errors": 0}
+
+    log.info("auto_dream uid=%s: %d 条 to_verify 待整理", user_id, len(items))
+    counts = {"reviewed": 0, "to_confirmed": 0, "to_stale": 0,
+              "uncertain": 0, "errors": 0}
+
+    now = datetime.now(timezone.utc)
+    for it in items:
+        try:
+            verdict = await _dream_one(user_id, it)
+        except Exception as e:
+            log.warning("dream err uid=%s id=%s: %s", user_id, it["id"][:8], e)
+            counts["errors"] += 1
+            await asyncio.sleep(DREAM_BATCH_SLEEP_SEC)
+            continue
+        counts["reviewed"] += 1
+        if verdict is None:
+            counts["errors"] += 1
+        elif verdict == "still_valid":
+            with eng.begin() as conn:
+                conn.execute(
+                    sql_text(
+                        "UPDATE memories SET status = 'confirmed', "
+                        "confidence = 1.0, last_verified_at = :ts, "
+                        "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"ts": now, "id": it["id"]},
+                )
+            counts["to_confirmed"] += 1
+        elif verdict == "stale":
+            with eng.begin() as conn:
+                conn.execute(
+                    sql_text(
+                        "UPDATE memories SET status = 'stale', "
+                        "confidence = 0.0, last_verified_at = :ts, "
+                        "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"ts": now, "id": it["id"]},
+                )
+            counts["to_stale"] += 1
+        else:  # uncertain
+            with eng.begin() as conn:
+                conn.execute(
+                    sql_text(
+                        "UPDATE memories SET last_verified_at = :ts "
+                        "WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"ts": now, "id": it["id"]},
+                )
+            counts["uncertain"] += 1
+        await asyncio.sleep(DREAM_BATCH_SLEEP_SEC)
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    summary = {**counts, "latency_ms": elapsed_ms}
+    log.info("auto_dream uid=%s 完成：%s", user_id, summary)
+    audit("memory_dream", user_id=user_id, **summary)
+    return summary
 
 
 def _parse_verdicts(raw: str, *, valid_ids: set[str]) -> dict[str, str]:

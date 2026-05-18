@@ -110,12 +110,26 @@ def build() -> AsyncIOScheduler:
             persona.consolidate(uid)
         await _fan_out(_one)
 
+    async def auto_dream_job() -> None:
+        """PRD v2 / 5.3：搭便车 persona_consolidate 那班车，03:13 跑批量整理。"""
+        async def _one(uid: int):
+            try:
+                await memory.auto_dream(uid)
+            except Exception as e:
+                log.warning("auto_dream uid=%d err: %s", uid, e)
+        await _fan_out(_one)
+
     sched.add_job(decay_job, "interval", hours=1, id="decay")
     sched.add_job(memu_flush_job, "interval", minutes=15, id="memu_flush")
     sched.add_job(
         persona_consolidate_job,
         CronTrigger(hour=3, minute=7),
         id="persona_consolidate",
+    )
+    sched.add_job(
+        auto_dream_job,
+        CronTrigger(hour=3, minute=13),
+        id="auto_dream",
     )
     jitter_sec = 10 * 60
     sched.add_job(

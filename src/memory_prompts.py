@@ -170,3 +170,61 @@ def render_reverify(fact: str, upstream: list[str], query: str) -> str:
         upstream=up,
         query=(query or "").strip() or "(空)",
     )
+
+
+# ============ Auto Dream（PRD v2 / 5.3）============
+
+DREAM_PROMPT = """# 任务（系统在凌晨整理记忆）
+下面这条事实是「待确认」状态。综合**所有相关上下文**重新判定它的归属，
+**敢于直判 stale**——这一步是后台批量整理，没有用户在场，可以果断收拾。
+
+## 待确认事实
+{fact}
+
+## 当初让它进入「待确认」的上游新事实（按时间从近到远）
+{upstream}
+
+## 该用户其它语义相近的、已确认（confirmed）的事实——作为综合上下文
+{neighbors}
+
+## 三态判定
+
+- **still_valid**：综合上下文确认仍成立。例：上游"用户搬上海了"曾让"用户喜欢辣条"
+  变 to_verify，但邻居里有"用户每周点麻辣烫外卖"——足以认定辣条爱好仍在。
+
+- **uncertain**：综合上下文里**没有清晰信号**告诉你它成立或失效。例：上游"搬上海了"
+  让"骑车 15 分钟通勤"待确认，但邻居里没有任何关于现在通勤方式的信息——保持 uncertain，
+  等真正出现新信号再处理。
+
+- **stale**：综合上下文里有**明确信号**这条已经失效。例：上游"用户分手了"让
+  "用户跟女友周五晚约会"待确认，但邻居里有"用户周五开始去健身房了"——
+  足以判它已经不再成立。
+
+  注意区分：上游事实**直接覆盖**（比如"住北京"被"搬上海了"覆盖）应该已经在 5.1
+  写入冲突时直接判 stale，**不会**走到这一步。这一步处理的是上游让它**变成 to_verify**、
+  需要更多上下文才能定夺的边缘情况。
+
+## 输出（严格 JSON，不包 ```json 围栏）
+
+```
+{{"verdict": "still_valid" | "uncertain" | "stale", "reason": "<1-2 句中文>"}}
+```"""
+
+
+def render_dream(fact: str, upstream: list[str], neighbors: list[str]) -> str:
+    """fact: to_verify summary。upstream: deps 上游 summaries（已剪枝 N 条）。
+    neighbors: 同 user 语义相近的 confirmed 条目 summaries（已剪枝 K 条）。
+    """
+    if upstream:
+        up = "\n".join(f"{i+1}. {s}" for i, s in enumerate(upstream))
+    else:
+        up = "(没拿到上游事实——可能 deps 关联已清理)"
+    if neighbors:
+        nb = "\n".join(f"{i+1}. {s}" for i, s in enumerate(neighbors))
+    else:
+        nb = "(语义相近的 confirmed 条目里没找到)"
+    return DREAM_PROMPT.format(
+        fact=fact.strip(),
+        upstream=up,
+        neighbors=nb,
+    )
