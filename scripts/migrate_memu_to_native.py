@@ -87,7 +87,8 @@ def main() -> int:
     # 真迁
     sql = text("""
         INSERT INTO memories (id, user_id, summary, memory_type, embedding,
-                              created_at, updated_at, evidence_ref)
+                              created_at, updated_at, evidence_ref,
+                              status, confidence)
         SELECT
             CAST(id AS uuid),
             CAST(user_id AS bigint),
@@ -96,7 +97,9 @@ def main() -> int:
             embedding,
             created_at,
             updated_at,
-            NULL
+            NULL,
+            'confirmed',
+            1.0
         FROM memory_items
         WHERE user_id ~ '^[0-9]+$'  -- 跳过非数字 user_id（防止脏数据）
         ON CONFLICT (id) DO NOTHING
