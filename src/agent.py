@@ -175,8 +175,26 @@ async def _build_turn(
         bits.append(f"距上次聊 {clock.since_phrase(idle_sec)}")
     time_prefix = "[" + "｜".join(bits) + "]"
 
+    # PRD：active trigger 暂存的"该主动告诉对方"的内容——融入这一轮上下文，
+    # 让 bot 自然带出来（避免单独冒一条打断对话）
+    pending_reach_msgs = []
+    try:
+        from . import storage as _storage
+        pending_reach_msgs = _storage.pop_pending_reach_for_merge(user_id)
+    except Exception as e:
+        log.debug("pop_pending_reach err uid=%s: %s", user_id, e)
+
     tool_ctx = ctx.get("tool_ctx", "")
     text_parts = [time_prefix]
+    if pending_reach_msgs:
+        merged = "\n".join(f"- {m.message}" for m in pending_reach_msgs)
+        text_parts.append(
+            "[系统暗示] 后台触达通道刚好有内容要主动告诉对方（基于对方之前提的偏好/请求）。"
+            "你**这一轮的回复**要把下面这条信息**自然地融入**主话题里——不要硬转、不要罗列，"
+            "**当成你刚好想起来要顺嘴提的事**。如果对方刚说的内容跟这件事强相关，就接着这个话题；"
+            "如果对方在聊别的，先回应对方那条，再用一两句自然带过：\n"
+            + merged
+        )
     if tool_ctx:
         text_parts.append(f"[链接内容]\n{tool_ctx}")
     if image_b64:

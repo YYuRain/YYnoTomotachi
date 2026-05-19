@@ -89,6 +89,12 @@ class PromptOverride(Base):
 
     PRD：用户独立 prompt + Feedback Sub-Agent。装配 system prompt 时在 dynamic block
     后面追加所有 status='active' 的 text。
+
+    trigger_kind = 'passive'（默认）：仅作为指令注入 prompt，靠 bot 在主对话流里
+        识别 trigger 关键词。
+    trigger_kind = 'active'：除了 passive 注入外，还由 triggered_reach_job 按 cron
+        定时扫描；time match 后跑 sonnet 判 condition_prompt 是否成立，成立则主动
+        触达（用户在聊就暂存到 PendingReachMessage 让下一轮自然融入；不在聊直接发）。
     """
     __tablename__ = "prompt_overrides"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -103,7 +109,31 @@ class PromptOverride(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     approved_by = Column(BigInteger, nullable=True)  # admin chat_id；自动 active 时填 0
     approved_at = Column(DateTime, nullable=True)
+    # active trigger 相关（trigger_kind='passive' 时为空）
+    trigger_kind = Column(String, nullable=False, default="passive")  # passive | active
+    cron_schedule = Column(String, nullable=True)  # APScheduler cron 表达式（CST），如 "30 17 * * 1-5"
+    condition_prompt = Column(Text, nullable=True)  # 给 sonnet 的判定 + 消息生成 prompt
+    last_fired_at = Column(DateTime, nullable=True)  # 上次主动触发时间（dedupe 用）
     __table_args__ = (Index("ix_prompt_overrides_user_status", "user_id", "status"),)
+
+
+class PendingReachMessage(Base):
+    """triggered_reach_job 生成的"应当主动告诉对方"的暂存消息。
+
+    场景：trigger 到点 + condition 成立 → sonnet 已生成"等等明天昌平有雨..."这种话
+    - 如果 user 正在聊（last_interaction < 5min）→ 暂存这条让下一轮 handle_user_message 融入
+    - 如果 user 不在聊 → 直接 send，不进这表
+    - 如果暂存超过 5min user 还没新 turn → 兜底 send + status='sent'
+    """
+    __tablename__ = "pending_reach_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    override_id = Column(Integer, nullable=False)
+    message = Column(Text, nullable=False)
+    expected_send_after = Column(DateTime, nullable=False)  # 兜底直发时间点
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    status = Column(String, nullable=False, default="pending")  # pending|merged|sent|expired
+    __table_args__ = (Index("ix_pending_reach_user_status", "user_id", "status"),)
 
 
 class Skill(Base):
@@ -185,6 +215,17 @@ def _ensure_columns(eng) -> None:
         if "webui_password" not in cols:
             with eng.begin() as conn:
                 conn.execute(text("ALTER TABLE users ADD COLUMN webui_password TEXT"))
+    if "prompt_overrides" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("prompt_overrides")}
+        with eng.begin() as conn:
+            if "trigger_kind" not in cols:
+                conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN trigger_kind TEXT DEFAULT 'passive'"))
+            if "cron_schedule" not in cols:
+                conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN cron_schedule TEXT"))
+            if "condition_prompt" not in cols:
+                conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN condition_prompt TEXT"))
+            if "last_fired_at" not in cols:
+                conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN last_fired_at TIMESTAMP"))
 
 
 def session():
@@ -229,6 +270,9 @@ def add_override(
     risk_level: str = "low",
     status: str = "active",
     approved_by: int | None = None,
+    trigger_kind: str = "passive",
+    cron_schedule: str | None = None,
+    condition_prompt: str | None = None,
 ) -> int:
     now = datetime.utcnow()
     with session() as s:
@@ -244,10 +288,97 @@ def add_override(
             updated_at=now,
             approved_by=approved_by if status == "active" else None,
             approved_at=now if status == "active" else None,
+            trigger_kind=trigger_kind,
+            cron_schedule=cron_schedule,
+            condition_prompt=condition_prompt,
         )
         s.add(o)
         s.commit()
         return int(o.id)
+
+
+def list_active_triggers() -> list[PromptOverride]:
+    """所有 active 且 trigger_kind='active' 的 override。triggered_reach_job 用。"""
+    with session() as s:
+        return list(
+            s.query(PromptOverride)
+            .filter(
+                PromptOverride.status == "active",
+                PromptOverride.trigger_kind == "active",
+                PromptOverride.cron_schedule.isnot(None),
+            )
+            .all()
+        )
+
+
+def mark_override_fired(override_id: int) -> None:
+    with session() as s:
+        o = s.query(PromptOverride).filter(PromptOverride.id == override_id).first()
+        if o is None:
+            return
+        o.last_fired_at = datetime.utcnow()
+        s.commit()
+
+
+# ----- pending_reach_messages -----
+
+def add_pending_reach(
+    *, user_id: int, override_id: int, message: str, expected_send_after,
+) -> int:
+    with session() as s:
+        p = PendingReachMessage(
+            user_id=user_id, override_id=override_id, message=message,
+            expected_send_after=expected_send_after,
+            created_at=datetime.utcnow(), status="pending",
+        )
+        s.add(p)
+        s.commit()
+        return int(p.id)
+
+
+def pop_pending_reach_for_merge(user_id: int) -> list[PendingReachMessage]:
+    """取该 user 所有 status='pending' 的暂存消息，标 merged 返回。
+    handle_user_message 入口调，把暂存内容融入下一轮 system prompt。"""
+    now = datetime.utcnow()
+    with session() as s:
+        rows = list(
+            s.query(PendingReachMessage)
+            .filter(
+                PendingReachMessage.user_id == user_id,
+                PendingReachMessage.status == "pending",
+            )
+            .all()
+        )
+        for r in rows:
+            r.status = "merged"
+            r.updated_at = now if hasattr(r, "updated_at") else None
+        s.commit()
+        return rows
+
+
+def list_overdue_pending_reach() -> list[PendingReachMessage]:
+    """超过 expected_send_after 仍 pending 的——兜底直发用。"""
+    now = datetime.utcnow()
+    with session() as s:
+        return list(
+            s.query(PendingReachMessage)
+            .filter(
+                PendingReachMessage.status == "pending",
+                PendingReachMessage.expected_send_after <= now,
+            )
+            .all()
+        )
+
+
+def mark_pending_reach_status(reach_id: int, status: str) -> None:
+    if status not in ("pending", "merged", "sent", "expired"):
+        raise ValueError(f"bad status: {status}")
+    with session() as s:
+        p = s.query(PendingReachMessage).filter(PendingReachMessage.id == reach_id).first()
+        if p is None:
+            return
+        p.status = status
+        s.commit()
 
 
 def set_override_status(override_id: int, status: str, *, approved_by: int | None = None) -> bool:

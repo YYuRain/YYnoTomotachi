@@ -122,6 +122,28 @@ def build() -> AsyncIOScheduler:
                 log.warning("auto_dream uid=%d err: %s", uid, e)
         await _fan_out(_one)
 
+    async def triggered_reach_job() -> None:
+        """主动触达 job：每分钟扫所有 active trigger override，cron match 当前时间则跑。
+
+        不走 proactive 冷却（这是 user 明确请求的、有意图的触达）。
+        命中后跑 sonnet 判 condition + 生成消息：
+          - user 最近 5min 在聊 → 暂存 PendingReachMessage 让下一轮 handle 融入
+          - user 不在聊 → 直接 send + record_proactive_message + UPDATE last_fired_at
+        """
+        try:
+            from . import triggered_reach
+            await triggered_reach.tick()
+        except Exception as e:
+            log.warning("triggered_reach_job err: %s", e)
+
+    async def pending_reach_overdue_job() -> None:
+        """兜底：pending_reach_messages 里 expected_send_after < now 仍 pending 的，直发。"""
+        try:
+            from . import triggered_reach
+            await triggered_reach.dispatch_overdue()
+        except Exception as e:
+            log.warning("pending_reach_overdue_job err: %s", e)
+
     sched.add_job(decay_job, "interval", hours=1, id="decay")
     sched.add_job(memu_flush_job, "interval", minutes=15, id="memu_flush")
     sched.add_job(
@@ -139,5 +161,15 @@ def build() -> AsyncIOScheduler:
         proactive_job,
         IntervalTrigger(minutes=25, jitter=jitter_sec),
         id="proactive",
+    )
+    sched.add_job(
+        triggered_reach_job,
+        IntervalTrigger(minutes=1),
+        id="triggered_reach",
+    )
+    sched.add_job(
+        pending_reach_overdue_job,
+        IntervalTrigger(minutes=1, jitter=15),
+        id="pending_reach_overdue",
     )
     return sched

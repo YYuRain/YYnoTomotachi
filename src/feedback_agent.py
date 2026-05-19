@@ -165,12 +165,13 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
 
     # capability_request 路径：调 skill_creator meta-skill 生成 trigger-based 指令
     intent = decision.get("intent", "")
+    capability_data: dict[str, Any] = {}
     if intent == "capability_request":
-        creator_body = await _generate_capability_skill(
+        capability_data = await _generate_capability_skill(
             resource=resource, user_request=brief or decision.get("summary", ""),
         )
-        if creator_body:
-            override_text = creator_body
+        if capability_data and capability_data.get("active_text_for_bot"):
+            override_text = capability_data["active_text_for_bot"].strip()
             decision_audit_base["risk_level"] = "high"  # capability 强制走 admin 审核
             risk_level = "high"
         else:
@@ -215,6 +216,13 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
                 except Exception as e:
                     log.warning("save_as_skill 失败 uid=%s: %s", user_id, e)
 
+    # capability_request 路径附带 trigger 字段（active 通道用）
+    is_active_trigger = (
+        intent == "capability_request"
+        and capability_data.get("kind") == "active"
+        and capability_data.get("cron_schedule")
+        and capability_data.get("condition_prompt")
+    )
     override_id = storage.add_override(
         user_id=user_id,
         text=override_text,
@@ -224,6 +232,9 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         risk_level=risk_level,
         status="active" if risk_level == "low" else "pending",
         approved_by=0 if risk_level == "low" else None,
+        trigger_kind="active" if is_active_trigger else "passive",
+        cron_schedule=capability_data.get("cron_schedule") if is_active_trigger else None,
+        condition_prompt=capability_data.get("condition_prompt") if is_active_trigger else None,
     )
     if new_skill_id is not None:
         # 新 skill 自己用一次（就是当前 user 这条 override）
@@ -308,39 +319,38 @@ async def _find_relevant_skills(brief: str) -> list[dict[str, Any]]:
     return out
 
 
-async def _generate_capability_skill(*, resource: str, user_request: str) -> str | None:
-    """capability_request 时调 skill_creator meta-skill 生成 trigger-based 指令。
+async def _generate_capability_skill(*, resource: str, user_request: str) -> dict[str, Any]:
+    """capability_request 时调 skill_creator meta-skill。
 
-    skill_creator 是种在 skills 表里的特殊 skill（name='skill_creator'）；body 是
-    sonnet 的 prompt template。在这里"调用" = 把它的 body 当 prompt template 跑一次 sonnet。
+    返回 dict {kind, active_text_for_bot, cron_schedule, condition_prompt}；
+    解析失败返 {}。
     """
     creator = _load_skill_creator()
     if creator is None:
         log.warning("skill_creator meta-skill 不存在，跳过 capability_request 处理")
-        return None
+        return {}
     prompt = feedback_prompts.render_skill_creator(
         user_request=user_request, resource=resource, body_template=creator,
     )
     try:
-        res = await asyncio.wait_for(
-            llm.chat(
+        d = await asyncio.wait_for(
+            llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main", temperature=0.2, max_tokens=600,
+                tier="main", temperature=0.1, max_tokens=1024,
             ),
             timeout=JUDGE_TIMEOUT_SEC,
         )
     except Exception as e:
         log.warning("skill_creator LLM err: %s", e)
-        return None
-    text = ""
-    if isinstance(res, str):
-        text = res.strip()
-    elif isinstance(res, dict):
-        text = (res.get("text") or "").strip()
-    # 去掉 markdown 围栏（如果 LLM 加了）
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
-    return text or None
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    return {
+        "kind": (d.get("kind") or "passive").strip(),
+        "active_text_for_bot": (d.get("active_text_for_bot") or "").strip(),
+        "cron_schedule": (d.get("cron_schedule") or None) or None,
+        "condition_prompt": (d.get("condition_prompt") or None) or None,
+    }
 
 
 def _load_skill_creator() -> str | None:
