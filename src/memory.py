@@ -963,14 +963,17 @@ async def _persist_items(
                 "updated_at": now,
                 "evidence_ref": evidence_ref,
             }
+            # status / confidence 必须显式给——这俩列在 ALTER 加的时候 NOT NULL，
+            # raw INSERT 不走 ORM default、PG 也不会自动填 ALTER 设的 default。
             if vec is not None:
                 params["embedding"] = embed_client.vec_literal(vec)
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, embedding, "
-                        "created_at, updated_at, evidence_ref) "
+                        "created_at, updated_at, evidence_ref, status, confidence) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
-                        "CAST(:embedding AS vector), :created_at, :updated_at, :evidence_ref)"
+                        "CAST(:embedding AS vector), :created_at, :updated_at, :evidence_ref, "
+                        "'confirmed', 1.0)"
                     ),
                     params,
                 )
@@ -978,9 +981,9 @@ async def _persist_items(
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, "
-                        "created_at, updated_at, evidence_ref) "
+                        "created_at, updated_at, evidence_ref, status, confidence) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
-                        ":created_at, :updated_at, :evidence_ref)"
+                        ":created_at, :updated_at, :evidence_ref, 'confirmed', 1.0)"
                     ),
                     params,
                 )
