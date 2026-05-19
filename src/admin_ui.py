@@ -838,8 +838,17 @@ function summarizeAudit(d) {
       return meta + t(d.text || '(空)', 120);
     }
     case 'memory_recall': {
-      if (!d.hits) return `<span class="k">0 hits</span>${t(d.query, 80)}`;
-      return `<span class="k">${d.hits} hits</span>${t(d.query, 40)}` + list(d.snippets, 80, 5);
+      if (!d.hits) {
+        const reason = d.skipped_reason ? `<span style="color:#888">[${d.skipped_reason}]</span>` : '';
+        return `<span class="k">0 hits</span>${reason}${t(d.query, 80)}`;
+      }
+      const dists = d.distances || [];
+      const snips = (d.snippets || []).slice(0, 5);
+      const lines = snips.map((s, i) => {
+        const dist = dists[i] !== undefined ? `<span style="color:#aaa;font-size:11px;font-family:ui-monospace,Menlo,monospace">d=${Number(dists[i]).toFixed(2)}</span> ` : '';
+        return `<div style="margin:1px 0">${dist}「${t(s, 80)}」</div>`;
+      }).join('');
+      return `<span class="k">${d.hits} hits</span>${t(d.query, 40)}` + lines;
     }
     case 'memory_flush': {
       const head = `<span class="k">${d.msgs} 消息 → +${d.new_items||0} 项</span>${d.file ? '<span class="k">'+t(d.file,30)+'</span>' : ''}`;

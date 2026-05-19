@@ -34,6 +34,37 @@ log = logging.getLogger(__name__)
 FLUSH_EVERY_N_TURNS = 6
 FLUSH_INTERVAL_SEC = 15 * 60  # 或 15 分钟强制一次
 
+# recall 精度门
+RECALL_MIN_QUERY_CJK_CHARS = 6   # query 中文字符 < 这个数 → 不 recall
+RECALL_MAX_DISTANCE = 0.45       # pgvector cosine distance；越小越相似（0=同方向）。> 这个 → 视为不相关
+# 一些不带语义的口头话术，整句直接命中就跳过（超出长度门时兜底）
+_RECALL_STOPWORD_PATTERNS = [
+    re.compile(r"^[嗯啊哦哎呀哈呵嘿耶吧呢吗的了"
+               r"\s\.,。，！？!?…~]+$"),
+    re.compile(r"^(是的|是吧|是啊|对啊|对的|好的|行|确实|没错|可以|嗯嗯|嗯啊|"
+               r"哈哈|哈哈哈|哎|哦哦|没事|挺好|不错|牛|牛逼|可怕|绝了|"
+               r"我没事|不影响|不知道|不太懂|我也是|确实是|是这样|就这样)$"),
+]
+
+
+def _is_low_value_query(text: str) -> tuple[bool, str]:
+    """A 道门：太短/纯口头禅的 query → 直接跳过 recall。返回 (是否跳, 原因)。"""
+    s = (text or "").strip()
+    if not s:
+        return True, "empty"
+    cjk = sum(1 for c in s if "一" <= c <= "鿿")
+    # 中文 query 字数门
+    if cjk and cjk < RECALL_MIN_QUERY_CJK_CHARS:
+        return True, f"too_short_cjk={cjk}"
+    # 纯英文 query 长度门（按词算）
+    if not cjk and len(s.split()) < 3:
+        return True, f"too_short_en_words={len(s.split())}"
+    # 整句口头禅
+    for pat in _RECALL_STOPWORD_PATTERNS:
+        if pat.fullmatch(s):
+            return True, "stopword_phrase"
+    return False, ""
+
 # PRD v2 / 5.2：召回时反验证 to_verify 条目
 REVERIFY_COOLDOWN_SEC = 30 * 60  # 同一条 to_verify 30min 内最多反验证一次
 REVERIFY_TIMEOUT_SEC = 8.0       # 单条反验证 LLM 调用超时（保护 recall 整体延迟）
@@ -86,6 +117,15 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
     """
     uid_str = _uid(user_id)
     snippets: list[str] = []
+    distances: list[float] = []
+    # A 道门：query 太短/纯口头禅 → 不浪费 embed call
+    skipped, skip_reason = _is_low_value_query(user_text)
+    if skipped:
+        audit("memory_recall", user_id=user_id, query=user_text[:200],
+              hits=0, snippets=[], skipped_reason=skip_reason)
+        log.info("recall uid=%s skip: %s (query=%r)", uid_str, skip_reason, user_text[:60])
+        return []
+
     try:
         vec = await embed_client.embed_one(user_text)
         if vec is None:
@@ -94,22 +134,29 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             return []
 
         eng = memory_store.engine()
+        # B 道门：cosine 距离阈值——只取距离 < RECALL_MAX_DISTANCE 的
+        # 拿距离一起回来方便 audit
         with eng.connect() as conn:
             rows = conn.execute(
                 sql_text(
                     "SELECT id::text AS id, summary, created_at, status, "
-                    "last_verified_at, depends_on FROM memories "
+                    "last_verified_at, depends_on, "
+                    "(embedding <=> CAST(:q AS vector)) AS dist "
+                    "FROM memories "
                     "WHERE user_id = :uid AND status != 'stale' "
+                    "AND (embedding <=> CAST(:q AS vector)) < :max_dist "
                     "ORDER BY embedding <=> CAST(:q AS vector) "
                     "LIMIT :k"
                 ),
-                {"uid": user_id, "q": embed_client.vec_literal(vec), "k": top_k},
+                {"uid": user_id, "q": embed_client.vec_literal(vec),
+                 "k": top_k, "max_dist": RECALL_MAX_DISTANCE},
             ).fetchall()
 
         items = [
             {
                 "id": r[0], "summary": r[1], "created_at": r[2],
                 "status": r[3], "last_verified_at": r[4], "depends_on": r[5],
+                "dist": float(r[6]) if r[6] is not None else None,
             }
             for r in rows
         ]
@@ -161,6 +208,8 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             marker = "[待确认] " if it["status"] == "to_verify" else ""
             base = f"({date}) {marker}{it['summary']}" if date else f"{marker}{it['summary']}"
             snippets.append(base)
+            if it.get("dist") is not None:
+                distances.append(round(it["dist"], 3))
     except Exception as e:
         log.debug("recall uid=%s 失败：%s", uid_str, e)
 
@@ -175,6 +224,8 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
         query=user_text[:200],
         hits=len(snippets),
         snippets=[s[:200] for s in snippets[:top_k]],
+        distances=distances[:top_k],
+        max_distance_threshold=RECALL_MAX_DISTANCE,
     )
     return snippets[:top_k]
 
