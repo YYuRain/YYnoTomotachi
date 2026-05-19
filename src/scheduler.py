@@ -114,12 +114,19 @@ def build() -> AsyncIOScheduler:
         await _fan_out(_one)
 
     async def auto_dream_job() -> None:
-        """PRD v2 / 5.3：搭便车 persona_consolidate 那班车，03:13 跑批量整理。"""
+        """PRD v2 / 5.3：搭便车 persona_consolidate 那班车，03:13 跑批量整理。
+
+        包含两段：memories 三态判定（auto_dream）+ prompt_overrides 冲突整理（auto_dream_overrides）。
+        """
         async def _one(uid: int):
             try:
                 await memory.auto_dream(uid)
             except Exception as e:
                 log.warning("auto_dream uid=%d err: %s", uid, e)
+            try:
+                await memory.auto_dream_overrides(uid)
+            except Exception as e:
+                log.warning("auto_dream_overrides uid=%d err: %s", uid, e)
         await _fan_out(_one)
 
     async def triggered_reach_job() -> None:

@@ -161,7 +161,7 @@ _INDEX_HTML = """<!doctype html>
   .ev { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .ev.user_msg, .ev.assistant_reply { background: #eef4ff; color: #1a6cff; }
   .ev.memory_recall, .ev.memory_flush, .ev.memory_conflict_check, .ev.memory_reverify,
-  .ev.memory_dream, .ev.memory_dream_one { background: #ecf8ee; color: #1a8a3a; }
+  .ev.memory_dream, .ev.memory_dream_one, .ev.override_dream { background: #ecf8ee; color: #1a8a3a; }
   .ev.persona_update, .ev.persona_consolidate { background: #f5edff; color: #7a3fcc; }
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
@@ -363,6 +363,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="memory_reverify">memory_reverify</option>
         <option value="memory_dream">memory_dream</option>
         <option value="memory_dream_one">memory_dream_one</option>
+        <option value="override_dream">override_dream</option>
         <option value="persona_update">persona_update</option>
         <option value="persona_consolidate">persona_consolidate</option>
         <option value="proactive_decision">proactive_decision</option>
@@ -879,6 +880,17 @@ function summarizeAudit(d) {
              `+${d.to_stale||0} stale · ` +
              `${d.uncertain||0} 维持 · ` +
              `${d.errors||0} 错`;
+    }
+    case 'override_dream': {
+      const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
+      const head = `<span class="k">扫 ${d.reviewed} 条 overrides${lat}</span>合并 ${d.merged||0} · 删 ${d.disabled||0}`;
+      const acts = (d.actions || []).slice(0, 4).map(a => {
+        if (a.kind === 'merge') {
+          return `<div style="color:#888;font-size:11px">↪ merge #${(a.from_ids||[]).join(',#')} → #${a.merged_into}: ${truncate(a.merged_text||'', 80)}</div>`;
+        }
+        return `<div style="color:#888;font-size:11px">↪ disable #${a.id}: ${truncate(a.reason||'', 80)}</div>`;
+      }).join('');
+      return head + acts;
     }
     case 'memory_dream_one': {
       const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';

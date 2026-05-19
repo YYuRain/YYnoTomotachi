@@ -228,3 +228,71 @@ def render_dream(fact: str, upstream: list[str], neighbors: list[str]) -> str:
         upstream=up,
         neighbors=nb,
     )
+
+
+# ============ Override Dream（PRD 5.3 扩展，整理 prompt_overrides）============
+
+OVERRIDE_DREAM_PROMPT = """# 任务（凌晨整理用户偏好）
+你是 AI 陪伴角色的偏好整理器。下面列出该用户当前所有 **active** 的 prompt overrides——
+这些条目会注入到 system prompt 末尾，告诉 bot 跟这位用户互动时该照做的偏好。
+
+## 当前 active overrides
+{overrides_block}
+
+## 你要做什么
+
+审查这批条目，找出**冗余**、**互相矛盾**、**被覆盖（过期）**的。输出处理建议——
+**只在显然有问题时动手**；拿不准就保留不动，宁可不合并也不要错删。
+
+判定原则：
+
+1. **合并（merge）**——多条 active 在说同一件事，但措辞不同 / 信息密度低 / 拆成多条不必要。
+   合并时**保留全部信息**，写成一条更精炼的指令。
+   例：[A] "对方喜欢俏皮风格" + [B] "对方爱抖机灵不要严肃" → 合一条 "对方偏好俏皮风格、可以
+   抖机灵、避免过于严肃"。
+
+2. **删（disable）**——
+   - 互相矛盾且能判出哪条更新（按 `created_at` / `last_fired_at` 等暗示）：删旧的
+   - 被另一条**显式覆盖**：例如旧 "叫我亲爱的" 被新 "别叫我亲爱的，叫名字" 取代——删旧的
+   - 一次性表达被错误沉淀（"这次帮我..." 而非长期偏好）：删
+   - **不要因为"风格不一致 / 看着冗余" 等模糊理由删除**——只在事实层面有冲突或失效才删
+
+3. **保留不动**——
+   - 互相不冲突的不同偏好（如"叫我名字" + "别用反问句"）→ 保留两条
+   - 拿不准是不是矛盾 → 保留
+   - active trigger 类（带 cron 的 capability）即使有内容相关也**绝对不要合并**——
+     trigger 配置会被破坏。`trigger_kind="active"` 的条目仅在**完全等价重复**时才考虑 disable
+
+## 输出格式（严格 JSON，无围栏）
+
+```
+{
+  "merge_groups": [
+    {
+      "ids": [1, 2],
+      "merged_text": "...",
+      "reason": "为什么合"
+    }
+  ],
+  "disable_ids": [3, 5],
+  "disable_reasons": {
+    "3": "被 #6 覆盖（用户后来明确改了称呼偏好）",
+    "5": "一次性请求被错误沉淀"
+  }
+}
+```
+
+merge_groups 里的 ids 会被 disable，merged_text 作为新 active override 落库。
+**整段输出必须是且只是一个 JSON 对象**，第一个字符必须是 `{`，最后一个字符是 `}`。"""
+
+
+def render_override_dream(overrides: list) -> str:
+    """overrides: list of PromptOverride ORM objects（拿 id / text / trigger_kind / created_at）。
+    用 str.replace 而非 .format——prompt 里有大量字面花括号。"""
+    lines = []
+    for o in overrides:
+        ts = o.created_at.strftime("%Y-%m-%d %H:%M") if o.created_at else "?"
+        kind_tag = f"[{o.trigger_kind}]" if getattr(o, "trigger_kind", None) and o.trigger_kind != "passive" else ""
+        lines.append(f"- id={o.id} {kind_tag} created={ts}\n  text: {o.text.strip()}")
+    block = "\n".join(lines) if lines else "（空）"
+    return OVERRIDE_DREAM_PROMPT.replace("{overrides_block}", block)

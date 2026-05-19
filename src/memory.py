@@ -867,6 +867,130 @@ async def auto_dream(user_id: int) -> dict[str, Any]:
     return summary
 
 
+# ============ Auto Dream override（PRD 5.3 扩展，整理 prompt_overrides）============
+
+OVERRIDE_DREAM_TIMEOUT_SEC = 30.0
+# 仅当 active overrides 至少有这么多条才跑（少于 2 条无可冲突）
+OVERRIDE_DREAM_MIN_COUNT = 2
+
+
+async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
+    """整理该 user 的 active prompt_overrides——合并冗余 / 删除矛盾或过期。
+
+    搭便车 auto_dream 同 cron（03:13 CST）。每个 user 跑一次 sonnet：
+    - 拉所有 active overrides
+    - 输出 {merge_groups, disable_ids}
+    - 应用：INSERT 合并条目（status='active' approved_by=0）+ disable 老 ids
+    """
+    from . import storage as _storage
+    started = time.time()
+    overrides = _storage.list_active_overrides(user_id)
+    if len(overrides) < OVERRIDE_DREAM_MIN_COUNT:
+        log.info("override_dream uid=%s: 仅 %d 条 active，跳过", user_id, len(overrides))
+        return {"reviewed": len(overrides), "merged": 0, "disabled": 0}
+
+    # active trigger（带 cron）的 override 不参与合并/删除——配置会破坏
+    # 但仍喂给 LLM 看（参考），让它输出时忽略这些 id
+    valid_ids = {o.id for o in overrides}
+    triggered_ids = {o.id for o in overrides if (o.trigger_kind or "passive") == "active"}
+
+    prompt = memory_prompts.render_override_dream(overrides)
+    try:
+        d = await asyncio.wait_for(
+            llm.chat_json(
+                [{"role": "user", "content": prompt}],
+                tier="main", temperature=0.1, max_tokens=2000,
+            ),
+            timeout=OVERRIDE_DREAM_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        log.warning("override_dream timeout uid=%s", user_id)
+        audit("override_dream", user_id=user_id, error="timeout",
+              reviewed=len(overrides), merged=0, disabled=0,
+              latency_ms=int((time.time() - started) * 1000))
+        return {"reviewed": len(overrides), "merged": 0, "disabled": 0, "error": "timeout"}
+    except Exception as e:
+        log.warning("override_dream LLM err uid=%s: %s", user_id, e)
+        return {"reviewed": len(overrides), "merged": 0, "disabled": 0, "error": str(e)}
+
+    if not isinstance(d, dict):
+        return {"reviewed": len(overrides), "merged": 0, "disabled": 0, "error": "parse_fail"}
+
+    merge_groups = d.get("merge_groups") or []
+    disable_ids = d.get("disable_ids") or []
+    disable_reasons = d.get("disable_reasons") or {}
+
+    n_merged = 0
+    n_disabled = 0
+    actions: list[dict[str, Any]] = []
+    touched_ids: set[int] = set()  # 防止同一 id 被两条规则同时处理
+
+    # 先处理 merge_groups
+    for grp in merge_groups:
+        if not isinstance(grp, dict):
+            continue
+        ids = [int(x) for x in (grp.get("ids") or []) if isinstance(x, (int, str))]
+        ids = [i for i in ids if i in valid_ids and i not in triggered_ids and i not in touched_ids]
+        merged_text = (grp.get("merged_text") or "").strip()
+        reason = (grp.get("reason") or "").strip()
+        if len(ids) < 2 or not merged_text:
+            continue
+        # 注释：不做 hard_guardrail 复检——merged 只是合并已 active 的内容，源已通过过
+        try:
+            from . import storage as __st
+            new_id = __st.add_override(
+                user_id=user_id,
+                text=merged_text,
+                reason=f"override_dream merge: {reason}" if reason else "override_dream merge",
+                source_user_msg=f"merged from #{','.join(map(str, ids))}",
+                risk_level="low",
+                status="active",
+                approved_by=0,
+            )
+            for oid in ids:
+                __st.set_override_status(oid, "disabled")
+                touched_ids.add(oid)
+            n_merged += 1
+            actions.append({
+                "kind": "merge", "merged_into": new_id,
+                "from_ids": ids, "merged_text": merged_text[:200], "reason": reason[:200],
+            })
+        except Exception as e:
+            log.warning("override_dream merge err uid=%s: %s", user_id, e)
+
+    # 再处理 disable_ids
+    for x in disable_ids:
+        try:
+            oid = int(x)
+        except Exception:
+            continue
+        if oid not in valid_ids or oid in triggered_ids or oid in touched_ids:
+            continue
+        try:
+            from . import storage as __st
+            ok = __st.set_override_status(oid, "disabled")
+            if ok:
+                n_disabled += 1
+                actions.append({
+                    "kind": "disable", "id": oid,
+                    "reason": disable_reasons.get(str(oid), "")[:200],
+                })
+                touched_ids.add(oid)
+        except Exception as e:
+            log.warning("override_dream disable err uid=%s id=%s: %s", user_id, oid, e)
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    summary = {
+        "reviewed": len(overrides),
+        "merged": n_merged,  # 几个合并 group
+        "disabled": n_disabled,  # 单独 disable 几个
+        "latency_ms": elapsed_ms,
+    }
+    log.info("override_dream uid=%s 完成：%s", user_id, summary)
+    audit("override_dream", user_id=user_id, **summary, actions=actions[:20])
+    return summary
+
+
 def _parse_verdicts(raw: str, *, valid_ids: set[str]) -> dict[str, str]:
     """LLM 输出的 JSON → dict[id → verdict]。strict json 优先，失败回退 regex。"""
     raw = (raw or "").strip()
