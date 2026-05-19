@@ -163,11 +163,26 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
             )
             return
 
-    # 新建 override 路径
-    override_text = (decision.get("new_override_text") or "").strip()
-    if not override_text:
-        audit("feedback_decision", **decision_audit_base, error="empty_override_text")
-        return
+    # capability_request 路径：调 skill_creator meta-skill 生成 trigger-based 指令
+    intent = decision.get("intent", "")
+    if intent == "capability_request":
+        creator_body = await _generate_capability_skill(
+            resource=resource, user_request=brief or decision.get("summary", ""),
+        )
+        if creator_body:
+            override_text = creator_body
+            decision_audit_base["risk_level"] = "high"  # capability 强制走 admin 审核
+            risk_level = "high"
+        else:
+            audit("feedback_decision", **decision_audit_base, error="skill_creator_failed")
+            return
+    else:
+        # 普通 override 路径
+        override_text = (decision.get("new_override_text") or "").strip()
+        if not override_text:
+            audit("feedback_decision", **decision_audit_base, error="empty_override_text")
+            return
+
     ok, reason = _passes_guardrails(override_text)
     if not ok:
         audit("feedback_decision", **decision_audit_base,
@@ -208,9 +223,15 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         # 新 skill 自己用一次（就是当前 user 这条 override）
         storage.bump_skill_usage(new_skill_id)
 
+    if intent == "capability_request":
+        action_label = "capability_via_skill_creator"
+    elif new_skill_id:
+        action_label = "new_skill"
+    else:
+        action_label = "new_override"
     audit("feedback_decision", **decision_audit_base,
           override_id=override_id,
-          action="new_skill" if new_skill_id else "new_override",
+          action=action_label,
           new_skill_id=new_skill_id)
     log.info(
         "feedback uid=%s → override %d (%s) %s",
@@ -279,6 +300,55 @@ async def _find_relevant_skills(brief: str) -> list[dict[str, Any]]:
             "similarity": float(sim),
         })
     return out
+
+
+async def _generate_capability_skill(*, resource: str, user_request: str) -> str | None:
+    """capability_request 时调 skill_creator meta-skill 生成 trigger-based 指令。
+
+    skill_creator 是种在 skills 表里的特殊 skill（name='skill_creator'）；body 是
+    sonnet 的 prompt template。在这里"调用" = 把它的 body 当 prompt template 跑一次 sonnet。
+    """
+    creator = _load_skill_creator()
+    if creator is None:
+        log.warning("skill_creator meta-skill 不存在，跳过 capability_request 处理")
+        return None
+    prompt = feedback_prompts.render_skill_creator(
+        user_request=user_request, resource=resource, body_template=creator,
+    )
+    try:
+        res = await asyncio.wait_for(
+            llm.chat(
+                [{"role": "user", "content": prompt}],
+                tier="main", temperature=0.2, max_tokens=600,
+            ),
+            timeout=JUDGE_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        log.warning("skill_creator LLM err: %s", e)
+        return None
+    text = ""
+    if isinstance(res, str):
+        text = res.strip()
+    elif isinstance(res, dict):
+        text = (res.get("text") or "").strip()
+    # 去掉 markdown 围栏（如果 LLM 加了）
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    return text or None
+
+
+def _load_skill_creator() -> str | None:
+    """从 skills 表拿 name='skill_creator' 的 body；失败返 None。"""
+    try:
+        with storage.session() as s:
+            sk = s.query(storage.Skill).filter(
+                storage.Skill.name == feedback_prompts.SKILL_CREATOR_NAME,
+                storage.Skill.status == "active",
+            ).first()
+        return sk.body if sk else None
+    except Exception as e:
+        log.debug("load skill_creator err: %s", e)
+        return None
 
 
 async def _sonnet_judge(

@@ -131,7 +131,48 @@ def engine():
         _engine = create_engine(f"sqlite:///{settings().app_db_path}", future=True)
         Base.metadata.create_all(_engine)
         _ensure_columns(_engine)
+        _seed_skill_creator(_engine)
     return _engine
+
+
+def _seed_skill_creator(eng) -> None:
+    """启动时确保 skills 表有 name='skill_creator' 的特殊 meta-skill。
+
+    feedback_agent 处理 capability_request 时会"调用"这条——把 body 当 sonnet
+    prompt template 跑，输出 trigger-based 指令。
+
+    第一次启动时种入；之后 admin 可在 webUI 调教 tab 编辑这条 skill 的 body 调整
+    生成质量（虽然现在没 edit UI，但后续可以加）。
+    """
+    try:
+        # 延迟 import 避免循环
+        from . import feedback_prompts
+    except Exception:
+        return
+    try:
+        # 用一个全 0 dummy embedding 占位（不会被 cosine 召回——本就是 meta，feedback_agent
+        # 直接按 name 查不走 embedding 召回）
+        with sessionmaker(bind=eng, future=True)() as s:
+            existing = s.query(Skill).filter(
+                Skill.name == feedback_prompts.SKILL_CREATOR_NAME
+            ).first()
+            if existing:
+                return
+            import json as _json
+            s.add(Skill(
+                name=feedback_prompts.SKILL_CREATOR_NAME,
+                summary=feedback_prompts.SKILL_CREATOR_SUMMARY,
+                body=feedback_prompts.SKILL_CREATOR_BODY,
+                embedding=_json.dumps([0.0] * 512),
+                created_by=0,  # system seed
+                created_at=datetime.utcnow(),
+                status="active",
+            ))
+            s.commit()
+    except Exception as e:
+        # 静默失败——不阻塞主启动；feedback_agent capability_request 路径会跳过
+        import logging
+        logging.getLogger(__name__).debug("seed skill_creator err: %s", e)
 
 
 def _ensure_columns(eng) -> None:

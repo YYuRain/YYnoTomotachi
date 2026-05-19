@@ -87,7 +87,10 @@ JUDGE_PROMPT = """# 任务
 ### 2. 如果 verdict="real_request"，必须再判：
 
 - **intent** ∈ ["tone_adjust"（语气/称呼/口吻）, "feature_wish"（希望 bot 做某事）,
-  "scope_change"（边界类，比如希望少问反问、不要总主动搭话）, "address_form"（怎么称呼对方）, "other"]
+  "scope_change"（边界类，比如希望少问反问、不要总主动搭话）, "address_form"（怎么称呼对方）,
+  "capability_request"（要求 bot 在某种 trigger 下做特定行为，例如"下班前下雨提醒"、
+  "周一早上问我准备好了没"——这种需要 bot 在未来某场景主动行动）,
+  "other"]
 
 - **risk_level** ∈ ["low", "high"]
   - low：语气、称呼、回复长度、是否多用表情、是否用方言/特定语种、避免某些口头禅 等。
@@ -140,6 +143,67 @@ JUDGE_PROMPT = """# 任务
 ```
 
 verdict 不是 real_request 时，其它字段可为空字符串或 null，但 reason 必须有。"""
+
+
+# ============ skill_creator meta-skill body（capability_request 时调用）============
+
+SKILL_CREATOR_BODY = """# 任务：把"功能希望"转成 trigger-based 指令
+
+用户对 bot 表达了一个 **capability_request**（希望 bot 在某种触发条件下主动做某事）。
+你要把它转写成一段**触发式指令**——这段文本会被注入到 bot 的 system prompt 里，
+让 bot 在每个 turn 自己识别触发条件并执行。
+
+## 用户原话
+{user_request}
+
+## 同对话上下文（帮你理解触发场景）
+{resource}
+
+## 你要输出什么
+
+一段 trigger-based 指令文本，遵循这种结构（**用中文**）：
+
+- **何时触发**：什么样的对话信号 / 时间点 / 用户表达，应当激活这条规则。
+- **做什么**：bot 应该执行的具体动作（必要时会用什么工具，比如"查天气"="用 web_search 搜
+  XX 城市天气"）。
+- **怎么回应**：把结果以什么口吻告诉对方（保持陪伴风格，不要客服腔）。
+
+## 写作要求
+
+1. **用第二人称"对方"指代用户**（不是"用户"）
+2. **触发条件要具体**：避免"用户说要下班时"这种模糊措辞，写成"对方说『要走了/下班了/拜拜』
+   或类似表达"——给 bot 可识别的字面信号
+3. **承认能力边界**：bot 没有精确闹钟（proactive scheduler 是 25min 软门），所以"必须 17:30
+   准时"这种做不到。改写成"对方下次主动找你 + 当时离下班一小时内"等可由对话或软门自然触发的版本
+4. **指令要可执行**：bot 看到这段文本能立刻知道"什么时候动"+"具体做什么"。不要写"如果合适就关心一下"
+   这种空话
+5. **简洁**：≤200 字。一段连贯的指令，不要分点列表
+
+## 示例
+
+**用户原话**：你能下班前提醒我看天气吗，要下雨记得告诉我
+
+**好输出**：
+> 当对方提到"要走了/下班/拜拜/明天"或主动来找你聊"今天怎么样"等暗示一天结束的信号时，
+> 主动用 web_search 查一下对方所在城市（之前对话里提过昌平）的明日天气。如果有雨，
+> 用一两句自然口吻提醒对方带伞或注意路上湿滑——例如"看了眼明天昌平有雨，记得带把伞"。
+> 没雨就不用刻意提天气，正常聊别的。如果对方没说所在城市就先问一句"你哪儿来着"。
+
+## 输出
+直接输出指令文本，**不要 JSON、不要解释、不要前后缀**。"""
+
+
+# 启动时种入 skills 表的 skill_creator meta-skill
+SKILL_CREATOR_NAME = "skill_creator"
+SKILL_CREATOR_SUMMARY = "[meta] 把用户的功能希望（capability_request）转写成 trigger-based 指令"
+
+
+def render_skill_creator(user_request: str, resource: str, body_template: str) -> str:
+    """body_template 是 skill_creator skill 的 body（默认 SKILL_CREATOR_BODY；admin 可改库里的）。"""
+    return body_template.format(
+        user_request=user_request.strip(),
+        resource=resource.strip(),
+    )
 
 
 def render_judge(
