@@ -144,6 +144,7 @@ async def _build_turn(
         interests_cold=interests.cold(user_id, 3),
         emotion=ctx["emotion"],
         sticker_tags=stickers.available_tags(),
+        user_id=user_id,
     )
 
     messages = [{"role": "system", "content": sys_prompt}]

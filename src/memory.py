@@ -258,6 +258,8 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
               new_items=0, new_item_summaries=[])
         # 仍然 fire persona update（用户也许聊了内容只是没产生 profile/event）
         _fire_persona_update(user_id_int, batch)
+        # 偏好不一定产生 profile/event（"叫我名字"是 prompt 调整不是事实），这里也要 fire
+        _fire_feedback_check(user_id_int, batch)
         return True
 
     # 入库
@@ -280,6 +282,7 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
 
     _fire_persona_update(user_id_int, batch)
     _fire_conflict_check(user_id_int, new_records)
+    _fire_feedback_check(user_id_int, batch)
     return True
 
 
@@ -299,6 +302,24 @@ def _fire_persona_update(user_id: int, batch: list[dict[str, str]]) -> None:
         asyncio.create_task(_go())
     except RuntimeError:
         # 没有 running loop（如脚本同步上下文调用），跳过
+        pass
+
+
+def _fire_feedback_check(user_id: int, batch: list[dict[str, str]]) -> None:
+    """flush 后异步 fire feedback sub-agent。粗筛 → sonnet 精判 → 落库 prompt_overrides / skill。"""
+    if not user_id or not batch:
+        return
+
+    async def _go():
+        try:
+            from . import feedback_agent  # 延迟避免循环 import
+            await feedback_agent.process(user_id, batch)
+        except Exception as e:
+            log.debug("feedback agent post-flush err: %s", e)
+
+    try:
+        asyncio.create_task(_go())
+    except RuntimeError:
         pass
 
 

@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
-from . import embed_client
+from . import embed_client, storage
 from .config import settings
 
 
@@ -166,6 +166,7 @@ _INDEX_HTML = """<!doctype html>
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
   .ev.tool_decision { background: #f7f3e8; color: #886600; }
+  .ev.feedback_screen, .ev.feedback_decision { background: #fff0fb; color: #b6398e; }
   .ev.interest_bump { background: #fffbe5; color: #997300; }
   .ev.startup, .ev.shutdown { background: #fdecec; color: #c53b3b; }
   .audit-summary { max-width: 700px; word-break: break-word; }
@@ -275,6 +276,7 @@ _INDEX_HTML = """<!doctype html>
 <nav>
   <button data-tab="items" class="active">记忆项</button>
   <button data-tab="graph">图谱</button>
+  <button data-tab="tune">调教</button>
   <button data-tab="audit">审计</button>
 </nav>
 
@@ -323,6 +325,32 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id="tab-tune" class="tab" style="display:none">
+    <div style="display:flex;flex-direction:column;gap:18px">
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">⏳ 待审核 overrides（high risk pending）</h3>
+        <table>
+          <thead><tr><th style="width:90px">用户</th><th style="width:80px">风险</th><th>override 文本</th><th style="width:200px">用户原话</th><th style="width:120px" class="mono">时间</th><th style="width:160px"></th></tr></thead>
+          <tbody id="tune-pending-tbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">✅ 已生效 overrides</h3>
+        <table>
+          <thead><tr><th style="width:90px">用户</th><th style="width:80px">风险</th><th>override 文本</th><th style="width:120px">来源</th><th style="width:120px" class="mono">时间</th><th style="width:100px"></th></tr></thead>
+          <tbody id="tune-active-tbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">📚 Skill 库（跨用户复用）</h3>
+        <table>
+          <thead><tr><th style="width:160px">name</th><th>summary / body</th><th style="width:80px">用过</th><th style="width:90px">创建者</th><th style="width:120px" class="mono">时间</th><th style="width:100px"></th></tr></thead>
+          <tbody id="tune-skills-tbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <div id="tab-audit" class="tab" style="display:none">
     <div class="toolbar">
       <select id="audit-filter">
@@ -342,6 +370,8 @@ _INDEX_HTML = """<!doctype html>
         <option value="proactive_opener_generated">proactive_opener_generated</option>
         <option value="tool_call">tool_call</option>
         <option value="tool_decision">tool_decision</option>
+        <option value="feedback_screen">feedback_screen</option>
+        <option value="feedback_decision">feedback_decision</option>
         <option value="interest_bump">interest_bump</option>
         <option value="startup">startup</option>
         <option value="shutdown">shutdown</option>
@@ -523,6 +553,7 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   $('#tab-' + tab).style.display = '';
   if (tab === 'items') loadItems();
   if (tab === 'graph') loadGraph();
+  if (tab === 'tune') loadTune();
   if (tab === 'audit') loadAudit();
   toggleAuditAutoRefresh(tab === 'audit' && $('#audit-auto').checked);
 }));
@@ -661,6 +692,109 @@ function escapeHtml(s) {
 $('#graph-type-filter').addEventListener('change', loadGraph);
 $('#graph-only-deps').addEventListener('change', loadGraph);
 
+// ============ tune tab ============
+async function loadTune() {
+  await Promise.all([loadTunePending(), loadTuneActive(), loadTuneSkills()]);
+}
+
+const riskChip = (risk) => {
+  const c = risk === 'high' ? '#b56500' : '#1a8a3a';
+  return `<span style="color:${c};font-family:ui-monospace,Menlo,monospace;font-size:11px">${risk || '?'}</span>`;
+};
+
+async function loadTunePending() {
+  const r = await fetch('/api/overrides?status=pending&' + withUid());
+  const j = await r.json();
+  const tb = $('#tune-pending-tbody'); tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无待审核</td></tr>'; return; }
+  for (const it of j) {
+    const tr = el('tr');
+    tr.innerHTML = `
+      <td class="mono" data-label="用户">${it.user_id}</td>
+      <td data-label="风险">${riskChip(it.risk_level)}</td>
+      <td class="summary" data-label="override 文本">${escapeHtml(it.text || '')}${it.reason ? '<div style="color:#888;font-size:11px;margin-top:2px">理由：'+escapeHtml(it.reason)+'</div>' : ''}</td>
+      <td class="summary" data-label="用户原话">${escapeHtml(it.source_user_msg || '')}</td>
+      <td class="mono" data-label="时间">${fmt(it.created_at)}</td>
+      <td class="ops"></td>
+    `;
+    const ops = tr.querySelector('.ops');
+    const bOk = el('button', { class: 'op' }, '✓ 通过');
+    bOk.onclick = async () => {
+      if (!confirm('通过这条 override，立即生效？')) return;
+      const r = await fetch(`/api/overrides/${it.id}/approve`, { method: 'POST' });
+      if (r.ok) { toast('已生效'); loadTune(); } else toast('失败：' + r.status);
+    };
+    const bRej = el('button', { class: 'op danger' }, '× 拒绝');
+    bRej.onclick = async () => {
+      if (!confirm('拒绝这条 override（status=rejected，不会生效）？')) return;
+      const r = await fetch(`/api/overrides/${it.id}/reject`, { method: 'POST' });
+      if (r.ok) { toast('已拒绝'); loadTune(); } else toast('失败：' + r.status);
+    };
+    ops.appendChild(bOk); ops.appendChild(bRej);
+    tb.appendChild(tr);
+  }
+}
+
+async function loadTuneActive() {
+  const r = await fetch('/api/overrides?status=active&' + withUid());
+  const j = await r.json();
+  const tb = $('#tune-active-tbody'); tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无生效</td></tr>'; return; }
+  for (const it of j) {
+    const tr = el('tr');
+    const src = it.source_skill_id
+      ? `<span class="muted" title="复用 skill #${it.source_skill_id}">📚 skill #${it.source_skill_id}</span>`
+      : `<span class="muted">独立</span>`;
+    tr.innerHTML = `
+      <td class="mono" data-label="用户">${it.user_id}</td>
+      <td data-label="风险">${riskChip(it.risk_level)}</td>
+      <td class="summary" data-label="override 文本">${escapeHtml(it.text || '')}${it.reason ? '<div style="color:#888;font-size:11px;margin-top:2px">理由：'+escapeHtml(it.reason)+'</div>' : ''}</td>
+      <td data-label="来源">${src}</td>
+      <td class="mono" data-label="时间">${fmt(it.created_at)}</td>
+      <td class="ops"></td>
+    `;
+    const ops = tr.querySelector('.ops');
+    const bDis = el('button', { class: 'op danger' }, '⏸ 停用');
+    bDis.onclick = async () => {
+      if (!confirm('停用这条 override（status=disabled，下轮不再注入 prompt）？')) return;
+      const r = await fetch(`/api/overrides/${it.id}/disable`, { method: 'POST' });
+      if (r.ok) { toast('已停用'); loadTune(); } else toast('失败：' + r.status);
+    };
+    ops.appendChild(bDis);
+    tb.appendChild(tr);
+  }
+}
+
+async function loadTuneSkills() {
+  const r = await fetch('/api/skills');
+  const j = await r.json();
+  const tb = $('#tune-skills-tbody'); tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">skill 库还是空的</td></tr>'; return; }
+  for (const sk of j) {
+    const tr = el('tr');
+    tr.innerHTML = `
+      <td class="mono" data-label="name">${escapeHtml(sk.name || '')}</td>
+      <td class="summary" data-label="summary / body">
+        <div>${escapeHtml(sk.summary || '')}</div>
+        <div class="muted" style="font-size:11px;margin-top:2px;font-family:ui-monospace,Menlo,monospace">${escapeHtml(sk.body || '')}</div>
+      </td>
+      <td class="mono" data-label="用过">${sk.usage_count || 0}</td>
+      <td class="mono" data-label="创建者">${sk.created_by}</td>
+      <td class="mono" data-label="时间">${fmt(sk.created_at)}</td>
+      <td class="ops"></td>
+    `;
+    const ops = tr.querySelector('.ops');
+    const bDis = el('button', { class: 'op danger' }, '⏸ 停用');
+    bDis.onclick = async () => {
+      if (!confirm('停用 skill「'+sk.name+'」（不再被 feedback agent 复用，已关联的 override 不影响）？')) return;
+      const r = await fetch(`/api/skills/${sk.id}/disable`, { method: 'POST' });
+      if (r.ok) { toast('已停用'); loadTune(); } else toast('失败：' + r.status);
+    };
+    ops.appendChild(bDis);
+    tb.appendChild(tr);
+  }
+}
+
 let _deb;
 $('#q').addEventListener('input', () => { clearTimeout(_deb); _deb = setTimeout(loadItems, 250); });
 $('#type-filter').addEventListener('change', loadItems);
@@ -790,6 +924,23 @@ function summarizeAudit(d) {
       const q = d.query ? `<div style="color:#888;font-size:11px">query：${t(d.query, 80)}</div>` : '';
       return `${decided} ${tool} ${skip}${u}${q}`;
     }
+    case 'feedback_screen': {
+      const sig = d.signal ? `<span style="color:#b6398e">✓ 有信号</span>` : `<span style="color:#888">× 无信号</span>`;
+      const brief = d.brief ? `<div style="color:#888;font-size:11px;margin-top:2px">摘录：${t(d.brief, 120)}</div>` : '';
+      return sig + brief;
+    }
+    case 'feedback_decision': {
+      const verdictColors = {real_request:'#1a8a3a', joke:'#888', ignore:'#888', guardrail_violation:'#d9554f', parse_fail:'#b56500'};
+      const c = verdictColors[d.verdict] || '#555';
+      const head = `<span style="color:${c};font-family:ui-monospace,Menlo,monospace;font-size:11px">${d.verdict || '?'}</span>` +
+                   (d.risk_level ? `<span class="k">${d.risk_level}</span>` : '') +
+                   (d.action ? `<span class="k">${d.action}</span>` : '');
+      const sum = d.summary ? `<div>「${t(d.summary, 80)}」</div>` : '';
+      const reason = d.reason ? `<div style="color:#888;font-size:11px">理由：${t(d.reason, 120)}</div>` : '';
+      const ov = d.override_id ? `<div style="color:#888;font-size:11px">→ override #${d.override_id}` + (d.new_skill_id ? ` + skill #${d.new_skill_id}` : '') + (d.skill_name ? ` (复用 ${escapeHtml(d.skill_name)})` : '') + '</div>' : '';
+      const block = d.blocked_by_guardrail ? `<div style="color:#d9554f;font-size:11px">⚠️ guardrail 拦截：${t(d.guardrail_reason || '', 80)}</div>` : '';
+      return head + sum + reason + ov + block;
+    }
     case 'interest_bump': {
       // topic(heat_before → heat_after) 全部展示
       const before = d.heat_before || {};
@@ -900,6 +1051,7 @@ async function initViewer() {
       loadStats();
       if (cur === 'items') loadItems();
       else if (cur === 'graph') loadGraph();
+      else if (cur === 'tune') loadTune();
       else if (cur === 'audit') loadAudit();
     });
   } catch (e) {
@@ -1163,6 +1315,106 @@ def build_app() -> FastAPI:
             )
             if r.rowcount == 0:
                 raise HTTPException(404, "not found")
+        return {"ok": True}
+
+    # ============ 调教（prompt overrides + skill 库）============
+
+    @app.get("/api/overrides")
+    async def overrides_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+        status: str = Query("", max_length=16),
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
+        rows = storage.list_overrides(
+            user_id=uid, status=(status.strip() or None), limit=limit
+        )
+        return [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "text": r.text,
+                "reason": r.reason,
+                "source_user_msg": r.source_user_msg,
+                "source_skill_id": r.source_skill_id,
+                "risk_level": r.risk_level,
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                "approved_by": r.approved_by,
+            }
+            for r in rows
+        ]
+
+    @app.post("/api/overrides/{ov_id}/approve")
+    async def overrides_approve(
+        ov_id: int,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        # 只 admin 能操作（普通用户对 override 是只读）
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        ok = storage.set_override_status(ov_id, "active", approved_by=viewer or 0)
+        if not ok:
+            raise HTTPException(404, "not found")
+        return {"ok": True}
+
+    @app.post("/api/overrides/{ov_id}/reject")
+    async def overrides_reject(
+        ov_id: int,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        ok = storage.set_override_status(ov_id, "rejected")
+        if not ok:
+            raise HTTPException(404, "not found")
+        return {"ok": True}
+
+    @app.post("/api/overrides/{ov_id}/disable")
+    async def overrides_disable(
+        ov_id: int,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        ok = storage.set_override_status(ov_id, "disabled")
+        if not ok:
+            raise HTTPException(404, "not found")
+        return {"ok": True}
+
+    @app.get("/api/skills")
+    async def skills_list(
+        viewer: int | None = Depends(_get_viewer),
+        status: str = Query("active", max_length=16),
+    ) -> list[dict[str, Any]]:
+        rows = storage.list_skills(status=(status.strip() or None) if status else None)
+        return [
+            {
+                "id": r.id,
+                "name": r.name,
+                "summary": r.summary,
+                "body": r.body,
+                "created_by": r.created_by,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "usage_count": r.usage_count,
+                "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,
+                "status": r.status,
+            }
+            for r in rows
+        ]
+
+    @app.post("/api/skills/{sk_id}/disable")
+    async def skills_disable(
+        sk_id: int,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        ok = storage.set_skill_status(sk_id, "disabled")
+        if not ok:
+            raise HTTPException(404, "not found")
         return {"ok": True}
 
     return app

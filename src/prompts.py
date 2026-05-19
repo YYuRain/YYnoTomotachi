@@ -9,10 +9,13 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from .emotion import EmotionSignal
 from .persona import PersonaState
+
+log = logging.getLogger(__name__)
 
 
 MEMORY_PLACEHOLDER = "{{#检索记忆.body#}}"
@@ -120,6 +123,7 @@ def build_system_prompt(
     emotion: Optional[EmotionSignal] = None,
     tool_context: str = "",
     sticker_tags: Optional[list[str]] = None,
+    user_id: Optional[int] = None,
 ) -> str:
     body = persona.body
     mem_block = _render_memory(memories)
@@ -141,7 +145,31 @@ def build_system_prompt(
             + '\n（用自己的话自然提到就好，不要说"根据搜索结果"，只取对话里有用的部分。）'
         )
 
-    return body + interest_block + emotion_block + sticker_block + role_block + tool_block
+    # PRD：用户独立 prompt overrides——追加到末尾，不改 baseline
+    user_overrides_block = _render_user_overrides(user_id) if user_id else ""
+
+    return (body + interest_block + emotion_block + sticker_block
+            + role_block + tool_block + user_overrides_block)
+
+
+def _render_user_overrides(user_id: int) -> str:
+    """按 user 拉所有 status='active' 的 prompt_overrides，拼到 system prompt 末尾。
+
+    feedback_agent 沉淀的偏好通过这里注入。低风险自动 active；高风险走 admin pending
+    所以不会进入这里。失败静默返空——不阻塞主对话。
+    """
+    try:
+        from . import storage
+        rows = storage.list_active_overrides(user_id)
+    except Exception as log_e:
+        log.debug("render user overrides err uid=%s: %s", user_id, log_e)
+        return ""
+    if not rows:
+        return ""
+    lines = ["", "", "# 这位对方希望你这样做（之前对话沉淀的偏好；逐条照做）"]
+    for r in rows:
+        lines.append(f"- {r.text.strip()}")
+    return "\n".join(lines)
 
 
 WELCOME_OPENER_INSTRUCTIONS = """这是你和这位**新用户**第一次说话——他刚通过邀请码加进来。
