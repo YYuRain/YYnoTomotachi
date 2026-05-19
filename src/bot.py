@@ -144,6 +144,42 @@ async def _cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _cmd_proactive_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """admin only：手动触发一次 proactive opener，跑完整 generate_opener + deliver +
+    record_proactive_message 链路。验证 record_proactive_message 是否真把消息进了
+    主进程的 _recent_per_user。
+
+    用法：admin 在 telegram 里发 /proactive_test。bot 立刻发一条 opener，下一句你回
+    什么都行——bot 应该能接得住，因为 opener 已经进了 _recent。
+    """
+    chat = update.effective_chat
+    if chat is None or not users.is_admin(chat.id):
+        return
+    ctx_payload = {
+        "why": "admin /proactive_test 手动触发，验证 record_proactive_message",
+        "user_probably_doing": "在测试 bot 上下文",
+        "opener_angle": "随手抛个有意思的小观察",
+        "recent_topics": [],
+    }
+    text = await agent.generate_opener(chat.id, context=ctx_payload)
+    if not text:
+        await context.bot.send_message(chat_id=chat.id, text="(generate_opener 返空)")
+        return
+
+    async def _send(t: str) -> None:
+        await context.bot.send_message(chat_id=chat.id, text=t)
+
+    async def _typing() -> None:
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+
+    await deliver(text, _send, _typing)
+    agent.record_proactive_message(chat.id, text)
+    from .audit_log import audit
+    audit("proactive_fire", user_id=chat.id, why=ctx_payload["why"],
+          user_probably_doing=ctx_payload["user_probably_doing"],
+          opener_angle=ctx_payload["opener_angle"], opener_text=text)
+
+
 async def _cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """所有激活用户可用——返回带签名 token 的 webUI 一键登录链接。
 
@@ -308,6 +344,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("invite", _cmd_invite))
     app.add_handler(CommandHandler("users", _cmd_users))
     app.add_handler(CommandHandler("memory", _cmd_memory))
+    app.add_handler(CommandHandler("proactive_test", _cmd_proactive_test))
     # 业务
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _on_message))
     app.add_handler(MessageHandler(filters.PHOTO, _on_photo))
