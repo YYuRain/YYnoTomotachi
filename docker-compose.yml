@@ -63,7 +63,8 @@ services:
     environment:
       MEMU_DB_URL: postgresql+psycopg://postgres:postgres@postgres:5432/memu
     volumes:
-      - ./data:/app/data:ro
+      # 改成读写：admin 现在要 UPDATE prompt_overrides / skills 表（approve/reject/disable）
+      - ./data:/app/data
       - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
     command: ["python", "-m", "scripts.admin"]
     ports:
