@@ -110,6 +110,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
             await deliver(text, _send, _typing, max_piece_chars=60, merge_up_to=12)
+            agent.record_proactive_message(chat_id, text)
     except Exception as e:
         log.exception("welcome generation err: %s", e)
 

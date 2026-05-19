@@ -94,6 +94,9 @@ def build() -> AsyncIOScheduler:
             if not text:
                 return
             await deliver(text, send, typing)
+            # 让下一轮 user 回复时上下文能看见这条 opener
+            from .agent import record_proactive_message
+            record_proactive_message(uid, text)
             proactive.record_fire(
                 uid,
                 why=decision.get("why", ""),
