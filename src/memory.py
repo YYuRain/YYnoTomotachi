@@ -36,7 +36,7 @@ FLUSH_INTERVAL_SEC = 15 * 60  # 或 15 分钟强制一次
 
 # recall 精度门
 RECALL_MIN_QUERY_CJK_CHARS = 6   # query 中文字符 < 这个数 → 不 recall
-RECALL_MAX_DISTANCE = 0.45       # pgvector cosine distance；越小越相似（0=同方向）。> 这个 → 视为不相关
+RECALL_MAX_DISTANCE = 0.55       # pgvector cosine distance；越小越相似（0=同方向）。> 这个 → 视为不相关
 # 一些不带语义的口头话术，整句直接命中就跳过（超出长度门时兜底）
 _RECALL_STOPWORD_PATTERNS = [
     re.compile(r"^[嗯啊哦哎呀哈呵嘿耶吧呢吗的了"
