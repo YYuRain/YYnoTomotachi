@@ -427,22 +427,61 @@ async function loadItems() {
     const pill = el('span', { class: 'pill' }, it.memory_type || '');
     const tdT = el('td', { 'data-label': '类型' }); tdT.appendChild(pill); tr.appendChild(tdT);
     const stPill = el('span', { class: 'st ' + (it.status || 'confirmed') }, it.status || 'confirmed');
-    if (it.confidence !== undefined && it.confidence < 1) stPill.title = `confidence=${Number(it.confidence).toFixed(2)}`;
-    const tdSt = el('td', { 'data-label': '状态' }); tdSt.appendChild(stPill); tr.appendChild(tdSt);
+    const tdSt = el('td', { 'data-label': '状态' });
+    tdSt.appendChild(stPill);
+    if (it.confidence !== undefined && it.confidence !== null) {
+      const conf = Number(it.confidence);
+      // 不显示 1.0；其它都标出来
+      if (Math.abs(conf - 1) > 0.001) {
+        const confSpan = el('span', { style: 'margin-left:6px;font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace' }, `c=${conf.toFixed(2)}`);
+        tdSt.appendChild(confSpan);
+      }
+    }
+    tr.appendChild(tdSt);
+
     const tdSummary = el('td', { class: 'summary', 'data-label': '内容' });
     tdSummary.appendChild(document.createTextNode(it.summary || ''));
+
+    // 元信息行：id · 依赖 · 来源 · 反验证 · 更新
+    const metaRow = el('div', { style: 'margin-top:6px;font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;display:flex;flex-wrap:wrap;gap:8px;align-items:center' });
+
+    // id
+    if (it.id) {
+      const idSpan = el('span', { title: it.id }, `#${it.id.slice(0, 8)}`);
+      metaRow.appendChild(idSpan);
+    }
+    // 依赖
     if (it.depends_on && it.depends_on.length) {
-      const depRow = el('div', { class: 'muted', style: 'margin-top:4px;font-size:11px' });
-      depRow.appendChild(document.createTextNode('依赖：'));
+      const depWrap = el('span');
+      depWrap.appendChild(document.createTextNode('依赖 '));
       it.depends_on.forEach((depId, idx) => {
-        if (idx > 0) depRow.appendChild(document.createTextNode(' · '));
-        const a = el('a', { href: '#', style: 'color:var(--accent);font-family:ui-monospace,Menlo,monospace;text-decoration:none' }, depId.slice(0, 8));
+        if (idx > 0) depWrap.appendChild(document.createTextNode(','));
+        const a = el('a', { href: '#', style: 'color:var(--accent);text-decoration:none' }, depId.slice(0, 8));
         a.title = '跳到这条事实';
         a.onclick = (e) => { e.preventDefault(); _focusItem(depId); };
-        depRow.appendChild(a);
+        depWrap.appendChild(a);
       });
-      tdSummary.appendChild(depRow);
+      metaRow.appendChild(depWrap);
     }
+    // evidence_ref（来源对话文件路径）
+    if (it.evidence_ref) {
+      const fname = String(it.evidence_ref).split('/').pop() || it.evidence_ref;
+      const ev = el('span', { title: it.evidence_ref }, `源 ${fname}`);
+      metaRow.appendChild(ev);
+    }
+    // last_verified_at
+    if (it.last_verified_at) {
+      const lva = el('span', { title: '最后一次反验证仍成立的时间' }, `验证 ${fmt(it.last_verified_at)}`);
+      metaRow.appendChild(lva);
+    }
+    // updated（如果跟 created 不同）
+    if (it.updated_at && it.created_at && it.updated_at !== it.created_at) {
+      const u = el('span', { title: '最后更新时间' }, `改 ${fmt(it.updated_at)}`);
+      metaRow.appendChild(u);
+    }
+
+    if (metaRow.childNodes.length) tdSummary.appendChild(metaRow);
+
     tr.appendChild(tdSummary);
     tr.appendChild(el('td', { class: 'mono', 'data-label': '时间' }, fmt(it.created_at)));
     const ops = el('td', { class: 'ops' });
@@ -639,31 +678,54 @@ const auditTimeFmt = ts => {
 
 function summarizeAudit(d) {
   const t = (s, n) => truncate(s, n);
+  // verdict 色：升 = 绿、降 = 灰、持平 = 橙
+  const verdictChip = (v) => {
+    const colors = {
+      still_valid: '#1a8a3a', confirmed: '#1a8a3a',
+      uncertain: '#b56500', to_verify: '#b56500',
+      stale: '#888',
+    };
+    const c = colors[v] || '#555';
+    return `<span style="color:${c};font-family:ui-monospace,Menlo,monospace;font-size:11px">${v}</span>`;
+  };
+  // 把多行字符串列表渲染成竖排（每条「...」一行）
+  const list = (arr, n, max) => (arr || []).slice(0, max).map(s => `<div style="margin:1px 0">「${t(s, n)}」</div>`).join('');
+
   switch (d.event) {
     case 'startup': return `provider=${d.provider} · model=${d.model}`;
     case 'shutdown': return '';
-    case 'user_msg': return (d.has_image ? '🖼️ ' : '') + t(d.text, 100);
+    case 'user_msg': return (d.has_image ? '🖼️ ' : '') + t(d.text, 120);
     case 'assistant_reply': {
       const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
-      const err = d.error ? ` ⚠️ ${t(d.error, 50)}` : '';
+      const err = d.error ? ` ⚠️ ${t(d.error, 80)}` : '';
       const meta = `<span class="k">${d.mode || '?'}${lat}${err}</span>`;
-      return meta + t(d.text || '(空)', 100);
+      return meta + t(d.text || '(空)', 120);
     }
-    case 'memory_recall':
-      if (!d.hits) return `<span class="k">0 hits</span>${t(d.query, 60)}`;
-      return `<span class="k">${d.hits} hits</span>${(d.snippets||[]).slice(0,2).map(s=>'「'+t(s,40)+'」').join(' · ')}`;
-    case 'memory_flush':
-      return `<span class="k">${d.msgs} 消息 → +${d.new_items||0} 项</span>` +
-             ((d.new_item_summaries||[]).slice(0,2).map(s=>'「'+t(s,40)+'」').join(' · '));
+    case 'memory_recall': {
+      if (!d.hits) return `<span class="k">0 hits</span>${t(d.query, 80)}`;
+      return `<span class="k">${d.hits} hits</span>${t(d.query, 40)}` + list(d.snippets, 80, 5);
+    }
+    case 'memory_flush': {
+      const head = `<span class="k">${d.msgs} 消息 → +${d.new_items||0} 项</span>${d.file ? '<span class="k">'+t(d.file,30)+'</span>' : ''}`;
+      const items = list(d.new_item_summaries, 80, 5);
+      const err = d.error ? `<div style="color:#d9554f">⚠️ ${t(d.error, 120)}</div>` : '';
+      return head + items + err;
+    }
     case 'memory_conflict_check': {
       const flips = d.flips || [];
-      if (!flips.length) return `<span class="k">${d.candidates} 候选 · 无变更</span>「${t(d.new_summary, 50)}」`;
-      const flipStr = flips.slice(0,3).map(f => `${(f.id||'').slice(0,6)}→${f.verdict}`).join(' ');
-      return `<span class="k">+1「${t(d.new_summary, 40)}」</span>触发 ${flips.length} 改: ${flipStr}`;
+      const head = `<span class="k">候选 ${d.candidates}</span>新事实「${t(d.new_summary, 60)}」`;
+      if (!flips.length) return head + '<div style="color:#888;font-size:11px;margin-top:2px">无变更（候选都判 still_valid）</div>';
+      const flipLines = flips.slice(0, 5).map(f =>
+        `<div style="margin:2px 0">${verdictChip(f.verdict)} <span style="color:#aaa;font-family:ui-monospace,Menlo,monospace;font-size:11px">${(f.id||'').slice(0,8)}</span> 「${t(f.summary || '', 60)}」</div>`
+      ).join('');
+      return head + flipLines;
     }
     case 'memory_reverify': {
       const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
-      return `<span class="k">${d.verdict || '?'}${lat}</span>「${t(d.fact, 60)}」`;
+      const head = `${verdictChip(d.verdict || '?')}<span class="k">${lat}</span>「${t(d.fact, 80)}」`;
+      const reason = d.reason ? `<div style="color:#888;font-size:11px;margin-top:2px">理由：${t(d.reason, 140)}</div>` : '';
+      const upstream = (d.upstream && d.upstream.length) ? `<div style="color:#888;font-size:11px">上游：${(d.upstream || []).slice(0,2).map(u => '「'+t(u,50)+'」').join(' · ')}</div>` : '';
+      return head + reason + upstream;
     }
     case 'memory_dream': {
       const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
@@ -675,36 +737,62 @@ function summarizeAudit(d) {
     }
     case 'memory_dream_one': {
       const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
-      return `<span class="k">${d.verdict || '?'}${lat}</span>「${t(d.fact, 60)}」`;
+      const head = `${verdictChip(d.verdict || '?')}<span class="k">${lat}</span>「${t(d.fact, 80)}」`;
+      const reason = d.reason ? `<div style="color:#888;font-size:11px;margin-top:2px">理由：${t(d.reason, 140)}</div>` : '';
+      const ctx_parts = [];
+      if (d.upstream && d.upstream.length) ctx_parts.push(`上游 ${d.upstream.length}`);
+      if (d.neighbors && d.neighbors.length) ctx_parts.push(`邻居 ${d.neighbors.length}`);
+      const ctx = ctx_parts.length ? `<div style="color:#888;font-size:11px">${ctx_parts.join(' · ')}</div>` : '';
+      return head + reason + ctx;
     }
     case 'persona_update': {
-      const deltas = Object.entries(d.trait_deltas || {}).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' ');
-      const obs = (d.new_observations || []).length;
-      const ms = (d.new_milestones || []).length;
+      const deltas = Object.entries(d.trait_deltas || {})
+        .filter(([k,v]) => Math.abs(v) > 0.001)
+        .map(([k,v]) => `${k}${v>0?'+':''}${v}`).join(' ');
       const parts = [];
       if (deltas) parts.push(`<span class="k">Δ</span>${deltas}`);
-      if (d.mood) parts.push(`<span class="k">mood</span>${d.mood}`);
-      if (obs) parts.push(`+${obs} 观察`);
-      if (ms) parts.push(`+${ms} 锚点`);
-      return parts.join(' · ') || '无变化';
+      else parts.push('<span style="color:#aaa">trait 无变化</span>');
+      if (d.mood) parts.push(`<span class="k">mood</span>${t(d.mood, 30)}`);
+      const head = parts.join(' · ');
+      // 详细列出新观察 / 新锚点（这是用户最在意的）
+      const obs = d.new_observations || [];
+      const ms = d.new_milestones || [];
+      const obsBlock = obs.length ? `<div style="margin-top:3px;color:#7a3fcc;font-size:11px">+${obs.length} 观察：</div>` + list(obs.map(o => typeof o === 'string' ? o : (o.text || o.event || JSON.stringify(o))), 100, 3) : '';
+      const msBlock = ms.length ? `<div style="margin-top:3px;color:#7a3fcc;font-size:11px">+${ms.length} 锚点：</div>` + list(ms.map(m => typeof m === 'string' ? m : (m.text || m.event || JSON.stringify(m))), 100, 3) : '';
+      return head + obsBlock + msBlock;
     }
     case 'persona_consolidate':
-      return `保留 ${d.observations_kept} 观察 · 丢 ${d.observations_dropped}`;
-    case 'proactive_decision':
-      return `${d.should ? '✓ GO' : '× skip'} · ${t(d.why || '', 80)}`;
+      return `保留 ${d.observations_kept} 观察 · 丢 ${d.observations_dropped}` +
+             ((d.new_baseline_excerpt) ? `<div style="color:#888;font-size:11px;margin-top:2px">${t(d.new_baseline_excerpt, 120)}</div>` : '');
+    case 'proactive_decision': {
+      const head = `${d.should ? '✓ GO' : '× skip'} · ${t(d.why || '', 100)}`;
+      const angle = d.opener_angle ? `<div style="color:#888;font-size:11px">切入点：${t(d.opener_angle, 80)}</div>` : '';
+      const doing = d.user_probably_doing ? `<div style="color:#888;font-size:11px">猜对方在：${t(d.user_probably_doing, 80)}</div>` : '';
+      return head + angle + doing;
+    }
     case 'proactive_fire':
-      return `「${t(d.opener_text, 80)}」`;
+      return `「${t(d.opener_text, 120)}」`;
     case 'proactive_opener_generated':
-      return `<span class="k">idle ${d.idle_sec}s</span>「${t(d.text, 60)}」`;
-    case 'tool_call':
-      return `<span class="k">${d.tool}</span>"${t(d.query, 30)}" → ${d.result_chars} chars`;
-    case 'interest_bump':
+      return `<span class="k">idle ${d.idle_sec}s</span>「${t(d.text, 100)}」`;
+    case 'tool_call': {
+      const head = `<span class="k">${d.tool}</span>"${t(d.query, 60)}" → ${d.result_chars} chars`;
+      const preview = d.result_preview ? `<div style="color:#888;font-size:11px;margin-top:2px">${t(d.result_preview, 140)}</div>` : '';
+      return head + preview;
+    }
+    case 'interest_bump': {
+      // topic(heat_before → heat_after) 全部展示
+      const before = d.heat_before || {};
+      const after = d.heat_after || {};
       return (d.topics || []).map(tp => {
-        const h = (d.heat_after || {})[tp];
-        return tp + (h !== undefined ? `(${Number(h).toFixed(1)})` : '');
+        const b = before[tp], a = after[tp];
+        if (a !== undefined && b !== undefined && b !== a) {
+          return `${tp} <span style="color:#888">${Number(b).toFixed(1)}→${Number(a).toFixed(1)}</span>`;
+        }
+        return tp + (a !== undefined ? ` <span style="color:#888">(${Number(a).toFixed(1)})</span>` : '');
       }).join(' · ');
+    }
     default:
-      return t(JSON.stringify(d), 100);
+      return t(JSON.stringify(d), 140);
   }
 }
 
@@ -993,7 +1081,8 @@ def build_app() -> FastAPI:
         wh = f"WHERE {' AND '.join(where)}" if where else ""
         sql = text(
             f"SELECT id, memory_type, summary, status, confidence, "
-            f"last_verified_at, depends_on, created_at, updated_at FROM memories {wh} "
+            f"last_verified_at, depends_on, evidence_ref, "
+            f"created_at, updated_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )
         with eng.connect() as c:

@@ -433,13 +433,18 @@ async def _check_conflicts_for_one(
             user_id, new_id[:8], len(flips),
             " | ".join(f"{oid[:8]}→{v}" for oid, v in flips[:5]),
         )
+    cand_map = {oid: s for oid, s in candidates}
     audit(
         "memory_conflict_check",
         user_id=user_id,
         new_id=new_id,
         new_summary=new_summary[:200],
         candidates=len(candidates),
-        flips=[{"id": oid, "verdict": v} for oid, v in flips],
+        candidate_list=[{"id": oid, "summary": s[:200]} for oid, s in candidates],
+        flips=[
+            {"id": oid, "verdict": v, "summary": cand_map.get(oid, "")[:200]}
+            for oid, v in flips
+        ],
     )
 
 
@@ -514,7 +519,7 @@ async def _reverify_one(
                     user_id, item["id"][:8], e)
         return None
 
-    verdict = _parse_reverify(raw)
+    verdict, reason = _parse_reverify(raw)
     latency_ms = int((time.time() - started) * 1000)
     audit(
         "memory_reverify",
@@ -524,6 +529,7 @@ async def _reverify_one(
         upstream=[u[:200] for u in upstream],
         query=(query or "")[:200],
         verdict=verdict or "parse_fail",
+        reason=reason[:300],
         latency_ms=latency_ms,
     )
     if verdict is None:
@@ -535,32 +541,32 @@ async def _reverify_one(
     return verdict
 
 
-def _parse_reverify(raw: str) -> str | None:
+def _parse_reverify(raw: str) -> tuple[str | None, str]:
+    """返回 (verdict, reason)。verdict ∈ {still_valid, uncertain, None}。"""
     raw = (raw or "").strip()
     if not raw:
-        return None
+        return None, ""
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-    try:
-        d = json.loads(raw)
-        v = d.get("verdict") if isinstance(d, dict) else None
-        if v in ("still_valid", "uncertain"):
-            return v
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if m:
+    for src in (raw, None):
+        if src is None:
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            src = m.group(0) if m else None
+            if src is None:
+                break
         try:
-            d = json.loads(m.group(0))
-            v = d.get("verdict") if isinstance(d, dict) else None
-            if v in ("still_valid", "uncertain"):
-                return v
+            d = json.loads(src)
+            if isinstance(d, dict):
+                v = d.get("verdict")
+                r = (d.get("reason") or "").strip()
+                if v in ("still_valid", "uncertain"):
+                    return v, r
         except Exception:
-            pass
+            continue
     m = _REVERIFY_RE.search(raw)
     if m:
-        return m.group(1)
-    return None
+        return m.group(1), ""
+    return None, ""
 
 
 # ============ Auto Dream（PRD v2 / 5.3）============
@@ -571,33 +577,32 @@ _DREAM_RE = re.compile(
 )
 
 
-def _parse_dream(raw: str) -> str | None:
-    """LLM 输出 → 'still_valid'|'uncertain'|'stale'|None。"""
+def _parse_dream(raw: str) -> tuple[str | None, str]:
+    """LLM 输出 → (verdict, reason)。verdict ∈ {still_valid, uncertain, stale, None}。"""
     raw = (raw or "").strip()
     if not raw:
-        return None
+        return None, ""
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-    try:
-        d = json.loads(raw)
-        v = d.get("verdict") if isinstance(d, dict) else None
-        if v in ("still_valid", "uncertain", "stale"):
-            return v
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if m:
+    for src in (raw, None):
+        if src is None:
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            src = m.group(0) if m else None
+            if src is None:
+                break
         try:
-            d = json.loads(m.group(0))
-            v = d.get("verdict") if isinstance(d, dict) else None
-            if v in ("still_valid", "uncertain", "stale"):
-                return v
+            d = json.loads(src)
+            if isinstance(d, dict):
+                v = d.get("verdict")
+                r = (d.get("reason") or "").strip()
+                if v in ("still_valid", "uncertain", "stale"):
+                    return v, r
         except Exception:
-            pass
+            continue
     m = _DREAM_RE.search(raw)
     if m:
-        return m.group(1)
-    return None
+        return m.group(1), ""
+    return None, ""
 
 
 async def _dream_one(
@@ -680,7 +685,7 @@ async def _dream_one(
         log.warning("dream LLM err uid=%s id=%s: %s", user_id, fact_id[:8], e)
         return None
 
-    verdict = _parse_dream(raw)
+    verdict, reason = _parse_dream(raw)
     latency_ms = int((time.time() - started) * 1000)
     audit(
         "memory_dream_one",
@@ -690,6 +695,7 @@ async def _dream_one(
         upstream=[u[:200] for u in upstream],
         neighbors=[n[:200] for n in neighbors],
         verdict=verdict or "parse_fail",
+        reason=reason[:300],
         latency_ms=latency_ms,
     )
     if verdict is None:
