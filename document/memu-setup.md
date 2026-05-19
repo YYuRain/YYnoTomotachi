@@ -1,5 +1,11 @@
 # memU 配置与风险
 
+> ⚠️ **历史归档（2026-05-18 起）**：memU SDK (`memu-py`) 已被自搭记忆栈替换。
+> 当前架构看 [`memory-stack.md`](memory-stack.md)。本文档保留作为：
+> - 选 memU 时踩过的坑参考（XML 输出、ctx 多用户 race、strip-think shim 必要性）
+> - 老库迁移到自搭栈的依据（`scripts/migrate_memu_to_native.py`）
+> 新部署不必读本文档。
+
 ## 选型
 
 - 自托管 `memu-py`（pip 包）。

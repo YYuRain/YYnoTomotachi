@@ -9,9 +9,9 @@
 
 | service | 镜像 | 端口（host） | 作用 |
 |---------|------|------|------|
-| `bot` | 自构建 `aidemo-bot` | 无 | 主 bot + 可选 test bot；含 embed_server :18080 + llm_proxy :18082（容器内） |
+| `bot` | 自构建 `aidemo-bot` | 无 | 主 bot + 可选 test bot；含 embed_server :18080（容器内） |
 | `admin` | 自构建 `aidemo-admin` | `0.0.0.0:18081` | webUI |
-| `postgres` | `pgvector/pgvector:pg16` | 无（compose 内网） | memU 持久化 |
+| `postgres` | `pgvector/pgvector:pg16` | 无（compose 内网） | 自搭记忆栈 `memories` 表持久化（容器名 `memu-postgres` 沿用旧名） |
 | `mihomo` | `metacubex/mihomo:latest` | 无 | Clash 内核——HK 出口 IP 被 Anthropic 限制时给 OpenRouter 走美区代理 |
 | `cloudflared` | `cloudflare/cloudflared:latest` | 无 | 把 admin :18081 反向代理出 `https://*.trycloudflare.com`（HTTPS + 不开公网端口）|
 
@@ -49,7 +49,6 @@ LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=anthropic/claude-sonnet-4.6
 JINA_API_KEY=jina_...                    # 可选，没填会退到 Exa
-MEMU_METADATA_PROVIDER=postgres
 MEMU_DB_URL=postgresql+psycopg://postgres:postgres@postgres:5432/memu
 MEMU_CHAT_MODEL=deepseek/deepseek-v4-flash
 ADMIN_UI_USER=<env 凭证用户名，备用，登录主路径已不用密码>
@@ -99,6 +98,22 @@ docker compose build         # 第一次 ~5–10 分钟（含 bge 模型烤进�
 docker compose up -d
 docker compose logs -f bot   # 看到 INFO __main__: ready 即就绪
 ```
+
+## 5.5. （仅当从 memU SDK 时代升级）迁移老记忆 + backfill 5.1
+
+如果服务器有从 memU 时代留下的 `memory_items` 表（自搭栈替换前的历史数据，2026-05-18 之前的部署），
+启动后跑一次性迁移：
+
+```bash
+# 把旧 memory_items 拷到新 memories 表（幂等，可重跑）
+docker compose exec bot python -m scripts.migrate_memu_to_native --apply
+
+# 给历史 profile 重放一次 5.1 写入冲突检测，让 graph 上有 deps 边可看
+docker compose exec bot python -m scripts.backfill_conflict_check --user-id <admin-chat-id>
+```
+
+迁移期间不停服。`backfill_conflict_check` 跑 ~115 LLM call、几分钱、5-7 分钟。
+跑完去 admin webUI 的图谱 tab 看 stale / to_verify 节点和 depends_on 边。
 
 ## 6. 邀请用户 + 登录 webUI
 

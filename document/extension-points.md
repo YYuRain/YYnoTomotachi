@@ -86,10 +86,12 @@ class EmotionSignal:
 
 ---
 
-## memU 持久化
+## 记忆栈持久化（自搭，2026-05-18 起）
 
-`src/memory.py::_get_service` 已经根据 `MEMU_METADATA_PROVIDER` env 分叉（`inmemory` vs `postgres`）。
-切换只需改 `.env`，代码不用动。
+postgres + pgvector 单表，在 `MEMU_DB_URL` 配置；启动时 `src/memory_store.py::engine()` 自动建表 +
+`_ensure_v2_columns` 跑 ALTER 兼容老库。代码层面没分支——切换只换 `MEMU_DB_URL`。
+PRD v2 三层防线（5.1/5.2/5.3）的 status / confidence / depends_on / last_verified_at 列都在 schema 里。
+详见 `memory-stack.md`。
 
 ---
 

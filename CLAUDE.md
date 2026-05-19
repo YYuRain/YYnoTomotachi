@@ -57,6 +57,8 @@ docker compose logs -f bot   # 看 ready
 | `EVAL_MODELS` | 评测候选模型，逗号分隔，`<provider>/<model_id>` 格式 |
 | `HF_HUB_OFFLINE` | `1`（离线用缓存模型，避免超时） |
 | `TRANSFORMERS_OFFLINE` | `1` |
+| `DEV_SKIP_PROD_BOT` | dev 用——`1` 时本地只跑 test bot 不跑 prod bot，避免和云上同 token 抢 polling（409） |
+| `ADMIN_UI_BASE_URL` | dev 用——本地不跑 cloudflared 时设 `http://127.0.0.1:18081`，让 test bot 的 `/memory` 拿到的链接指向本地 admin UI |
 
 ## 模块地图
 
@@ -71,8 +73,8 @@ docker compose logs -f bot   # 看 ready
 | `src/embed_client.py` | 本地 :18080 embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
 | `src/memory_store.py` | 自搭记忆栈：`memories` 表 ORM + engine + pgvector 索引 |
-| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event 一次性 JSON 输出） |
-| `src/memory.py` | recall（pgvector cosine RAG）+ note_turn（短期 buffer）+ maybe_flush（抽取入库） |
+| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
+| `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）+ note_turn（短期 buffer）+ maybe_flush（抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
@@ -82,10 +84,10 @@ docker compose logs -f bot   # 看 ready
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
 | `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
-| `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate |
+| `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13) |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；只剩「记忆项」+「审计」两个 tab |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；三个 tab「记忆项」「图谱（D3 force-directed）」「审计」 |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
 | `src/openrouter.py` | OpenAI 兼容客户端，主聊天（LLM_PROVIDER=openrouter）+ `scripts/eval_*`；走 Clash 代理 |
@@ -116,6 +118,19 @@ docker compose logs -f bot   # 看 ready
 - `/clear` 清空当前虚拟身份的所有数据（SQLite + memU + 内存），邀请码归还
 - `/memory` 拿当前虚拟身份的 webUI 链接
 
+## 记忆架构 PRD v2（2026-05-18 起）
+
+memory 不只是 RAG。三层防线让记忆"知道自己不确定"：
+
+- **5.1 写入冲突检测**（异步）：每条新事实 flush 入库后，对它语义最近的 top-5 旧 profile 跑一次 LLM 影响分析。verdicts ∈ {still_valid / to_verify / stale}；后两者写老条目的 `status` + 把新事实 id append 到老条目的 `depends_on` 数组（去重）。同 batch 内同伴互排除避免互判。
+- **5.2 召回反验证**（同步阻塞 recall）：recall 命中 `to_verify` 条目时，同步跑 LLM 反向验证（输入条目+depends_on 上游+当前 user query）。verdicts ∈ {still_valid / uncertain}（不能直接判 stale 防错杀）。30 min cooldown 用 `last_verified_at` 限速。still_valid → 升回 confirmed；uncertain → 保留 to_verify 仅打戳。
+- **5.3 Auto Dream**（03:13 cron 批量）：对每个用户的所有 to_verify 条目跑一遍三态判定（still_valid / uncertain / stale）。后台无打扰，可激进直判 stale。LLM 拿 deps 上游 + top-5 confirmed 邻居作综合上下文。
+
+`memories` 表新加 4 列：`status` (confirmed/to_verify/stale)、`confidence`、`last_verified_at`、`depends_on UUID[]`。
+recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让主 LLM 自己拿捏。
+
+详见 `me/prd_memory.md`（PRD 原文）+ `document/memory-stack.md`（实现细节）。
+
 ## Agent Reach 工具
 
 依赖 CLI 工具（bot 不用重启即可验证）：
@@ -143,7 +158,8 @@ docker compose logs -f bot   # 看 ready
 | `document/dialog-tuning-log.md` | 对话风格调优记录（最新在上） |
 | `document/agent-reach-integration.md` | 工具集成：xhs/Exa/yt-dlp |
 | `document/minimax-integration.md` | MiniMax 接入与坑点 |
-| `document/memu-setup.md` | memU 配置 + Postgres 持久化 |
+| `document/memory-stack.md` | 自搭记忆栈（postgres+pgvector）+ PRD v2 三层防线实现 |
+| `document/memu-setup.md` | （已归档）memU SDK 时代配置；自搭栈替换前的踩坑参考 |
 | `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测/多用户都已落地） |
 | `document/deployment.md` | 云部署（Docker Compose + mihomo + cloudflared + 多用户测试流程） |
 | `document/persona-evolution.md` | 人格演化：traits/mood/observations/milestones 设计 |

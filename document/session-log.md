@@ -1,5 +1,40 @@
 # 会话流水（本次搭建过程）
 
+## 2026-05-18：抛弃 memU SDK + PRD v2 三层防线
+
+### 触发
+
+memU SDK (`memu-py`) 1.5.x 多次踩坑（happened_at 列偷加、ctx 多用户 race、需要 strip-think shim
+兜底）。memU 给的能力其实只有抽取 LLM 调用 + pgvector RAG 召回，自己写 < 200 行就够。
+
+### 改动
+
+**Phase 1：等价替换 memU**（commit `2a1c661`）
+- 新单表 `memories`，抽取 prompt 改 JSON（一次 call 出 profile+event 两类）
+- `recall/note_turn/maybe_flush` 三个公共 API 不变，上层零改动
+- 删 `src/llm_proxy.py` + `src/memu_prompts_zh.py`；卸 `memu-py`
+- `scripts/migrate_memu_to_native.py` 老 `memory_items` → 新 `memories`
+- 新 `DEV_SKIP_PROD_BOT=1` 让本地不抢云端 polling
+
+**Phase 2：PRD v2 三层防线**
+- **5.1 写入冲突检测**（commit `73eee02`）：每条新事实 flush 后异步 fire LLM 影响分析；同 batch 互排除；schema 加 `status / confidence / last_verified_at / depends_on UUID[]`
+- **图谱视图**（commit `2532d6f`）：admin UI D3 v7 force-directed graph；conflict check 把新事实 id 写进老条目 depends_on（去重）
+- **backfill 历史**（commit `661c7b4`）：admin 122 profile / 35 flips（21 stale, 14 to_verify）
+- **5.2 召回反验证**（commit `2dad994`）：recall 同步阻塞 + 30min cooldown；LLM 两态（still_valid / uncertain）
+- **5.3 Auto Dream**（commit `94cebc4`）：03:13 cron 批量；LLM 三态（still_valid / uncertain / stale）；用 deps 上游 + top-5 confirmed 邻居作综合上下文
+
+### 部署到 HK 服务器
+
+`memory-deps` 分支直接 checkout；服务器 188 条历史迁过去；admin backfill 后
+147 confirmed / 21 stale / 12 to_verify；prod + test bot 双在线；Auto Dream 已挂 03:13 cron。
+
+### 验证
+
+沙箱跑 PRD §2.3 例子（住北京 + 通勤 + 理发卡 + 社保 → 搬上海了），三层全按设计触发。
+完整描述见 `me/prd_memory.md` + `document/memory-stack.md`。
+
+---
+
 ## 2026-04-29：Agent Reach 工具能力集成
 
 ### 目标

@@ -7,7 +7,8 @@
 
 > 一个陪伴型（不是助手、不是心理咨询师）的 Telegram chat agent，会主动找人、像真人聊、
 > 会自己想起记忆、兴趣热度会涨会退、能看图发表情包。OpenRouter / Claude / MiniMax 做 LLM，
-> 本地 bge-small-zh 做 embedding，memU 做长期记忆。**多用户邀请制**（5–50 人），单实例。
+> 本地 bge-small-zh 做 embedding，自搭 postgres+pgvector 记忆栈（PRD v2 三层防线，详见
+> `memory-stack.md`）。**多用户邀请制**（5–50 人），单实例。
 
 ## 运行时结构
 
@@ -37,14 +38,15 @@
 │                       └─► async: memorize(uid) / availability(uid) │
 │                                                      │
 │  本地服务（main.py 内 asyncio task）                   │
-│   ├─ embed_server  :18080  bge-small-zh embedding shim │
-│   └─ llm_proxy     :18082  memU 上游 shim（OpenRouter/MiniMax 路由+strip-think）│
+│   └─ embed_server  :18080  bge-small-zh embedding shim │
 │                                                      │
-│  APScheduler（4 job 各自 fan-out 遍历 users.list_active() with Sem(5)） │
+│  APScheduler（5 job 各自 fan-out 遍历 users.list_active() with Sem(5)） │
 │   ├─ decay_job           每 1h  interests.decay_tick(uid) per user │
 │   ├─ memu_flush_job      每 15m memory.maybe_flush(uid) per user │
 │   │                            └─► persona.update_state(uid) │
+│   │                            └─► _fire_conflict_check (PRD 5.1 异步) │
 │   ├─ persona_consolidate 每日 03:07 (CST) per user 衰减/清旧观察│
+│   ├─ auto_dream          每日 03:13 (CST) memory.auto_dream(uid) (PRD 5.3) │
 │   └─ proactive_job       每 25m per user 软门 LLM 判断 │
 │                                    └─► generate_opener(uid) │
 │                                    └─► bot.make_send_and_typing(uid) │
@@ -67,8 +69,10 @@
 | `src/test_bot.py` | 可选第二个 Telegram bot（`TEST_BOT_TOKEN`）：`/become <label>` 选虚拟 user_id（与 chat_id 解耦），完整邀请码激活流程，`/clear` 清盘——同 telegram 账户能扮演多个用户 | ✅ 接入（2026-05-13，可选） |
 | `src/minimax.py` | 聊天走 OpenAI 兼容端点；embed 走 MiniMax 原生格式；自动剥 `<think>` | ✅ MVP |
 | `src/embed_server.py` | 本地 OpenAI 兼容 embedding shim：FastAPI + sentence-transformers (bge-small-zh) :18080 | ✅ MVP |
-| `src/llm_proxy.py` | 本地 memU 上游 shim :18082。按 `MEMU_CHAT_MODEL` 自动路由：OpenRouter（带 Clash）或 MiniMax 直连；永远剥 `<think>` 防污染 `memory_categories.summary` | ✅ 接入（2026-05-07，2026-05-12 加 OpenRouter 路由） |
-| `src/memory.py` | memU MemoryService 封装；chat=本地 shim:18082→上游，embedding=本地 shim:18080；rolling buffer → JSON → memorize；recall 携带形成日期 | ✅ MVP |
+| `src/embed_client.py` | embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） | ✅ 接入（2026-05-18） |
+| `src/memory_store.py` | 自搭记忆栈 ORM：`memories` 表 + `_ensure_v2_columns` 启动时 ALTER 兼容老库 | ✅ 接入（2026-05-18） |
+| `src/memory_prompts.py` | 抽取 / 冲突检测 / 反验证 / Auto Dream 4 个 LLM prompt | ✅ 接入（2026-05-18） |
+| `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）/ note_turn / maybe_flush（抽取入库 + 5.1 异步冲突检测）/ auto_dream（5.3 批量整理）。recall 输出每条带形成日期，stale 不召回，to_verify 带 `[待确认]` 标记 | ✅ MVP（2026-05-18 PRD v2 三层防线接入） |
 | `src/interests.py` | 话题抽取（轻量 LLM）+ 热度 bump/decay/top/cold | ✅ MVP |
 | `src/availability.py` | 每次回消息记 (weekday, hour)；`score` 给 proactive 用 | ✅ MVP（带冷启动先验） |
 | `src/emotion.py` | 聊天模式判档：casual / empathy / depth / interest | ✅ MVP |
@@ -80,9 +84,9 @@
 | `src/prompts.py` | 装配 system prompt + `PROACTIVE_OPENER_INSTRUCTIONS` + 表情包段 + 四档情绪指令（empathy/depth/interest） | ✅ MVP |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
 | `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener`；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
-| `src/scheduler.py` | APScheduler 四个 job：decay/memu_flush/proactive/persona_consolidate | ✅ MVP |
+| `src/scheduler.py` | APScheduler 五个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13) | ✅ MVP |
 | `src/bot.py` | 主 bot：邀请码准入门、命令 `/start /myid /memory /invite /users`、激活后调 `agent.generate_welcome` 发开场白；text + photo handler；`send_sticker` 回调 | ✅ MVP |
-| `src/main.py` | 统一启动/关停（embed_server + llm_proxy + prod bot + 可选 test bot + scheduler） | ✅ MVP |
+| `src/main.py` | 统一启动/关停（embed_server + prod bot + 可选 test bot + scheduler）；`DEV_SKIP_PROD_BOT=1` 时跳过 prod bot 让本地不抢云端 polling | ✅ MVP |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应 | ✅ MVP |
 | `src/agent.py::generate_welcome` | 用户邀请码激活后立刻生成的"拉对方进对话"第一条消息 | ✅ 接入（2026-05-13） |
 
@@ -96,11 +100,11 @@
   - `persona_snapshots(id, user_id, ts, payload_json)`
   - `users(chat_id PK, status, created_at, note, webui_password)` —— 注册用户表
   - `invite_codes(code PK, created_by, created_at, used_by, used_at)` —— 邀请码
-- **memU**（默认 `postgres`，2026-04-27 切）：长期记忆
-  - 每 6 轮或 15 分钟把 rolling buffer flush 成 `data/memu_buffer/conv_*.json`，调 `service.memorize`
-  - 每条用户消息到达时 `service.retrieve` 做主动召回
-  - 容器：`docker memu-postgres`（pgvector），`localhost:5432/memu`
-  - **memU 内部 LLM 调用走本地 :18082 shim**（`src/llm_proxy.py`）；shim 按 `MEMU_CHAT_MODEL` 选 OpenRouter（默认 deepseek-v4-flash）或 MiniMax，永远剥 `<think>`
+- **自搭记忆栈**（postgres + pgvector，2026-05-18 替换原 memU SDK）：长期记忆
+  - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json`，调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）→ `_persist_items`（embedding + INSERT 到 `memories` 表）
+  - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（pgvector cosine top-k）
+  - **PRD v2 三层防线**：5.1 写入冲突检测（异步）+ 5.2 召回反验证（同步阻塞 + 30min cooldown）+ 5.3 Auto Dream（03:13 cron 批量整理）；详见 `memory-stack.md`
+  - 容器：`docker memu-postgres`（pgvector，名字沿用旧 memU 时代不改），`localhost:5432/memu`
 - **静态资源**：
   - `data/stickers/*.{jpg,png,gif,webp}` — 表情包，文件名（去后缀）当 tag
   - `data/eval/run_<ts>.{jsonl,md,scores.jsonl,scores.md}` — 模型评测产物（`scripts/eval_*`）

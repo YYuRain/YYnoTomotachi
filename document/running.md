@@ -47,14 +47,14 @@ cd /Users/yangyu/Desktop/AIDemo
 ```
 INFO src.embed_server: embedding model ready, dim=512
 INFO __main__: embed server ready @ 127.0.0.1:18080
-INFO __main__: llm proxy ready @ 127.0.0.1:18082
 INFO __main__: ready
 ```
 
 **本地端口分配**：
-- `:18080` — embed server（bge-small-zh，给 memU 做 embedding）
+- `:18080` — embed server（bge-small-zh，给自搭记忆栈做 embedding）
 - `:18081` — admin UI（可选，`scripts.admin` 单独跑）
-- `:18082` — strip-think shim（memU 内部 LLM 调用经过它，剥 MiniMax `<think>` 块）
+
+> 历史端口 `:18082` 是 memU SDK 时代的 strip-think shim，2026-05-18 起换自搭记忆栈后已退役。
 
 在 Telegram 找你那个 bot 发消息就行。
 
@@ -62,7 +62,7 @@ INFO __main__: ready
 
 ## 记忆浏览 UI（可选）
 
-查看/搜索 memU 已存的记忆数据。独立于 bot 进程。
+查看/搜索 自搭记忆栈（postgres `memories` 表）的记忆数据 + D3 图谱。独立于 bot 进程。
 
 ```bash
 nohup .venv/bin/python -m scripts.admin > data/admin.log 2>&1 & disown
