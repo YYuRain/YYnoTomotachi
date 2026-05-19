@@ -172,8 +172,8 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         )
         if capability_data and capability_data.get("active_text_for_bot"):
             override_text = capability_data["active_text_for_bot"].strip()
-            decision_audit_base["risk_level"] = "high"  # capability 强制走 admin 审核
-            risk_level = "high"
+            # 不再强制 high——按 sonnet 自判的 risk_level 走（核心人设修改才 high；
+            # 普通 capability 如"下雨提醒带伞"是 low → 自动 active）
         else:
             audit("feedback_decision", **decision_audit_base, error="skill_creator_failed")
             return
@@ -223,12 +223,15 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         and capability_data.get("cron_schedule")
         and capability_data.get("condition_prompt")
     )
+    # skill 库**仅作为仓库**——新建 skill 时**不**让当前 user 也算"复用"：
+    # 不指向 source_skill_id、不 bump usage_count。skill 静态躺在库里，等其他 user
+    # 提相似需求时通过 cosine 召回 + sonnet 选 reuse_skill_id 才算被调用。
     override_id = storage.add_override(
         user_id=user_id,
         text=override_text,
         reason=decision.get("reason") or "",
         source_user_msg=brief,
-        source_skill_id=new_skill_id,
+        source_skill_id=None,  # 不指向新建的 skill（仓库语义）
         risk_level=risk_level,
         status="active" if risk_level == "low" else "pending",
         approved_by=0 if risk_level == "low" else None,
@@ -236,9 +239,7 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         cron_schedule=capability_data.get("cron_schedule") if is_active_trigger else None,
         condition_prompt=capability_data.get("condition_prompt") if is_active_trigger else None,
     )
-    if new_skill_id is not None:
-        # 新 skill 自己用一次（就是当前 user 这条 override）
-        storage.bump_skill_usage(new_skill_id)
+    # （不 bump_skill_usage——usage_count 仅记录跨用户复用次数）
 
     if intent == "capability_request":
         action_label = "capability_via_skill_creator"
