@@ -52,3 +52,18 @@
 - test bot `/memory` 加 admin chat 路径：admin 真实 chat 直接发 `/memory` 进 admin 视角，不需要 `/become`
 - 部署 `memory-deps` 分支到 HK（暂不合 main，下个 PR）：跑 migrate + backfill；prod + test bot 双在线
 - 同步 docs：新建 `document/memory-stack.md`；CLAUDE.md / overview / deployment / extension-points / running 全部去 memU SDK 引用；`memu-setup.md` 加归档头
+
+## 2026-05-19
+
+- search 工具栈整修：诊断 admin tool_call 全部 result_chars=0，根因容器没装 mcporter/xhs（本地 nvm/pipx 全局 binary）。`search_web` 改用 Jina Search REST（`https://s.jina.ai/?q=...`），复用现有 `JINA_API_KEY`，容器零依赖
+- `xhs_search` 入口删除（账号本就风控失效），并入 `web_search`；LLM 在 query 里加"小红书"关键词
+- `_TOOL_DETECT_SYSTEM` 改 .format 模板 + 运行时拼今天日期（`今天是 2026-05-19（周二）` + `今年是 2026 query 必须用 2026 不要 2025`），修 LLM 写 query 错年份
+- `_TOOL_DETECT_SYSTEM` 加规则：用户用"你能查 / 你试试 / 你帮我搜"等试探口吻附带具体话题 → needed=true（之前会判 false 当作"问能力"）
+- `_maybe_fetch_context` 不管 needed 与否都 audit 一条 `tool_decision`，加用户原话/skipped_reason，让 admin 直接看为啥没触发
+- `_ROLE_DISCIPLINE` 新增"你有联网能力"段，明确告诉 bot 它有 read_url/web_search 工具、查到的内容会以 `[链接内容]` 塞回；禁止主动声称"AI 不联网"——之前 sonnet 默认人设否认能力让用户体验差
+- 引入「per-user prompt + Feedback Sub-Agent + Skill 库」子系统（`document/feedback-agent.md`）：sonnet 监听 flush 后 batch，粗筛（aux）+ 精判（main 三态判定）+ 双层硬护栏（prompt 7 条 + 代码 regex 兜底）+ low/high 风险分流（low 自动 active、high pending 等 admin 审核）+ 跨用户 skill 库（cosine top-3 召回复用）
+- 新表 `prompt_overrides` / `skills`（SQLite，跟 persona_snapshots 一个库）；helpers 一套加在 `storage.py` 末尾
+- `prompts.build_system_prompt(user_id=...)` 末尾追加 active overrides 段，baseline 不动
+- admin webUI 新增「调教」tab：pending（approve/reject）+ active（disable）+ skill 库（disable）三段；audit 加 `feedback_screen` / `feedback_decision` 着色 + 详细渲染
+- 修 `_persist_items` INSERT 漏 status/confidence 列触发 NotNullViolation（同 migrate 之前的坑）；本地 ORM CREATE 走 default 跑得通，服务器表是 ALTER 加列 PG 不走 ALTER 的 DEFAULT，必须显式补
+- admin UI items 卡片显示更多信息：confidence / source / last_verified_at / updated_at；audit 摘要展开 persona_update 的 observations 内容、conflict_check 的 flip 老条目原文、reverify/dream 的 LLM reason 等

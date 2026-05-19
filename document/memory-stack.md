@@ -136,11 +136,13 @@ res: dict = await memory.auto_dream(user_id)
 `data/audit.jsonl` 里有这些 event（admin UI 审计 tab 可滤）：
 
 - `memory_flush` — flush 一次的汇总（msgs / new_items / new_item_summaries）
-- `memory_conflict_check` — 5.1 写入冲突分析单次（new_id / candidates / flips: [{id, verdict}]）
+- `memory_conflict_check` — 5.1 写入冲突分析单次（new_id / candidates / flips: [{id, verdict, summary}]）
 - `memory_recall` — recall 一次（query / hits / snippets）
-- `memory_reverify` — 5.2 反验证单条（fact_id / verdict / latency_ms / upstream / query）
+- `memory_reverify` — 5.2 反验证单条（fact_id / verdict / reason / latency_ms / upstream / query）
 - `memory_dream` — 5.3 整批汇总（reviewed / to_confirmed / to_stale / uncertain / errors / latency_ms）
-- `memory_dream_one` — 5.3 单条（fact_id / verdict / latency_ms / upstream / neighbors）
+- `memory_dream_one` — 5.3 单条（fact_id / verdict / reason / latency_ms / upstream / neighbors）
+- `feedback_screen` / `feedback_decision` — Feedback sub-agent 粗筛 + 精判（详见 `feedback-agent.md`）
+- `tool_decision` / `tool_call` — search 工具触发判定 + 调用结果（详见 `agent-reach-integration.md`）
 
 ## admin UI 图谱
 

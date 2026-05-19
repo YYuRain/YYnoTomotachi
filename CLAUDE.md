@@ -75,26 +75,28 @@ docker compose logs -f bot   # 看 ready
 | `src/memory_store.py` | 自搭记忆栈：`memories` 表 ORM + engine + pgvector 索引 |
 | `src/memory_prompts.py` | LLM 抽取 prompt（profile / event JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
 | `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）+ note_turn（短期 buffer）+ maybe_flush（抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
+| `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）prompt |
+| `src/feedback_agent.py` | flush 后异步 fire；监听用户偏好/不满信号，沉淀 prompt_overrides + skill 库（详见 `document/feedback-agent.md`）|
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
 | `src/tools.py` | Agent Reach 工具：URL读取/xhs搜索/Exa搜索 |
 | `src/proactive.py` | 主动搭话：硬门 + LLM 软门 + 每日限额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
-| `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual） |
+| `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
 | `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
 | `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13) |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；三个 tab「记忆项」「图谱（D3 force-directed）」「审计」 |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库）」「审计」 |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
 | `src/openrouter.py` | OpenAI 兼容客户端，主聊天（LLM_PROVIDER=openrouter）+ `scripts/eval_*`；走 Clash 代理 |
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes`
+- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + `prompt_overrides`（per-user 偏好沉淀）/ `skills`（跨用户复用）
 - **记忆栈** via **Postgres + pgvector**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（schema 见 `src/memory_store.py`）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
@@ -133,12 +135,14 @@ recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让�
 
 ## Agent Reach 工具
 
-依赖 CLI 工具（bot 不用重启即可验证）：
+当前生效（2026-05-19 起，容器零额外 binary 依赖）：
 
-- `xhs`：`/Users/yangyu/.local/bin/xhs`（pipx）
-- `mcporter`：`/Users/yangyu/.nvm/versions/node/v24.15.0/bin/mcporter`（nvm）
+- `read_url(url)` — Jina Reader (`https://r.jina.ai/<url>`)，带 `JINA_API_KEY` Bearer
+- `search_web(query)` — Jina Search (`https://s.jina.ai/?q=...`)，复用 `JINA_API_KEY`
+- 历史的 `xhs_search`（pipx xhs）+ Exa via mcporter 已退役（容器没装且账号风控失效）
 
-工具失败静默跳过，不影响聊天。详见 `document/agent-reach-integration.md`。
+工具失败静默跳过，不影响聊天。`_TOOL_DETECT_SYSTEM` 运行时拼今天日期防 LLM 写错年份。
+详见 `document/agent-reach-integration.md`。
 
 ## 常见问题速查
 
@@ -159,6 +163,7 @@ recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让�
 | `document/agent-reach-integration.md` | 工具集成：xhs/Exa/yt-dlp |
 | `document/minimax-integration.md` | MiniMax 接入与坑点 |
 | `document/memory-stack.md` | 自搭记忆栈（postgres+pgvector）+ PRD v2 三层防线实现 |
+| `document/feedback-agent.md` | per-user prompt overrides + Feedback Sub-Agent + skill 库 |
 | `document/memu-setup.md` | （已归档）memU SDK 时代配置；自搭栈替换前的踩坑参考 |
 | `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测/多用户都已落地） |
 | `document/deployment.md` | 云部署（Docker Compose + mihomo + cloudflared + 多用户测试流程） |

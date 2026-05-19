@@ -15,21 +15,24 @@
 
 ## Agent Reach 工具依赖（前置，只需确认一次）
 
-bot 集成了链接读取 + 搜索工具，依赖两个外部 CLI：
-
-- `xhs`（pipx）：`/Users/yangyu/.local/bin/xhs`
-- `mcporter`（npm via nvm）：`/Users/yangyu/.nvm/versions/node/v24.15.0/bin/mcporter`
+bot 的链接读取 + 搜索都走 Jina REST API（`https://r.jina.ai` / `https://s.jina.ai`），
+只需 `.env::JINA_API_KEY`，无外部 CLI 依赖。
 
 验证：
 
 ```bash
-xhs search "测试" --json | head -3        # 有数据 = xhs 正常
-mcporter call 'exa.web_search_exa(query: "test", numResults: 1)'  # 有返回 = mcporter 正常
+# Jina Search（search_web）
+curl -s -H "Authorization: Bearer $JINA_API_KEY" -H "X-Respond-With: no-content" \
+  "https://s.jina.ai/?q=test" | head -5
+
+# Jina Reader（read_url）
+curl -s -H "Authorization: Bearer $JINA_API_KEY" \
+  "https://r.jina.ai/https://example.com" | head -5
 ```
 
 工具不可用时 bot 仍能正常聊天，只是读不了链接/搜不了内容（失败静默跳过）。
 
-**注意 xhs 风控**：账号被风控时 `xhs search` 会返回 `code -104, "您当前登录的账号没有权限访问"`。
+> 历史的 `xhs search` / `mcporter call exa.web_search_exa` 自 2026-05-19 起退役（容器没装且 xhs 账号风控失效）。
 代码里 `search_xhs` 已自动退化到 Exa 网页搜索（`site:xiaohongshu.com`）作为兜底。要恢复
 原生 xhs 搜索，要么换浏览器登录的小红书账号、要么 `xhs login --qrcode` 扫码登另一个号。
 

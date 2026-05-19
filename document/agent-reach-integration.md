@@ -1,98 +1,75 @@
 # Agent Reach 工具能力集成
 
-> 完成日期：2026-04-29。
+> 接入：2026-04-29。**2026-05-19 大改**：mcporter / Exa 退役，search 改 Jina REST；
+> xhs_search 入口取消（账号风控本就失效，并入 web_search）；detect prompt 注入今天日期。
 
 ## 背景
 
-Agent Reach 是一套可插拔的 CLI 工具集，提供小红书搜索/读帖、Exa 语义网页搜索、YouTube/B 站视频元信息等能力。本次把这些能力接入陪伴 agent，让它在感知到用户分享链接或询问具体内容时，能自动拉取实时信息并自然地融入回复——不改变对话风格，不暴露"查资料"过程。
+陪伴 agent 在感知到用户分享链接或问"最近 X"类话题时，能自动拉取实时信息融入回复——
+不改变对话风格、不暴露"查资料"过程。当前生效的工具只剩两条路径：
+- `read_url(url)` — Jina Reader（r.jina.ai）读网页正文
+- `search_web(query)` — Jina Search（s.jina.ai）网页搜索
+
+历史上还有 `search_xhs`（pipx xhs）+ Exa via mcporter，2026-05-19 都退役了，原因见下。
 
 ---
 
-## 安装 Agent Reach
+## 当前工具栈（2026-05-19 起）
 
-### 前提
+只依赖 `JINA_API_KEY`：
+- `read_url(url)` — `https://r.jina.ai/<url>`，Bearer 鉴权
+- `search_web(query)` — `https://s.jina.ai/?q=<query>`，Bearer 鉴权 + `X-Respond-With: no-content`（只要 title/url/desc）
 
-- macOS，Homebrew 已装（用来装 pipx）
-- Clash 代理在 `127.0.0.1:7897`（安装过程涉及 GitHub 下载）
-- nvm 已装，Node 版本 v24.15.0
+容器零额外 binary 依赖，Dockerfile 不需要装 node/pipx/mcporter/xhs。
 
-### 步骤
+## 历史工具退役说明
 
-```bash
-# 1. 用 Homebrew 安装 pipx
-brew install pipx
-pipx ensurepath
+### mcporter / Exa（2026-05-19 退役）
 
-# 2. 安装 agent-reach 本体（含 mcporter，即 Exa 的 MCP 代理）
-# 安装脚本需要通过代理访问 GitHub：
-HTTPS_PROXY=http://127.0.0.1:7897 bash <(curl -s --proxy http://127.0.0.1:7897 \
-  https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md)
+旧 `search_web` 走 `mcporter call exa.web_search_exa(...)` ——`mcporter` 是 npm global、`xhs` 是 pipx，
+本地开发用全局 binary 跑得通；**容器没装** → 所有 `tool_call` 返 0 chars。
 
-# 3. 安装小红书频道
-HTTPS_PROXY=http://127.0.0.1:7897 pipx install xiaohongshu-cli
-# 已安装版本：xiaohongshu-cli 0.6.4
-```
+诊断时间线：
+1. admin 反馈 search 不工作 → audit 看到 `tool_call` 触发但 `result_chars: 0`
+2. `docker exec aidemo-bot which mcporter` → 不存在
+3. 改用 Jina Search REST（已有 `JINA_API_KEY`），免装额外 binary
 
-安装后二进制位置：
-- `xhs`：`/Users/yangyu/.local/bin/xhs`（pipx）
-- `mcporter`：`/Users/yangyu/.nvm/versions/node/v24.15.0/bin/mcporter`（npm global）
+### xhs_search（2026-05-19 退役）
 
----
+xhs 账号被风控（`-104 无权限`），本来就 fallback 到 Exa；现在 Exa 也撤了，xhs 入口完全删除。
+小红书需求统一并入 `web_search`，让 LLM 在 query 里加 `小红书` 关键词即可。
 
-## 小红书 Cookie 认证
-
-`xhs` CLI 通过读取浏览器 Cookie 来认证，核心 Cookie 是 `a1`（长效 session key）。
-
-### 坑：Chrome 的 Cookie 不够
-
-Chrome 登陆小红书后只有 `web_session` + `id_token`，没有 `a1`。`a1` 是小红书 App 流量特有的标识，在 **Safari** 中访问小红书网页版后会写入。
-
-### 正确做法
-
-1. 在 Safari 中打开并登录 `xiaohongshu.com`，完成登录流程。
-2. 给 **VSCode** 授予"完全磁盘访问权限"（系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 添加 VSCode）。
-   - **注意**：只给 Terminal.app 权限不够，因为 Claude Code 以 VSCode subprocess 运行。
-3. 运行 `xhs login --browser safari`，CLI 会扫描 Safari Cookie 数据库，自动提取 `a1` 写入本地配置。
-
-验证：`xhs search "测试" --json` 返回 JSON 数据即为成功。
+> 历史细节（小红书 a1 cookie 认证 / pipx 安装 / Safari 桥接 等）保留在 `me/0508-进展汇总.md` 与
+> 早期 commit history，本文档不再维护。
 
 ---
 
 ## tools.py 模块设计
 
-`src/tools.py` 是所有工具调用的入口，对外暴露四个公共函数：
+`src/tools.py` 当前对外暴露：
 
 | 函数 | 作用 |
 |------|------|
 | `fetch_urls_in_message(text)` | 提取消息里所有 URL，并发读取，返回合并内容字符串 |
-| `search_xhs(keyword)` | 搜索小红书，返回前 5 条笔记标题 + 互动数 |
-| `search_web(query)` | 通过 Exa（mcporter）搜网页，返回摘要 |
-| `read_url(url)` | 通过 Jina Reader 读取网页正文（前 600 字） |
+| `search_web(query)` | Jina Search REST 搜网页，返回 ≤1500 字摘要 |
+| `read_url(url)` | Jina Reader 读取网页正文，返回 ≤600 字 |
 
-### PATH 注入
-
-`asyncio.create_subprocess_exec` 不继承 shell PATH，必须手动补：
-
-```python
-_EXTRA_PATHS = [
-    "/Users/yangyu/.local/bin",                        # pipx: xhs
-    "/Users/yangyu/.nvm/versions/node/v24.15.0/bin",  # mcporter
-    "/opt/homebrew/bin",
-]
-_TOOL_ENV = {**_os.environ, "PATH": ":".join(_EXTRA_PATHS) + ":" + _os.environ.get("PATH", "")}
-```
+`agent._TOOL_FUNCS` 映射只剩 `web_search` / `read_url` 两条路径——LLM detect 时也只会
+选这两个 tool 名，xhs_search 已从 prompt 移除。
 
 ### URL 路由逻辑
 
-`_fetch_one_url(url)` 按域名路由到最合适的读取方式，主方式失败则用 Exa 兜底搜索：
+`_fetch_one_url(url)` 按域名路由：
 
 ```
-小红书域名   → _read_xhs_note()  → xhs read CLI
-B 站域名     → _read_video()     → yt-dlp --dump-json
+小红书域名   → _read_xhs_note()  → xhs CLI（仅本地有 xhs 时；容器跳过）
+B 站域名     → _read_video()     → yt-dlp --dump-json（仅本地有 yt-dlp 时）
 YouTube      → _read_video()     → yt-dlp --dump-json
-其他         → read_url()        → Jina Reader (r.jina.ai, 需代理)
-失败时       → _exa_fetch_url()  → mcporter call exa.web_search_exa (numResults=1)
+其他         → read_url()        → Jina Reader (r.jina.ai)
+失败时       → search_web 兜底  → Jina Search (s.jina.ai)
 ```
+
+容器场景：xhs / yt-dlp 路径都失败 → 直接 fallback 到 Jina Reader / Jina Search。
 
 ### 小红书短链处理
 
@@ -142,7 +119,7 @@ else:
 使用 `tier="aux"`（Sonnet，快且便宜）判断是否需要实时信息：
 
 ```json
-{"needed": true, "tool": "xhs_search|web_search|read_url", "query": "搜索词或URL"}
+{"needed": true, "tool": "web_search|read_url", "query": "搜索词或URL"}
 ```
 
 触发条件（prompt 明确列出）：想了解某平台上的内容、问具体事实、提到网址、想知道最近流行什么。
@@ -168,9 +145,10 @@ messages.append({"role": "user", "content": user_msg})
 
 | 问题 | 根因 | 解决 |
 |------|------|------|
-| `mcporter: command not found` | subprocess 不继承 shell PATH | 手动构造 `_TOOL_ENV` 注入 nvm/pipx 路径 |
-| mcporter 中文变 `\uXXXX` | `json.dumps` 默认 `ensure_ascii=True` | 所有 mcporter call expression 用 `json.dumps(..., ensure_ascii=False)` |
-| Jina 搜索需要 auth | `s.jina.ai` 需要付费 | 改用 `exa.web_search_exa` via mcporter（免费） |
+| 容器 search 全 0 chars | 容器没装 mcporter/xhs | 2026-05-19 改用 Jina Search REST，容器零依赖 |
+| LLM 写 query 用 2025 | baseline 训练截止 | `_TOOL_DETECT_SYSTEM` 运行时拼今天日期 + "今年是 2026" |
+| user 问"你能查 X 吗"被判 false | LLM 当成"问能力" | prompt 加规则：试探口吻 + 具体话题 → needed=true |
+| bot 回"我不联网" | sonnet 默认人设 | `_ROLE_DISCIPLINE` 显式说明"你有 read_url/web_search 工具" |
 | prompts.py SyntaxError | 双引号嵌套中文字符串 | 外层改单引号，内部中文引号用 `"..."` |
 | agent 说"看不了链接" | tool_context 注入 system prompt 末尾，MiniMax 忽略 | 改注入用户消息前缀 |
 | xhslink 短链读不到内容 | Exa 搜索这个 URL 返回 GitHub 的 "xhslink resolver" 项目 | 先 `_resolve_url` 跟随重定向拿真实 URL，再提取 note_id + xsec_token |
@@ -183,17 +161,20 @@ messages.append({"role": "user", "content": user_msg})
 ## 工具可用性确认
 
 ```bash
-# 验证 xhs
-xhs search "穿搭" --json | head -5
+# 验证 Jina Reader（read_url）
+curl -s --max-time 7 -H "Authorization: Bearer $JINA_API_KEY" \
+  "https://r.jina.ai/https://example.com" | head -20
 
-# 验证 mcporter/Exa
-mcporter call 'exa.web_search_exa(query: "Python 教程", numResults: 1)'
+# 验证 Jina Search（search_web）
+curl -s --max-time 10 -H "Authorization: Bearer $JINA_API_KEY" \
+  -H "X-Respond-With: no-content" \
+  "https://s.jina.ai/?q=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("最近大事 2026"))')" | head -20
 
-# 验证 yt-dlp（B站）
+# 验证 yt-dlp（B站，仅本地有）
 yt-dlp --dump-json --no-simulate --quiet "https://www.bilibili.com/video/BV1xx411c7mD"
 
-# 验证 Jina（需代理）
-curl -s --max-time 7 --proxy http://127.0.0.1:7897 "https://r.jina.ai/https://example.com" | head -20
+# 验证 xhs（仅本地有 + 账号未风控时）
+xhs search "穿搭" --json | head -5
 ```
 
 ---

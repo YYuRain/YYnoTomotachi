@@ -45,6 +45,7 @@
 │   ├─ memu_flush_job      每 15m memory.maybe_flush(uid) per user │
 │   │                            └─► persona.update_state(uid) │
 │   │                            └─► _fire_conflict_check (PRD 5.1 异步) │
+│   │                            └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
 │   ├─ persona_consolidate 每日 03:07 (CST) per user 衰减/清旧观察│
 │   ├─ auto_dream          每日 03:13 (CST) memory.auto_dream(uid) (PRD 5.3) │
 │   └─ proactive_job       每 25m per user 软门 LLM 判断 │
@@ -76,7 +77,7 @@
 | `src/interests.py` | 话题抽取（轻量 LLM）+ 热度 bump/decay/top/cold | ✅ MVP |
 | `src/availability.py` | 每次回消息记 (weekday, hour)；`score` 给 proactive 用 | ✅ MVP（带冷启动先验） |
 | `src/emotion.py` | 聊天模式判档：casual / empathy / depth / interest | ✅ MVP |
-| `src/tools.py` | Agent Reach 工具封装：URL 读取路由（xhs/B站/YouTube/通用）+ xhs 搜索（账号风控时退 Exa）+ Exa 网页搜索 | ✅ MVP |
+| `src/tools.py` | Agent Reach 工具封装：URL 读取路由（Jina Reader / yt-dlp 视频）+ Jina Search 网页搜索（2026-05-19 起 mcporter/Exa/xhs 退役）| ✅ MVP |
 | `src/persona.py` | traits/mood/观察/锚点动态层；flush 后增量更新 + 每日 03:07 衰减 | ✅ 接入（2026-05-06） |
 | `src/clock.py` | 中文时间感字符串：`2026-05-08 周五（工作日） 14:32 下午`、`since_phrase` 体感 idle | ✅ 接入（2026-05-07） |
 | `src/stickers.py` | 表情包索引：扫 `data/stickers/`、文件名当 tag、`parse_message` 切 `[sticker:tag]` 段 | ✅ 接入（2026-05-07） |
@@ -89,6 +90,7 @@
 | `src/main.py` | 统一启动/关停（embed_server + prod bot + 可选 test bot + scheduler）；`DEV_SKIP_PROD_BOT=1` 时跳过 prod bot 让本地不抢云端 polling | ✅ MVP |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应 | ✅ MVP |
 | `src/agent.py::generate_welcome` | 用户邀请码激活后立刻生成的"拉对方进对话"第一条消息 | ✅ 接入（2026-05-13） |
+| `src/feedback_prompts.py` / `src/feedback_agent.py` | Sonnet 子 agent + skill 库——监听用户偏好/不满信号，沉淀 prompt_overrides；硬护栏双层防 jailbreak。详见 `feedback-agent.md` | ✅ 接入（2026-05-19） |
 
 ## 数据流 & 存储
 
@@ -100,6 +102,8 @@
   - `persona_snapshots(id, user_id, ts, payload_json)`
   - `users(chat_id PK, status, created_at, note, webui_password)` —— 注册用户表
   - `invite_codes(code PK, created_by, created_at, used_by, used_at)` —— 邀请码
+  - `prompt_overrides(user_id, text, reason, source_skill_id, risk_level, status, ...)` —— per-user 偏好沉淀
+  - `skills(name, summary, body, embedding, created_by, usage_count, ...)` —— 跨用户复用的 prompt 片段库
 - **自搭记忆栈**（postgres + pgvector，2026-05-18 替换原 memU SDK）：长期记忆
   - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json`，调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）→ `_persist_items`（embedding + INSERT 到 `memories` 表）
   - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（pgvector cosine top-k）
