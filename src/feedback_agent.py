@@ -190,6 +190,12 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         return
 
     save_as_skill = bool(decision.get("save_as_skill"))
+    # 兜底：tone_adjust / address_form / scope_change 都是高度个人化偏好，
+    # 强制不沉淀进跨用户 skill 库——即使 LLM 判 save_as_skill=true 也覆盖掉
+    if save_as_skill and intent in ("tone_adjust", "address_form", "scope_change"):
+        log.info("feedback uid=%s 强制 save_as_skill=false（intent=%s 个人化）",
+                 user_id, intent)
+        save_as_skill = False
     new_skill_id = None
     if save_as_skill:
         skill_name = (decision.get("skill_name") or "").strip()

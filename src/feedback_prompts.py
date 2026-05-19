@@ -112,8 +112,15 @@ JUDGE_PROMPT = """# 任务
   - 例：「对方喜欢短促回复，每条不超过 2 句话。」
 
 - **save_as_skill** ∈ [true, false]：这次诉求是否值得沉淀成 skill 给其他用户复用？
-  通用化得越彻底越值得。比如"不要叫宝宝"→ true（很多人都会想要）；
-  "在工作日上午别打扰我"→ false（太私域，每人时段不同）。
+
+  **强制约束**——以下 intent 一律 `save_as_skill=false`，绝不沉淀进跨用户库：
+  - `tone_adjust`（语气、活泼/严肃、是否多用 emoji 等）—— 不同用户偏好相反
+  - `address_form`（怎么称呼对方）—— 私人偏好，每人都不一样
+  - `scope_change`（少反问、不要主动搭话频率等）—— 用户性格不同，标准也不同
+
+  仅当 intent ∈ [`feature_wish`, `capability_request`, `other`] 且诉求**通用、客观、对多数用户都成立**
+  时才 `save_as_skill=true`。例如"对方提到要下班时帮查天气"——可复用通用模板。
+  反例："我喜欢被叫小猫咪"——address_form，false。
 
 - **skill_name**（save_as_skill=true 时必填）：英文 slug，全小写下划线，≤32 字符。
   例："polite_address_no_petname" / "shorter_replies" / "no_rhetorical_questions"
