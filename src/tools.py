@@ -257,10 +257,33 @@ async def search_xhs(keyword: str) -> str:
 
 
 async def search_web(query: str) -> str:
-    """通过 Exa（mcporter）搜索网页，返回摘要。"""
-    call_expr = f"exa.web_search_exa(query: {json.dumps(query, ensure_ascii=False)}, numResults: 3)"
-    raw = await _run("mcporter", "call", call_expr)
-    return raw[:800] if raw else ""
+    """走 Jina Search API（s.jina.ai）。复用 JINA_API_KEY 不引第三方 CLI。
+
+    历史：原来走 Exa via mcporter，但 mcporter 是本地 nvm 装的、容器没有。
+    Jina Search 免费层每月 1M token，对个人项目够用。
+    """
+    if not query.strip():
+        return ""
+    from .config import settings as _settings
+    from urllib.parse import quote as _quote
+    s = _settings()
+    url = f"https://s.jina.ai/?q={_quote(query)}"
+    args = ["curl", "-s", "--max-time", "15"]
+    if s.telegram_proxy:
+        args += ["-x", s.telegram_proxy]
+    if s.jina_api_key:
+        args += ["-H", f"Authorization: Bearer {s.jina_api_key}"]
+    # 默认 Jina 返回长 markdown，截 1500 字让主 LLM 看 3-4 条命中即可
+    args += ["-H", "X-Respond-With: no-content"]  # 只要 title+url+desc，不要全文
+    args.append(url)
+    raw = await _run(*args)
+    if not raw:
+        return ""
+    # 鉴权/限流失败时返回 JSON 错误体
+    if raw.lstrip().startswith("{") and ('"code":4' in raw or 'AuthenticationRequiredError' in raw):
+        log.info("jina search 失败：%s", raw[:120])
+        return ""
+    return raw[:1500]
 
 
 async def read_url(url: str) -> str:
