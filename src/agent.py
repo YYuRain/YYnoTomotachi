@@ -141,7 +141,7 @@ async def _build_turn(
     if user_text and tools._URL_RE.search(user_text):
         tool_task = asyncio.create_task(tools.fetch_urls_in_message(user_text))
     elif user_text:
-        tool_task = asyncio.create_task(_maybe_fetch_context(user_text))
+        tool_task = asyncio.create_task(_maybe_fetch_context(user_text, user_id=user_id))
     else:
         async def _empty() -> str:
             return ""
@@ -258,12 +258,36 @@ _TOOL_FUNCS = {
 }
 
 
-async def _maybe_fetch_context(user_text: str) -> str:
-    """判断是否需要搜索，如需要则执行并返回结果字符串，否则返回空字符串。"""
+async def _maybe_fetch_context(user_text: str, user_id: int | None = None) -> str:
+    """判断是否需要搜索，如需要则执行并返回结果字符串，否则返回空字符串。
+
+    PRD（feedback agent v2）：如果该 user 有 active prompt_overrides 含 trigger 风格指令
+    （"对方说 X 时主动查 Y"），detect 阶段把这些指令也喂给 aux LLM——LLM 看到当前
+    user_text 命中 trigger 时强制 needed=true，按 override 指引生成 query。
+    主 LLM 这一轮 reply 就能直接整合搜到的内容，不会出现"等等让我查"然后没下文的情况。
+    """
+    sys_content = _tool_detect_system()
+    if user_id:
+        try:
+            from . import storage
+            rows = storage.list_active_overrides(user_id)
+        except Exception as e:
+            log.debug("tool_detect: load overrides err uid=%s: %s", user_id, e)
+            rows = []
+        if rows:
+            override_block = "\n".join(f"- {r.text}" for r in rows[:10])
+            sys_content += (
+                "\n\n## 该用户的触发性指令（active prompt_overrides）\n"
+                + override_block
+                + "\n\n如果当前 user 消息**命中**上述任何指令的 trigger 条件（具体的关键词/场景描述），"
+                "**强制 needed=true** 并按指令里的描述构造 query。例如指令说"
+                "「对方说『要走了/下班了』时查 X 城市天气」，user 一旦说「下班！」"
+                "就要 query='X 城市 明日天气'。"
+            )
     try:
         decision = await llm.chat_json(
             [
-                {"role": "system", "content": _tool_detect_system()},
+                {"role": "system", "content": sys_content},
                 {"role": "user", "content": user_text},
             ],
             temperature=0.1,
