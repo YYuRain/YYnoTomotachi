@@ -218,10 +218,32 @@ SKILL_CREATOR_BODY = """# 任务：把"功能希望"转成 trigger-based 指令
 }}
 ```
 
-## 输出
-**严格 JSON**，无围栏，无解释。kind ∈ ["passive", "active"]。
-- kind="passive" 时只填 active_text_for_bot（cron / condition 字段为 null）
-- kind="active" 时三个字段都填"""
+## 输出格式（**强制要求**）
+
+你的整段输出**必须是且只是一个 JSON 对象**，**第一个字符必须是 `{`**，最后一个字符是 `}`。
+**不要写解释段、不要写"我的输出是："、不要包 markdown 围栏、不要分点列表。**
+
+错误示例（不要这样）：
+> 这条诉求是 active 类型...
+> ```json
+> { ... }
+> ```
+
+正确示例（直接这样）：
+{{"kind": "active", "cron_schedule": "30 17 * * 1-5", "condition_prompt": "...", "active_text_for_bot": "..."}}
+
+字段约束：
+- kind ∈ ["passive", "active"]
+- kind="passive" 时：cron_schedule 和 condition_prompt 填 null
+- kind="active" 时：三个字段都必填非空
+- active_text_for_bot **任何情况都必填**（passive 用它做兜底，active 用它做 bot 在主对话流的备份指令）
+
+## 关键判断
+
+如果用户原话**明确强调"不要我主动问 / 你自己主动找我 / 每天/每周固定时段 X"**——
+**强制 kind="active"** 并设合理的 cron_schedule。
+不要把"我希望你定时提醒"误判成 passive。passive 仅用于触发场景**强依赖 user 自然提及**
+（比如"我下次说累了你别问太多"——必须 user 自己说"累了"才该 trigger）。"""
 
 
 # 启动时种入 skills 表的 skill_creator meta-skill
