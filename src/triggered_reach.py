@@ -63,7 +63,7 @@ async def tick() -> None:
 
 async def _try_fire(ov) -> None:
     """跑 sonnet 判 condition + 决定 send / 暂存。"""
-    msg_data = await _judge_and_compose(ov.condition_prompt or "")
+    msg_data = await _judge_and_compose(ov.condition_prompt or "", user_id=ov.user_id)
     if not msg_data or not msg_data.get("should_send"):
         audit("triggered_reach_check",
               user_id=ov.user_id, override_id=ov.id,
@@ -143,18 +143,47 @@ _CONDITION_PARSE_FALLBACK = re.compile(
 )
 
 
-async def _judge_and_compose(condition_prompt: str) -> dict[str, Any]:
+async def _judge_and_compose(
+    condition_prompt: str, *, user_id: int | None = None,
+) -> dict[str, Any]:
     """跑 sonnet 判 condition_prompt → {should_send, message, reason?}。
 
-    condition_prompt 是 user 写好的（来自 skill_creator 输出），里面应该已经说清楚
-    判定标准 + 输出格式。我们这里只负责调 sonnet + 解析 JSON。
+    condition_prompt 是 skill_creator 输出（含场景、查询步骤、消息格式约束）。
+    这里**额外**喂最近对话给 sonnet——让它自己判"刚说过这事没必要再提"，
+    避免主动触达跟最近聊天内容撞车显得刻意。
     """
     if not condition_prompt:
         return {}
+    full_prompt = condition_prompt
+    if user_id:
+        try:
+            from .agent import _recent_per_user
+            recent = _recent_per_user.get(str(user_id), [])
+        except Exception:
+            recent = []
+        if recent:
+            last = recent[-12:]
+            block = "\n".join(
+                f"{m.get('role','?')}: {(m.get('content') or '')[:240]}"
+                for m in last
+            )
+            full_prompt += (
+                "\n\n## 最近对话片段（仅用于查重）\n"
+                + block
+                + "\n\n**唯一额外过滤条件**——上面对话里你**已经提醒过同一信息**才 skip。\n"
+                "判定标准：bot 是否已经把**这次条件成立要发的同样事实**告诉过对方了？"
+                "例如：要发『明天昌平有雨记得带伞』，最近 bot 已经说过『今晚/明天有雨』"
+                "且对方有回应——这种已经传达到，should_send=false。\n\n"
+                "**不要因为以下原因 skip**：\n"
+                "- 对方现在在聊别的事 → 仍然该发（融入主话题的处理在另一层做，你只管判该不该发）\n"
+                "- 觉得『时机不太合适 / 显得刻意』 → 仍然该发，宁多勿漏\n"
+                "- 对方似乎心情/状态不好 → 仍然该发，对方明确请求过这个提醒\n\n"
+                "原则：**没传达过同样信息就一定发**。"
+            )
     try:
         d = await asyncio.wait_for(
             llm.chat_json(
-                [{"role": "user", "content": condition_prompt}],
+                [{"role": "user", "content": full_prompt}],
                 tier="main", temperature=0.1, max_tokens=400,
             ),
             timeout=20.0,
