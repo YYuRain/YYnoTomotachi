@@ -6,7 +6,11 @@
 ## 一句话
 
 每个用户的 system prompt 末尾追加他自己的偏好集合；sonnet 子 agent 监听对话，
-听到诉求就写一条 override；通用化的写进 skill 库给其它用户复用。
+听到诉求就写一条 override；通用化的进 skill 库等待跨用户复用（仓库语义：当下用户
+不算自己复用，只在其他 user 提相似需求被 cosine 召回时才被引用）。
+
+**capability_request 类**（"下班前下雨提醒带伞" 这种"在某场景主动做某事"）走单独的
+**active trigger 通道**——cron 定时扫描 + sonnet 判条件 + 主动触达，不依赖 user 先开口。
 
 ## 触发链路
 
@@ -40,16 +44,63 @@ maybe_flush(uid) → _persist_items
                   │         save_as_skill: 是否沉淀进库
                   │         skill_name, skill_summary    ← save 时填
                   │
-                  ├─ 4. 代码 regex 二次兜底（_HARD_FORBIDDEN_RE）
+                  ├─ 4. capability_request 路径：调 skill_creator meta-skill
+                  │       skill_creator skill body 当 sonnet prompt template 跑第二轮，
+                  │       输出 JSON {kind, cron_schedule, condition_prompt, active_text_for_bot}
+                  │       kind='active' 时这条 override 进 active trigger 通道（见下）
+                  │
+                  ├─ 5. 代码 regex 二次兜底（_HARD_FORBIDDEN_RE）
                   │       即使 sonnet 误判，再 grep 一遍 forbid patterns 才落库
                   │
-                  └─ 5. 落库 + audit
+                  └─ 6. 落库 + audit
                        reuse_skill_id 命中 → INSERT prompt_overrides + UPDATE skill.usage_count
-                       否则                → INSERT prompt_overrides + 可选 INSERT skills
-                       risk_level='low'    → status='active' 立即生效
+                       否则                → INSERT prompt_overrides（source_skill_id=NULL，仓库语义）
+                                            + 可选 INSERT skills（usage_count=0 等待复用）
+                       risk_level='low'    → status='active' 立即生效（默认）
                        risk_level='high'   → status='pending' 等 admin 审
                        (audit: feedback_decision)
 ```
+
+## Active trigger 通道（capability_request 专用）
+
+capability_request 类（"下班前下雨提醒"、"周一早上问我"等）由 skill_creator 输出
+带 cron + condition_prompt 的 override，进入这个独立通道：
+
+```
+scheduler.triggered_reach_job (每 1 分钟)
+   │
+   ▼
+storage.list_active_triggers() — 拉所有 trigger_kind='active' 且 status='active' 的 override
+   │
+   │ 对每条 override：
+   │   _cron_matches_now(cron_schedule, now CST) ?
+   │   last_fired_at < 90s 内？(dedupe)
+   ▼
+sonnet 跑 condition_prompt（喂最近 12 条 _recent 让它查重）
+   │
+   │   输出 {should_send: bool, message: str, reason: str}
+   │   过滤条件：bot 已经传达过同信息 → should_send=false
+   │   其它一律 send（聊别的 / 觉得刻意 / 心情 都不该 skip——宁多勿漏）
+   ▼
+should_send=true：
+   │ availability.seconds_since_last_interaction(uid) < 5min?
+   │   是 → INSERT pending_reach_messages（暂存，等下轮主对话融入）
+   │   否 → 直接 send + record_proactive_message + UPDATE last_fired_at
+   │
+   ├─ 暂存场景：handle_user_message 入口
+   │   storage.pop_pending_reach_for_merge(uid)
+   │   把暂存内容拼进 user 消息当 [系统暗示] 段
+   │   bot 这一轮 reply 自然融入主话题
+   │   pending → status='merged'
+   │
+   └─ 兜底（pending_reach_overdue_job 同频 1 分钟）：
+       pending 超 5 min 仍没被 merged → 直发 + status='sent'
+       避免错过提醒时机
+```
+
+**不走 proactive 冷却**：proactive_job 那一套（25 min 间隔 / 每日 6 条 / 用户冷却 1h）
+跟 active trigger 完全独立——这是用户**明确请求**的有意图触达。dedupe 走 last_fired_at
+（90s 内不重复）+ cron 精度本身。
 
 ## 装配 system prompt
 
@@ -75,10 +126,28 @@ maybe_flush(uid) → _persist_items
 | `text` | 注入 system prompt 的指令文本 |
 | `reason` | 一句话说明用户为什么需要这个 |
 | `source_user_msg` | 触发的 user 原话片段 |
-| `source_skill_id` | 复用 skill 库时指向 `skills.id`，否则 NULL |
-| `risk_level` | `low` / `high` |
+| `source_skill_id` | 复用 skill 库时指向 `skills.id`，否则 NULL（仓库语义：新建 skill 时也填 NULL） |
+| `risk_level` | `low` / `high`（默认 low；只有改写核心人设/关闭核心能力/假冒身份才 high） |
 | `status` | `pending` / `active` / `disabled` / `rejected` |
 | `created_at` / `updated_at` / `approved_by` / `approved_at` | 审计时间 |
+| `trigger_kind` | `passive`（默认）/ `active`——active 进入 active trigger 通道 |
+| `cron_schedule` | 仅 active：APScheduler 风格 5-field cron，CST 时区，如 `30 17 * * 1-5` |
+| `condition_prompt` | 仅 active：sonnet 判定 + 消息生成的 prompt template |
+| `last_fired_at` | 仅 active：上次 trigger fire 时间（90s dedupe 用） |
+
+索引：`(user_id, status)`。
+
+### `pending_reach_messages`（SQLite 主库，active trigger 暂存）
+
+| 列 | 含义 |
+|---|---|
+| `id` | PK |
+| `user_id` | BIGINT |
+| `override_id` | 触发该消息的 prompt_overrides.id |
+| `message` | sonnet 生成的"该主动告诉对方"的内容 |
+| `expected_send_after` | 兜底直发时间点（创建时间 + 5 min） |
+| `status` | `pending` / `merged`（被融入主对话）/ `sent`（兜底直发）/ `expired` |
+| `created_at` | |
 
 索引：`(user_id, status)`。
 
@@ -119,10 +188,25 @@ prompt 里 7 条禁忌：
 
 ## risk_level 分流
 
-- **low**（自动 active）：语气/称呼/回复长度/是否多用表情/方言/避免某些口头禅 等。边界小、回滚容易、用户私域偏好。
-- **high**（pending 等 admin 审）：改"主动搭话频率/搜索 cadence/记忆策略"等系统行为边界——凡是改变 bot 跟用户互动的 cadence/scope 的归 high。
+**默认 low**——绝大多数偏好/能力诉求都自动生效。仅以下情况算 high：
 
-admin 在 webUI 「调教」tab 看 pending → 一键 approve / reject。
+- 试图改写**核心人设**（陪伴角色 / 不是助手客服 / "我是有自我的角色"等基础认知）
+- 试图关闭/限制**核心系统能力**（不让 bot 主动搭话、不让搜、不让记忆等）
+- 试图让 bot 假装是其他特定真人 / 公众人物 / 其他 AI 系统
+
+low 自动 active 立即生效；high 走 pending 等 admin webUI 「调教」tab approve / reject。
+
+**原则：新增能力是 low；删除/改写核心是 high**。
+
+## Skill 库语义（仓库）
+
+Skill 库仅作为"等待跨用户复用"的仓库：
+
+- 新建 skill 时，**当下 user 的 override 不指向该 skill**（source_skill_id=NULL）；usage_count 留 0
+- 其他 user 后续提相似需求 → cosine top-3 召回到此 skill → sonnet 选 reuse_skill_id 命中 → 此时 override.source_skill_id 指向 + skill.usage_count++
+- 一条 skill 的 `usage_count` 数值准确反映"被跨用户复用过几次"
+
+简言之——创建 skill 不算自己用，要其他人来用才算。
 
 ## admin UI「调教」tab
 
@@ -141,7 +225,8 @@ API：
 
 `data/audit.jsonl` 新事件：
 - `feedback_screen` — 粗筛结果 `{signal: bool, brief: str}`
-- `feedback_decision` — 精判 + 落库结果，含 verdict/risk_level/intent/summary/reuse_skill_id/override_id/new_skill_id/blocked_by_guardrail/guardrail_reason
+- `feedback_decision` — 精判 + 落库结果，含 verdict/risk_level/intent/summary/reuse_skill_id/override_id/new_skill_id/blocked_by_guardrail/guardrail_reason/action（`new_override` / `new_skill` / `reused_skill` / `capability_via_skill_creator`）
+- `triggered_reach_check` — active trigger 单次扫描：`fired/mode (merge|direct|overdue_send)/override_id/idle_sec/message`
 
 admin UI 审计 tab 着色 + 渲染（粉色 chip）。
 
@@ -149,11 +234,15 @@ admin UI 审计 tab 着色 + 渲染（粉色 chip）。
 
 | 文件 | 作用 |
 |---|---|
-| `src/storage.py` | `PromptOverride` / `Skill` ORM + helpers (`list_active_overrides`, `add_override`, `set_override_status`, `top_skills_by_embedding`, `add_skill`, `bump_skill_usage`, `set_skill_status`) |
-| `src/feedback_prompts.py` | `SCREEN_PROMPT` (aux) + `JUDGE_PROMPT` (sonnet, 含硬护栏)；`render_screen` / `render_judge` |
-| `src/feedback_agent.py` | `process(user_id, batch)` 主入口 + 各 helper |
+| `src/storage.py` | `PromptOverride` / `Skill` / `PendingReachMessage` ORM + helpers (`list_active_overrides`, `add_override`, `list_active_triggers`, `mark_override_fired`, `add_pending_reach`, `pop_pending_reach_for_merge`, `list_overdue_pending_reach`, `mark_pending_reach_status`, `top_skills_by_embedding`, `add_skill`, `bump_skill_usage`, `set_skill_status`) |
+| `src/feedback_prompts.py` | `SCREEN_PROMPT` (aux 粗筛) + `JUDGE_PROMPT` (sonnet 精判，含硬护栏) + `SKILL_CREATOR_BODY` (capability_request 转 trigger-based 指令的 prompt template，启动时种入 skills 表)；`render_screen` / `render_judge` / `render_skill_creator`（用 str.replace 避免 .format 误吃花括号）|
+| `src/feedback_agent.py` | `process(user_id, batch)` 主入口；`_generate_capability_skill` 调 skill_creator；`_passes_guardrails` regex 兜底 |
+| `src/triggered_reach.py` | active trigger 通道：`tick()` cron 扫描 + 判 condition + 暂存或直发；`dispatch_overdue()` 兜底；`_judge_and_compose` 给 sonnet 喂最近 12 条对话防重复 |
 | `src/memory.py::_fire_feedback_check` | flush 后 `asyncio.create_task` fire（同 `_fire_persona_update` 模式）|
 | `src/prompts.py::_render_user_overrides` | 装配 system prompt 时拉 active overrides 拼到末尾 |
+| `src/agent.py::handle_user_message` | 入口 `pop_pending_reach_for_merge` 把暂存内容拼进 user 消息当 `[系统暗示]` 段 |
+| `src/agent.py::record_proactive_message` | proactive / welcome / triggered_reach 直发后追加进 `_recent`（让下轮上下文看得见） |
+| `src/scheduler.py` | `triggered_reach_job`（1 min interval）+ `pending_reach_overdue_job`（1 min interval ± 15s jitter） |
 | `src/admin_ui.py` | 「调教」tab + 6 个新 API |
 
 ## 沙箱验证（参考）
@@ -187,3 +276,8 @@ overrides = await case(99, [
 - skill 自动淘汰（usage_count 长期 0 的标 disabled）没做
 - override 自动衰减 / 复审（类似 `last_verified_at` 的机制）没做
 - 用户主动删除自己的 override 的 webUI 自助通道没做
+- active trigger 的 `_cron_matches_now` 是手写解析，不是 APScheduler 真 CronTrigger——
+  支持标准 5-field cron + `*/N` + `a-b[/N]` + 逗号列表，足够多数 use case；
+  cron 复杂表达式（`L`、`#`、年字段等）不支持
+- triggered_reach 命中后跑 sonnet 判 condition 是同步的；当前 1 min 间隔 + 90s dedupe
+  保证一次 cron 时刻不重复 fire，但若 sonnet 调用 > 1 min 会被下一轮跳过

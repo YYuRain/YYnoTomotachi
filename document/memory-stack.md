@@ -13,20 +13,20 @@ postgres + pgvector 单表 RAG。flush 时跑 LLM 抽 profile/event 落库，rec
 
 `memories` 表（pgvector + 一些状态字段）：
 
-| 列 | 类型 | 说明 |
-|---|---|---|
-| `id` | UUID PK | |
-| `user_id` | BIGINT NOT NULL, indexed | 跟 SQLAlchemy 端 BIGINT 对齐 |
-| `summary` | TEXT NOT NULL | LLM 抽出的中文事实 |
-| `memory_type` | VARCHAR(32) NOT NULL DEFAULT 'profile' | `profile` / `event` |
-| `embedding` | vector(512) | bge-small-zh-v1.5 出的向量 |
-| `created_at` / `updated_at` | TIMESTAMPTZ | |
-| `evidence_ref` | TEXT | 来源对话 `data/memu_buffer/conv_*.json` 路径 |
-| **PRD v2 状态**：| | |
-| `status` | VARCHAR(16) NOT NULL DEFAULT 'confirmed' | `confirmed` / `to_verify` / `stale` |
-| `confidence` | DOUBLE PRECISION DEFAULT 1.0 | 0.0-1.0；stale=0.0、to_verify=0.5 |
-| `last_verified_at` | TIMESTAMPTZ | 最后一次反验证仍成立的时间（5.2 cooldown 用） |
-| `depends_on` | UUID[] | 触发该条变 to_verify/stale 的上游事实 id 列表（去重） |
+| 列                           | 类型                                       | 说明                                     |
+| --------------------------- | ---------------------------------------- | -------------------------------------- |
+| `id`                        | UUID PK                                  |                                        |
+| `user_id`                   | BIGINT NOT NULL, indexed                 | 跟 SQLAlchemy 端 BIGINT 对齐               |
+| `summary`                   | TEXT NOT NULL                            | LLM 抽出的中文事实                            |
+| `memory_type`               | VARCHAR(32) NOT NULL DEFAULT 'profile'   | `profile` / `event`                    |
+| `embedding`                 | vector(512)                              | bge-small-zh-v1.5 出的向量                 |
+| `created_at` / `updated_at` | TIMESTAMPTZ                              |                                        |
+| `evidence_ref`              | TEXT                                     | 来源对话 `data/memu_buffer/conv_*.json` 路径 |
+| **PRD v2 状态**：              |                                          |                                        |
+| `status`                    | VARCHAR(16) NOT NULL DEFAULT 'confirmed' | `confirmed` / `to_verify` / `stale`    |
+| `confidence`                | DOUBLE PRECISION DEFAULT 1.0             | 0.0-1.0；stale=0.0、to_verify=0.5        |
+| `last_verified_at`          | TIMESTAMPTZ                              | 最后一次反验证仍成立的时间（5.2 cooldown 用）          |
+| `depends_on`                | UUID[]                                   | 触发该条变 to_verify/stale 的上游事实 id 列表（去重）  |
 
 索引：`(user_id, created_at)`、`(user_id, status)`、`embedding USING ivfflat (vector_cosine_ops)` 100+ 行后自动建。
 
@@ -57,9 +57,14 @@ maybe_flush(uid, force) ──► _extract_items: LLM (deepseek-flash) 抽 JSON
 ```
 recall(uid, user_text, top_k=3)
    │
+   │ A 道门：query 太短/纯口头禅 → 跳过 recall（hits=0, skipped_reason）
+   │   _is_low_value_query：CJK<6 / 英文<3 词 / 整句口头禅 regex 命中 → skip
+   │
    │ embed_one(user_text) → 512-dim 向量
    ▼
-SELECT … FROM memories WHERE status != 'stale' ORDER BY embedding <=> :q LIMIT k
+SELECT … FROM memories WHERE status != 'stale'
+  AND (embedding <=> :q) < 0.55  ← B 道门：cosine distance 阈值
+  ORDER BY embedding <=> :q LIMIT k
    │
    │ items 中 status='to_verify' 且 last_verified_at NULL 或 30min 之前 → due 列表
    ▼
@@ -67,7 +72,13 @@ asyncio.gather(*[_reverify_one(uid, item, query) for item in due])  ← PRD 5.2 
    │   每条：拉 deps 上游 → LLM (still_valid / uncertain) → UPDATE
    ▼
 按最新 status 拼 snippets：confirmed 不带前缀；to_verify 带 `[待确认]`
+audit memory_recall 加 distances 数组（admin UI 每条 hit 前显示 d=0.32）
 ```
+
+**精度调优**（`RECALL_MAX_DISTANCE = 0.55`，`RECALL_MIN_QUERY_CJK_CHARS = 6`）：
+- 仍有相关 query 被滤 → 阈值调高（如 0.6）
+- 仍有噪声穿过 → 阈值调低（如 0.45）
+- audit `memory_recall` 每条 hit 自带 `d=` 距离值，admin 直接看分布
 
 ```
 03:13 cron auto_dream_job (CST)

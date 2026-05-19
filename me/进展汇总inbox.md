@@ -67,3 +67,28 @@
 - admin webUI 新增「调教」tab：pending（approve/reject）+ active（disable）+ skill 库（disable）三段；audit 加 `feedback_screen` / `feedback_decision` 着色 + 详细渲染
 - 修 `_persist_items` INSERT 漏 status/confidence 列触发 NotNullViolation（同 migrate 之前的坑）；本地 ORM CREATE 走 default 跑得通，服务器表是 ALTER 加列 PG 不走 ALTER 的 DEFAULT，必须显式补
 - admin UI items 卡片显示更多信息：confidence / source / last_verified_at / updated_at；audit 摘要展开 persona_update 的 observations 内容、conflict_check 的 flip 老条目原文、reverify/dream 的 LLM reason 等
+
+### 2026-05-19 续：主动触达通道 + skill 仓库语义 + 各种修
+
+- **bot 错拒主动能力 + 打包票承诺**：`_ROLE_DISCIPLINE` 加段——明确 bot 有 proactive 能力（不要说"我没法主动"），承诺时谨慎表达（"我跟系统提一下，不一定每次准"）
+- **主动消息进 _recent**：之前 proactive opener 发完没追加进 `_recent_per_user`，下轮 user 回话 bot 看不到刚说的，回"啊？你问哪个哪个"。新加 `agent.record_proactive_message(uid, text)`，scheduler / bot welcome / test_bot welcome / triggered_reach 三处统一调
+- **bot 加 admin /proactive_test 命令**：主进程内手动触发 generate_opener + deliver + record_proactive_message，验证链路
+- **memory.recall 加双门精度过滤**：query 太短/纯口头禅 skip + cosine distance ≤0.55 阈值；audit 加 distances 数组让 admin webUI 看每条 hit 的相似度
+- **search 工具 + bot prompt 一组修**：tools.search_web 走 mcporter 容器没装 → 全 0 chars，改 Jina Search REST；删 xhs_search 入口；_TOOL_DETECT_SYSTEM 加今天日期防 LLM 写 query 用旧年；不管 needed 与否都 audit `tool_decision`；prompt 显式说"你有联网能力，不要说我搜不到"
+- **PRD v2 capability_request 落地**：JUDGE_PROMPT intent 增 `capability_request`；feedback_agent 命中时调 skill_creator meta-skill（特殊 skill 存在 skills 表，body 是 sonnet prompt template）输出 trigger-based 指令；启动时 storage._seed_skill_creator 自动种入
+- **主动触达 channel（active trigger 通道）**：
+  - prompt_overrides 加 `trigger_kind / cron_schedule / condition_prompt / last_fired_at`
+  - skill_creator 升级输出 JSON（含 cron + condition + active_text）；render_skill_creator 改 str.replace 避免 .format 误吃花括号
+  - 新表 `pending_reach_messages`（暂存待主动发的消息）
+  - 新模块 `src/triggered_reach.py`：`tick()` 每分钟扫 cron + 跑 sonnet 判 condition + 喂最近 12 条对话防重复 + 暂存或直发；`dispatch_overdue()` 5min 兜底
+  - scheduler 加 `triggered_reach_job` + `pending_reach_overdue_job`（1min interval）
+  - `handle_user_message` 入口 `pop_pending_reach_for_merge` 把暂存内容拼进 user 消息当 `[系统暗示]` 段，bot 自然融入
+  - 不走 proactive 冷却（独立 dedupe 走 last_fired_at 90s）
+  - audit 新事件 `triggered_reach_check`
+- **risk_level 默认 low + skill 仓库语义**：移除 capability_request 强制 high；JUDGE_PROMPT 收紧 high 仅限"改写核心人设 / 关闭核心能力 / 假冒身份"；新建 skill 时 override.source_skill_id=NULL 不 bump usage_count，仅当跨用户 reuse_skill_id 命中才 +1
+- **个人化偏好禁止沉淀进 skill 库**：JUDGE_PROMPT 强制 tone_adjust / address_form / scope_change 一律 save_as_skill=false；feedback_agent 代码层兜底 + 服务器现存的 lively_tone skill 标 disabled
+- **修 SCREEN_PROMPT 漏识别**：补"capability_request"关键词列表（"以后/下次/每次/如果...就..."）+ 8 条具体例子，让 deepseek-flash 别再判 false
+- **bot prompt 两层禁打包票**：`_ROLE_DISCIPLINE` 显式说"沉淀机制是异步的，你不知道结果"，禁止"我记住了/以后都会"，要"我尽量记着，不一定准"
+- **修 admin webUI 「通过」按钮 500**：admin 容器 `./data:/app/data:ro` 改读写——admin UI 现在要 UPDATE prompt_overrides
+- **修 _persist_items NOT NULL bug**：跟 migrate 脚本同坑，INSERT 没列 status/confidence 时 PG 不走 ALTER DEFAULT，显式补
+- **bot 拼上下文段补 [系统暗示]**：active trigger 暂存内容明确指引 bot "**这一轮的回复**要把这条信息**自然地融入**主话题"，避免硬转/罗列

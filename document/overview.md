@@ -40,17 +40,20 @@
 │  本地服务（main.py 内 asyncio task）                   │
 │   └─ embed_server  :18080  bge-small-zh embedding shim │
 │                                                      │
-│  APScheduler（5 job 各自 fan-out 遍历 users.list_active() with Sem(5)） │
-│   ├─ decay_job           每 1h  interests.decay_tick(uid) per user │
-│   ├─ memu_flush_job      每 15m memory.maybe_flush(uid) per user │
-│   │                            └─► persona.update_state(uid) │
-│   │                            └─► _fire_conflict_check (PRD 5.1 异步) │
-│   │                            └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
-│   ├─ persona_consolidate 每日 03:07 (CST) per user 衰减/清旧观察│
-│   ├─ auto_dream          每日 03:13 (CST) memory.auto_dream(uid) (PRD 5.3) │
-│   └─ proactive_job       每 25m per user 软门 LLM 判断 │
-│                                    └─► generate_opener(uid) │
-│                                    └─► bot.make_send_and_typing(uid) │
+│  APScheduler（7 job 各自 fan-out 遍历 users.list_active() with Sem(5)） │
+│   ├─ decay_job              每 1h  interests.decay_tick(uid) per user │
+│   ├─ memu_flush_job         每 15m memory.maybe_flush(uid) per user │
+│   │                               └─► persona.update_state(uid) │
+│   │                               └─► _fire_conflict_check (PRD 5.1 异步) │
+│   │                               └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
+│   ├─ persona_consolidate    每日 03:07 (CST) per user 衰减/清旧观察│
+│   ├─ auto_dream             每日 03:13 (CST) memory.auto_dream(uid) (PRD 5.3) │
+│   ├─ proactive_job          每 25m per user 软门 LLM 判断 │
+│   │                                └─► generate_opener(uid) │
+│   │                                └─► bot.make_send_and_typing(uid) │
+│   ├─ triggered_reach_job    每 1m  扫 active trigger override (cron match → sonnet 判 │
+│   │                                condition → 暂存或直发，绕开 proactive 冷却) │
+│   └─ pending_reach_overdue  每 1m  pending 超 5min 仍没融入 → 兜底直发 │
 │                                                      │
 │  云部署额外组件（docker-compose）                        │
 │   ├─ postgres   pgvector，跨容器名 `postgres:5432`    │
@@ -84,13 +87,14 @@
 | `src/openrouter.py` | OpenAI 兼容 httpx 客户端；主聊天（LLM_PROVIDER=openrouter，2026-05-10 起）+ `scripts/eval_*`；走 Clash 代理 | ✅ 接入（2026-05-08） |
 | `src/prompts.py` | 装配 system prompt + `PROACTIVE_OPENER_INSTRUCTIONS` + 表情包段 + 四档情绪指令（empathy/depth/interest） | ✅ MVP |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
-| `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener`；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
-| `src/scheduler.py` | APScheduler 五个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13) | ✅ MVP |
+| `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener` + `record_proactive_message`（proactive/welcome/triggered_reach 直发后写 `_recent` 让下轮上下文看见）+ `pop_pending_reach_for_merge`（active trigger 暂存内容拼进 user 消息）；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
+| `src/scheduler.py` | APScheduler 七个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min) | ✅ MVP |
 | `src/bot.py` | 主 bot：邀请码准入门、命令 `/start /myid /memory /invite /users`、激活后调 `agent.generate_welcome` 发开场白；text + photo handler；`send_sticker` 回调 | ✅ MVP |
 | `src/main.py` | 统一启动/关停（embed_server + prod bot + 可选 test bot + scheduler）；`DEV_SKIP_PROD_BOT=1` 时跳过 prod bot 让本地不抢云端 polling | ✅ MVP |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应 | ✅ MVP |
 | `src/agent.py::generate_welcome` | 用户邀请码激活后立刻生成的"拉对方进对话"第一条消息 | ✅ 接入（2026-05-13） |
-| `src/feedback_prompts.py` / `src/feedback_agent.py` | Sonnet 子 agent + skill 库——监听用户偏好/不满信号，沉淀 prompt_overrides；硬护栏双层防 jailbreak。详见 `feedback-agent.md` | ✅ 接入（2026-05-19） |
+| `src/feedback_prompts.py` / `src/feedback_agent.py` | Sonnet 子 agent + skill 库（仓库语义）——监听用户偏好/不满/能力诉求信号，沉淀 prompt_overrides；硬护栏双层防 jailbreak；capability_request 走 skill_creator 输出 trigger-based 指令 | ✅ 接入（2026-05-19） |
+| `src/triggered_reach.py` | active trigger 通道：cron 定时扫 → sonnet 判 condition + 生成消息 → user 在聊就暂存等下轮融入，否则直发；不走 proactive 冷却 | ✅ 接入（2026-05-19） |
 
 ## 数据流 & 存储
 
@@ -102,8 +106,9 @@
   - `persona_snapshots(id, user_id, ts, payload_json)`
   - `users(chat_id PK, status, created_at, note, webui_password)` —— 注册用户表
   - `invite_codes(code PK, created_by, created_at, used_by, used_at)` —— 邀请码
-  - `prompt_overrides(user_id, text, reason, source_skill_id, risk_level, status, ...)` —— per-user 偏好沉淀
-  - `skills(name, summary, body, embedding, created_by, usage_count, ...)` —— 跨用户复用的 prompt 片段库
+  - `prompt_overrides(user_id, text, reason, source_skill_id, risk_level, status, trigger_kind, cron_schedule, condition_prompt, last_fired_at, ...)` —— per-user 偏好沉淀（含 active trigger 字段）
+  - `skills(name, summary, body, embedding, created_by, usage_count, ...)` —— 跨用户复用的 prompt 片段库（仓库语义，含 `skill_creator` meta-skill）
+  - `pending_reach_messages(user_id, override_id, message, expected_send_after, status, ...)` —— active trigger 暂存的待主动发消息
 - **自搭记忆栈**（postgres + pgvector，2026-05-18 替换原 memU SDK）：长期记忆
   - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json`，调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）→ `_persist_items`（embedding + INSERT 到 `memories` 表）
   - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（pgvector cosine top-k）

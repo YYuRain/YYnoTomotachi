@@ -75,8 +75,9 @@ docker compose logs -f bot   # 看 ready
 | `src/memory_store.py` | 自搭记忆栈：`memories` 表 ORM + engine + pgvector 索引 |
 | `src/memory_prompts.py` | LLM 抽取 prompt（profile / event JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
 | `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）+ note_turn（短期 buffer）+ maybe_flush（抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
-| `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）prompt |
-| `src/feedback_agent.py` | flush 后异步 fire；监听用户偏好/不满信号，沉淀 prompt_overrides + skill 库（详见 `document/feedback-agent.md`）|
+| `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
+| `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
+| `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
@@ -86,7 +87,7 @@ docker compose logs -f bot   # 看 ready
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
 | `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
-| `src/scheduler.py` | APScheduler：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13) |
+| `src/scheduler.py` | APScheduler 七个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min) |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库）」「审计」 |
@@ -96,7 +97,7 @@ docker compose logs -f bot   # 看 ready
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + `prompt_overrides`（per-user 偏好沉淀）/ `skills`（跨用户复用）
+- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + `prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）
 - **记忆栈** via **Postgres + pgvector**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（schema 见 `src/memory_store.py`）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
@@ -112,6 +113,7 @@ docker compose logs -f bot   # 看 ready
 **主 bot**（admin 专属，对应 `ADMIN_CHAT_ID`）：
 - `/invite [n]` 生成 n 个邀请码（默认 1）
 - `/users` 看注册用户列表
+- `/proactive_test` 立刻触发一次 proactive opener（在 bot 主进程内调 generate_opener + deliver + record_proactive_message，验证主动消息通道 + `_recent` 写入）
 
 **test bot**（如启用）：
 - `/become <label>` 选虚拟身份（label = alice/bob/数字）
