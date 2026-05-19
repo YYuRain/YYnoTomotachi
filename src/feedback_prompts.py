@@ -252,11 +252,16 @@ SKILL_CREATOR_SUMMARY = "[meta] 把用户的功能希望（capability_request）
 
 
 def render_skill_creator(user_request: str, resource: str, body_template: str) -> str:
-    """body_template 是 skill_creator skill 的 body（默认 SKILL_CREATOR_BODY；admin 可改库里的）。"""
-    return body_template.format(
-        user_request=user_request.strip(),
-        resource=resource.strip(),
-    )
+    """body_template 是 skill_creator skill 的 body（默认 SKILL_CREATOR_BODY；admin 可改库里的）。
+
+    用 str.replace 而不是 .format——body 里有大量字面 `{` `}`（JSON schema 例子等），
+    .format 会把 single brace 当变量名抛 KeyError。约定 placeholder 是
+    `{user_request}` 和 `{resource}`，replace 即可。
+    """
+    out = body_template
+    out = out.replace("{user_request}", user_request.strip())
+    out = out.replace("{resource}", resource.strip())
+    return out
 
 
 def render_judge(
