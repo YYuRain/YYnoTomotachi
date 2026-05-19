@@ -201,8 +201,12 @@ _TOOL_DETECT_SYSTEM = """你是工具调用判断助手。判断用户这条消�
 - 用户想了解某平台（小红书/微博等）上的内容 → xhs_search
 - 提到了某个网址 → read_url
 - 问某件具体事实但答案可能在近期变化
+- **用户用"你能查到吗 / 你试试 / 你查一下 / 你能搜 X 吗"等试探口吻**提到具体人物、事件、时间——
+  这其实是用户想要那个信息，不要把它当作"问 bot 能力"。
+  例："你能查到五月天北京最后一天的演唱会吗" → needed=true, query="五月天 北京 演唱会 最后一天"
 
 不需要查询的情况：闲聊、情绪倾诉、回忆往事、问观点/建议、日常打招呼、问你个人感受。
+"你有 search 吗"这种**纯能力试探**（没附带具体话题）→ needed=false。
 
 如果用户问的是最近/实时的事情，优先 needed=true，不要因为"不确定有没有结果"而放弃搜索。
 
@@ -230,22 +234,35 @@ async def _maybe_fetch_context(user_text: str) -> str:
             max_tokens=80,
             tier="aux",
         )
-        if not decision or not decision.get("needed"):
+        needed = bool(decision and decision.get("needed"))
+        tool_name = (decision or {}).get("tool", "") or ""
+        query = ((decision or {}).get("query", "") or "").strip()
+
+        # 不管 needed 与否都 audit——观测决策本身，方便回查"为什么没触发搜"
+        if not needed:
+            audit("tool_decision", needed=False, user_text=user_text[:200],
+                  tool=tool_name, query=query[:200])
             return ""
-        tool_name = decision.get("tool", "")
-        query = decision.get("query", "").strip()
+
         func = _TOOL_FUNCS.get(tool_name)
         if not func or not query:
+            audit("tool_decision", needed=True, user_text=user_text[:200],
+                  tool=tool_name, query=query[:200],
+                  skipped_reason="unknown_tool" if not func else "empty_query")
             return ""
+
         log.info("tool call: %s(%r)", tool_name, query[:60])
         result = await func(query)
         if result:
             log.info("tool result: %d chars", len(result))
         audit("tool_call", tool=tool_name, query=query[:200],
+              user_text=user_text[:200],
               result_chars=len(result or ""), result_preview=(result or "")[:300])
         return result
     except Exception as e:
         log.debug("tool detect/exec error: %s", e)
+        audit("tool_decision", needed=False, user_text=user_text[:200],
+              skipped_reason=f"err:{type(e).__name__}:{str(e)[:120]}")
         return ""
 
 

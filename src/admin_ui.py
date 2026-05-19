@@ -165,6 +165,7 @@ _INDEX_HTML = """<!doctype html>
   .ev.persona_update, .ev.persona_consolidate { background: #f5edff; color: #7a3fcc; }
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
+  .ev.tool_decision { background: #f7f3e8; color: #886600; }
   .ev.interest_bump { background: #fffbe5; color: #997300; }
   .ev.startup, .ev.shutdown { background: #fdecec; color: #c53b3b; }
   .audit-summary { max-width: 700px; word-break: break-word; }
@@ -340,6 +341,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="proactive_fire">proactive_fire</option>
         <option value="proactive_opener_generated">proactive_opener_generated</option>
         <option value="tool_call">tool_call</option>
+        <option value="tool_decision">tool_decision</option>
         <option value="interest_bump">interest_bump</option>
         <option value="startup">startup</option>
         <option value="shutdown">shutdown</option>
@@ -776,8 +778,17 @@ function summarizeAudit(d) {
       return `<span class="k">idle ${d.idle_sec}s</span>「${t(d.text, 100)}」`;
     case 'tool_call': {
       const head = `<span class="k">${d.tool}</span>"${t(d.query, 60)}" → ${d.result_chars} chars`;
+      const u = d.user_text ? `<div style="color:#888;font-size:11px">用户：${t(d.user_text, 80)}</div>` : '';
       const preview = d.result_preview ? `<div style="color:#888;font-size:11px;margin-top:2px">${t(d.result_preview, 140)}</div>` : '';
-      return head + preview;
+      return head + u + preview;
+    }
+    case 'tool_decision': {
+      const decided = d.needed ? `<span style="color:#1a8a3a">✓ 需要</span>` : `<span style="color:#888">× 跳过</span>`;
+      const tool = d.tool ? `<span class="k">${d.tool}</span>` : '';
+      const skip = d.skipped_reason ? `<span style="color:#d9554f">${t(d.skipped_reason, 60)}</span>` : '';
+      const u = d.user_text ? `<div style="color:#888;font-size:11px">用户：${t(d.user_text, 100)}</div>` : '';
+      const q = d.query ? `<div style="color:#888;font-size:11px">query：${t(d.query, 80)}</div>` : '';
+      return `${decided} ${tool} ${skip}${u}${q}`;
     }
     case 'interest_bump': {
       // topic(heat_before → heat_after) 全部展示
