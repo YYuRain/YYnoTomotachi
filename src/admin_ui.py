@@ -610,7 +610,7 @@ async function _showEpisode(epId) {
         const role = t.role === 'user' ? '👤' : '🤖';
         lines.push(`${role} ${t.content || ''}`);
       }
-      body = lines.join('\n');
+      body = lines.join('\\n');
     }
   } catch (e) {
     body = '加载失败：' + e.message;
