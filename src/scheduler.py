@@ -116,7 +116,10 @@ def build() -> AsyncIOScheduler:
     async def auto_dream_job() -> None:
         """PRD v2 / 5.3：搭便车 persona_consolidate 那班车，03:13 跑批量整理。
 
-        包含两段：memories 三态判定（auto_dream）+ prompt_overrides 冲突整理（auto_dream_overrides）。
+        三段：
+        1. memories 三态判定（auto_dream，per-user）
+        2. prompt_overrides 冲突整理（auto_dream_overrides，per-user）
+        3. skill 库整理（auto_dream_skills，全局一次）
         """
         async def _one(uid: int):
             try:
@@ -128,6 +131,11 @@ def build() -> AsyncIOScheduler:
             except Exception as e:
                 log.warning("auto_dream_overrides uid=%d err: %s", uid, e)
         await _fan_out(_one)
+        # skill 库不分 user，跑一次即可
+        try:
+            await memory.auto_dream_skills()
+        except Exception as e:
+            log.warning("auto_dream_skills err: %s", e)
 
     async def triggered_reach_job() -> None:
         """主动触达 job：每分钟扫所有 active trigger override，cron match 当前时间则跑。

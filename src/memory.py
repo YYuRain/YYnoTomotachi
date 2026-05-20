@@ -991,6 +991,147 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
     return summary
 
 
+SKILL_DREAM_TIMEOUT_SEC = 30.0
+SKILL_DREAM_MIN_COUNT = 2
+SKILL_CREATOR_PROTECTED_NAME = "skill_creator"  # 不参与整理
+
+
+async def auto_dream_skills() -> dict[str, Any]:
+    """整理跨用户 skill 库——合并语义重复 / disable 失效。
+
+    全表扫一次（不是 per-user），每天 03:13 跟 auto_dream / auto_dream_overrides 同班车跑。
+    保护 name='skill_creator' 这条 meta-skill 不动。
+    """
+    from . import storage as _storage
+    from . import embed_client as _ec
+    started = time.time()
+    skills = _storage.list_skills(status="active", limit=500)
+    # 排除 meta-skill
+    candidates = [sk for sk in skills if sk.name != SKILL_CREATOR_PROTECTED_NAME]
+    if len(candidates) < SKILL_DREAM_MIN_COUNT:
+        log.info("skill_dream: 仅 %d 条非 meta active skill，跳过", len(candidates))
+        return {"reviewed": len(candidates), "merged": 0, "disabled": 0}
+
+    valid_ids = {sk.id for sk in candidates}
+
+    prompt = memory_prompts.render_skill_dream(candidates)
+    try:
+        d = await asyncio.wait_for(
+            llm.chat_json(
+                [{"role": "user", "content": prompt}],
+                tier="main", temperature=0.1, max_tokens=2000,
+            ),
+            timeout=SKILL_DREAM_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        log.warning("skill_dream timeout")
+        audit("skill_dream", error="timeout", reviewed=len(candidates),
+              merged=0, disabled=0, latency_ms=int((time.time() - started) * 1000))
+        return {"reviewed": len(candidates), "merged": 0, "disabled": 0, "error": "timeout"}
+    except Exception as e:
+        log.warning("skill_dream LLM err: %s", e)
+        return {"reviewed": len(candidates), "merged": 0, "disabled": 0, "error": str(e)}
+
+    if not isinstance(d, dict):
+        return {"reviewed": len(candidates), "merged": 0, "disabled": 0, "error": "parse_fail"}
+
+    merge_groups = d.get("merge_groups") or []
+    disable_ids = d.get("disable_ids") or []
+    disable_reasons = d.get("disable_reasons") or {}
+
+    n_merged = 0
+    n_disabled = 0
+    actions: list[dict[str, Any]] = []
+    touched: set[int] = set()
+
+    for grp in merge_groups:
+        if not isinstance(grp, dict):
+            continue
+        ids = [int(x) for x in (grp.get("ids") or []) if isinstance(x, (int, str))]
+        ids = [i for i in ids if i in valid_ids and i not in touched]
+        merged_name = (grp.get("merged_name") or "").strip()
+        merged_summary = (grp.get("merged_summary") or "").strip()
+        merged_body = (grp.get("merged_body") or "").strip()
+        reason = (grp.get("reason") or "").strip()
+        if len(ids) < 2 or not merged_name or not merged_body:
+            continue
+
+        # 合并 usage_count（保留累计被复用次数，反映真实价值）
+        sum_usage = sum(sk.usage_count or 0 for sk in candidates if sk.id in ids)
+        # 取第一个被合并的 created_by 当代表
+        first_creator = next(
+            (sk.created_by for sk in candidates if sk.id in ids), 0,
+        )
+
+        # 算 embedding（合并 summary + body 一起 embed）
+        try:
+            vec = await _ec.embed_one(merged_summary + " | " + merged_body)
+        except Exception as e:
+            log.debug("skill_dream embed err: %s", e)
+            vec = None
+        if vec is None:
+            log.warning("skill_dream merge skip uid=meta: embed 失败 group %s", ids)
+            continue
+
+        try:
+            new_skill_id = _storage.add_skill(
+                name=merged_name[:64],
+                summary=merged_summary[:200],
+                body=merged_body,
+                embedding=vec,
+                created_by=first_creator,
+            )
+            # 累加 usage_count（add_skill 默认 0）
+            if sum_usage > 0:
+                with _storage.session() as s:
+                    sk_new = s.query(_storage.Skill).filter(_storage.Skill.id == new_skill_id).first()
+                    if sk_new:
+                        sk_new.usage_count = sum_usage
+                        s.commit()
+            for sid in ids:
+                _storage.set_skill_status(sid, "disabled")
+                touched.add(sid)
+            n_merged += 1
+            actions.append({
+                "kind": "merge", "merged_into": new_skill_id,
+                "from_ids": ids, "merged_name": merged_name,
+                "merged_summary": merged_summary[:200],
+                "preserved_usage": sum_usage, "reason": reason[:200],
+            })
+        except Exception as e:
+            log.warning("skill_dream merge err: %s", e)
+
+    for x in disable_ids:
+        try:
+            sid = int(x)
+        except Exception:
+            continue
+        if sid not in valid_ids or sid in touched:
+            continue
+        try:
+            ok = _storage.set_skill_status(sid, "disabled")
+            if ok:
+                n_disabled += 1
+                actions.append({
+                    "kind": "disable", "id": sid,
+                    "reason": disable_reasons.get(str(sid), "")[:200],
+                })
+                touched.add(sid)
+        except Exception as e:
+            log.warning("skill_dream disable err id=%s: %s", sid, e)
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    summary = {
+        "reviewed": len(candidates),
+        "merged": n_merged,
+        "disabled": n_disabled,
+        "latency_ms": elapsed_ms,
+    }
+    log.info("skill_dream 完成：%s", summary)
+    audit("skill_dream", **summary, actions=actions[:30])
+    return summary
+
+
 def _parse_verdicts(raw: str, *, valid_ids: set[str]) -> dict[str, str]:
     """LLM 输出的 JSON → dict[id → verdict]。strict json 优先，失败回退 regex。"""
     raw = (raw or "").strip()

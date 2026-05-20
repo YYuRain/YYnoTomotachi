@@ -252,10 +252,17 @@ OVERRIDE_DREAM_PROMPT = """# 任务（凌晨整理用户偏好）
    抖机灵、避免过于严肃"。
 
 2. **删（disable）**——
-   - 互相矛盾且能判出哪条更新（按 `created_at` / `last_fired_at` 等暗示）：删旧的
-   - 被另一条**显式覆盖**：例如旧 "叫我亲爱的" 被新 "别叫我亲爱的，叫名字" 取代——删旧的
+   - 互相矛盾且能判出哪条更新（按 `created_at` 时间戳，**新的覆盖旧的**）
+   - 被另一条**显式覆盖**：旧 "叫我亲爱的" 被新 "别叫我亲爱的，叫名字" 取代 → 删旧
+   - 旧条目说 X，新条目说 "不要 X" / "改成 Y" → 旧明显失效，删
    - 一次性表达被错误沉淀（"这次帮我..." 而非长期偏好）：删
-   - **不要因为"风格不一致 / 看着冗余" 等模糊理由删除**——只在事实层面有冲突或失效才删
+   - **以下也算冲突失效**：
+     - 旧 "对方喜欢正式语气" + 新 "对方喜欢俏皮活泼" → 风格反转，删旧
+     - 旧 "回复尽量长" + 新 "回复要短" → 删旧
+     - 旧 active trigger 的 cron 跟新 active trigger cron 同一时段做相反事 → 不动
+       trigger（trigger 类不参与本次整理），但记到 disable_reasons 里 admin 看
+   - **大胆删，不要怕错杀**——admin 在 webUI 看到不对可以恢复（status='disabled' 改回
+     'active'），但漏删让 bot 同时执行矛盾指令体验更差
 
 3. **保留不动**——
    - 互相不冲突的不同偏好（如"叫我名字" + "别用反问句"）→ 保留两条
@@ -284,6 +291,77 @@ OVERRIDE_DREAM_PROMPT = """# 任务（凌晨整理用户偏好）
 
 merge_groups 里的 ids 会被 disable，merged_text 作为新 active override 落库。
 **整段输出必须是且只是一个 JSON 对象**，第一个字符必须是 `{`，最后一个字符是 `}`。"""
+
+
+SKILL_DREAM_PROMPT = """# 任务（凌晨整理 skill 仓库）
+你是 AI 陪伴产品的 skill 库整理员。下面是当前所有 active 的 **跨用户 skill**——
+这些是从用户历史诉求中沉淀出的、可被语义召回复用的指令片段。
+
+## 当前 active skills
+{skills_block}
+
+## 你要做什么
+
+审查这批 skill，**只在显然有问题时动手**：
+
+1. **合并（merge）**——多条在做同一件事（场景相同、动作几乎相同），措辞上拆分意义不大。
+   合并后 name 选最具代表性的，summary 覆盖原全部场景，body 是合并后的指令。
+   例：[A] "polite_address_no_petname"（"不要叫宝贝/亲爱的"）+ [B] "use_real_name"（"称呼名字"）
+   → 合一条 "polite_address_no_petname"，覆盖两个原场景。
+
+2. **删（disable）**——
+   - 完全等价重复（先 active 跨用户复用过几次的留，usage_count 大的优先保留）
+   - skill 内容已经被另一条更全面的 skill 涵盖（被覆盖）
+   - skill 内容是错误的、违反 hard guardrail 的（罕见——硬护栏在写入时已挡，但兜底）
+
+3. **保留不动**——
+   - 场景虽相关但目标不同（"语气俏皮" + "回复简短" 是两件事，保留两条）
+   - 拿不准是不是真重复
+   - **`name='skill_creator'` 这条 meta-skill 绝对不要碰**——它是系统功能不是用户偏好
+
+## 重要约束
+
+- **保留 usage_count 高的**：合并/删除时优先保留被跨用户复用过的（数据反映了通用性）
+- **不要乱合**——name 命名空间是搜索 key，合并后老 name 会丢失（其它用户的 override
+  可能 source_skill_id 指向被合并的）。仅当合并后**确实更精炼且不丢信息**才动
+- 给 disable_ids 写明确的 reason
+
+## 输出格式（严格 JSON，无围栏）
+
+```
+{
+  "merge_groups": [
+    {
+      "ids": [3, 5],
+      "merged_name": "polite_address_no_petname",
+      "merged_summary": "...",
+      "merged_body": "...",
+      "reason": "..."
+    }
+  ],
+  "disable_ids": [7],
+  "disable_reasons": {
+    "7": "被 #3 完全覆盖且 usage_count=0"
+  }
+}
+```
+
+merge_groups 里的 ids 会被 disable，新 skill 用 merged_* 字段建。
+**整段输出必须是且只是一个 JSON 对象**。"""
+
+
+def render_skill_dream(skills: list) -> str:
+    """skills: list of Skill ORM。用 str.replace 避免 .format 撞花括号。"""
+    lines = []
+    for sk in skills:
+        ts = sk.created_at.strftime("%Y-%m-%d") if sk.created_at else "?"
+        lines.append(
+            f"- id={sk.id} name={sk.name} (usage={sk.usage_count}, created={ts})\n"
+            f"  summary: {sk.summary}\n"
+            f"  body: {sk.body[:240]}"
+        )
+    block = "\n".join(lines) if lines else "（空）"
+    return SKILL_DREAM_PROMPT.replace("{skills_block}", block)
 
 
 def render_override_dream(overrides: list) -> str:
