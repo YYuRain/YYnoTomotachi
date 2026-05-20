@@ -348,6 +348,14 @@ _INDEX_HTML = """<!doctype html>
           <tbody id="tune-skills-tbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
         </table>
       </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">🔥 兴趣热度（interests）</h3>
+        <div class="muted" style="font-size:11px;margin-bottom:6px" id="tune-interests-hint">选了具体 user 才显示（admin 看全部用户时这段空）</div>
+        <table>
+          <thead><tr><th style="width:200px">topic</th><th style="width:150px">heat</th><th style="width:160px" class="mono">最后涉及</th><th style="width:160px"></th></tr></thead>
+          <tbody id="tune-interests-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -696,7 +704,7 @@ $('#graph-only-deps').addEventListener('change', loadGraph);
 
 // ============ tune tab ============
 async function loadTune() {
-  await Promise.all([loadTunePending(), loadTuneActive(), loadTuneSkills()]);
+  await Promise.all([loadTunePending(), loadTuneActive(), loadTuneSkills(), loadTuneInterests()]);
 }
 
 const riskChip = (risk) => {
@@ -763,6 +771,55 @@ async function loadTuneActive() {
       if (r.ok) { toast('已停用'); loadTune(); } else toast('失败：' + r.status);
     };
     ops.appendChild(bDis);
+    tb.appendChild(tr);
+  }
+}
+
+async function loadTuneInterests() {
+  const tb = $('#tune-interests-tbody');
+  const hint = $('#tune-interests-hint');
+  if (!_currentUid) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">admin 视图全部用户时不显示——请先在顶部下拉选某个 user</td></tr>';
+    hint.textContent = '选了具体 user 才显示（admin 看全部用户时这段空）';
+    return;
+  }
+  hint.textContent = `当前 user_id=${_currentUid}`;
+  const r = await fetch('/api/interests?limit=100&' + withUid());
+  const j = await r.json();
+  tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">还没有兴趣记录</td></tr>'; return; }
+  for (const it of j) {
+    const tr = el('tr');
+    tr.innerHTML = `
+      <td data-label="topic">${escapeHtml(it.topic || '')}</td>
+      <td data-label="heat">
+        <input type="number" step="0.1" min="0" max="20" value="${Number(it.heat).toFixed(2)}" style="width:90px;padding:4px 6px;border:1px solid var(--bd);border-radius:4px;font-family:ui-monospace,Menlo,monospace" />
+        <button class="op">保存</button>
+      </td>
+      <td class="mono" data-label="最后涉及">${fmt(it.last_touch)}</td>
+      <td class="ops"></td>
+    `;
+    const input = tr.querySelector('input');
+    const bSave = tr.querySelector('.op');
+    bSave.onclick = async () => {
+      const v = parseFloat(input.value);
+      if (Number.isNaN(v) || v < 0) { toast('数值无效'); return; }
+      const r = await fetch(`/api/interests/${encodeURIComponent(it.topic)}?user_id=${encodeURIComponent(_currentUid)}`, {
+        method: 'PATCH', headers: {'content-type': 'application/json'},
+        body: JSON.stringify({ heat: v }),
+      });
+      if (r.ok) { toast('已保存'); loadTuneInterests(); }
+      else toast('失败：' + r.status);
+    };
+    const ops = tr.querySelector('.ops');
+    const bDel = el('button', { class: 'op danger' }, '删除');
+    bDel.onclick = async () => {
+      if (!confirm(`删除 topic「${it.topic}」的兴趣记录？bot 之后聊到这话题会从 0 重新累积`)) return;
+      const r = await fetch(`/api/interests/${encodeURIComponent(it.topic)}?user_id=${encodeURIComponent(_currentUid)}`, { method: 'DELETE' });
+      if (r.ok) { toast('已删除'); loadTuneInterests(); }
+      else toast('失败：' + r.status);
+    };
+    ops.appendChild(bDel);
     tb.appendChild(tr);
   }
 }
@@ -1448,6 +1505,80 @@ def build_app() -> FastAPI:
         ok = storage.set_skill_status(sk_id, "disabled")
         if not ok:
             raise HTTPException(404, "not found")
+        return {"ok": True}
+
+    # ============ 兴趣热度（interests）============
+
+    @app.get("/api/interests")
+    async def interests_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            return []  # admin 必须选某个 user 才看 interests（per-user 数据）
+        from . import storage as _s
+        with _s.session() as sess:
+            rows = list(
+                sess.query(_s.Interest)
+                .filter(_s.Interest.user_id == uid)
+                .order_by(_s.Interest.heat.desc())
+                .limit(limit)
+                .all()
+            )
+        return [
+            {
+                "user_id": r.user_id, "topic": r.topic,
+                "heat": float(r.heat), "last_touch": r.last_touch.isoformat() if r.last_touch else None,
+            }
+            for r in rows
+        ]
+
+    class InterestPatch(BaseModel):
+        heat: float = Field(ge=0.0, le=20.0)
+
+    @app.patch("/api/interests/{topic}")
+    async def interests_patch(
+        topic: str, body: InterestPatch,
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        # 普通用户只能改自己（与 _resolve_uid 已强制）；这里再保险
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import storage as _s
+        from datetime import datetime as _dt
+        with _s.session() as sess:
+            row = sess.get(_s.Interest, (uid, topic))
+            if row is None:
+                raise HTTPException(404, "not found")
+            row.heat = float(body.heat)
+            row.last_touch = _dt.utcnow()
+            sess.commit()
+        return {"ok": True}
+
+    @app.delete("/api/interests/{topic}")
+    async def interests_delete(
+        topic: str,
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import storage as _s
+        with _s.session() as sess:
+            row = sess.get(_s.Interest, (uid, topic))
+            if row is None:
+                raise HTTPException(404, "not found")
+            sess.delete(row)
+            sess.commit()
         return {"ok": True}
 
     return app
