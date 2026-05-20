@@ -35,8 +35,16 @@ FLUSH_EVERY_N_TURNS = 6
 FLUSH_INTERVAL_SEC = 15 * 60  # 或 15 分钟强制一次
 
 # recall 精度门
-RECALL_MIN_QUERY_CJK_CHARS = 6   # query 中文字符 < 这个数 → 不 recall
+# P0-1（2026-05-20）：从 6 → 3。hybrid 时代短 query 走 ngram + entity 路也能命中；
+# 老的 6 阈值是 cosine-only 时代为了防 cosine 短 query 不稳。
+RECALL_MIN_QUERY_CJK_CHARS = 3   # query 中文字符 < 这个数 → 不 recall
 RECALL_MAX_DISTANCE = 0.55       # pgvector cosine distance；越小越相似（0=同方向）。> 这个 → 视为不相关
+
+# P0-1 hybrid retrieval（Mem0 v3 借鉴）：三路候选 + RRF 融合
+HYBRID_CANDIDATES_PER_PATH = 20  # 每路召回多少候选喂给融合
+RRF_K = 60                       # RRF 公式 1/(k+rank)，k=60 是 Cormack et al. 工业默认
+NGRAM_WINDOW = 2                 # query 切 2-char window 做 ILIKE 子串匹配（中文友好）
+NGRAM_MIN_HITS = 1               # 至少命中 1 个 ngram 才算候选
 # 一些不带语义的口头话术，整句直接命中就跳过（超出长度门时兜底）
 _RECALL_STOPWORD_PATTERNS = [
     re.compile(r"^[嗯啊哦哎呀哈呵嘿耶吧呢吗的了"
@@ -45,6 +53,42 @@ _RECALL_STOPWORD_PATTERNS = [
                r"哈哈|哈哈哈|哎|哦哦|没事|挺好|不错|牛|牛逼|可怕|绝了|"
                r"我没事|不影响|不知道|不太懂|我也是|确实是|是这样|就这样)$"),
 ]
+
+
+def _query_ngrams(text: str) -> list[str]:
+    """切 query 成 2-char window 列表，去重 + 去口头禅 + 去过泛 ngram。
+
+    pg_trgm 对中文短词的 similarity 很弱（"上班"和长句的 sim < 0.1），
+    但 GIN trigram 索引加速 ILIKE 子串很快——所以走 ngram + ILIKE 路。
+    例：'草莓音乐节怎么样' → ['草莓','莓音','音乐','乐节'] （后面的 "节怎"/"怎么"/"么样" 被过滤）。
+    """
+    s = (text or "").strip()
+    if len(s) < NGRAM_WINDOW:
+        return []
+    # 抠掉常见标点和口头禅字符
+    skip_chars = set("，。！？!?…~ \t\n.,的了吗呢吧啊呀哦嗯哎哈呵嘿耶")
+    # 过泛 ngram 黑名单——这些 2-char 窗在记忆里出现频次极高、信息量低
+    skip_ngrams = {
+        "什么", "怎么", "怎样", "如何", "为什", "因为", "所以", "然后", "其实",
+        "一下", "一个", "一些", "可以", "可能", "已经", "正在", "应该", "需要",
+        "没有", "还是", "或者", "不过", "但是", "不是", "都是", "就是",
+        "今天", "明天", "昨天", "现在", "刚才", "最近", "之前", "以后",
+        "这个", "那个", "这样", "那样", "哪里", "哪个",
+        "我们", "你们", "他们", "用户", "助手",
+    }
+    seen = set()
+    out: list[str] = []
+    for i in range(len(s) - NGRAM_WINDOW + 1):
+        win = s[i:i + NGRAM_WINDOW]
+        if all(c in skip_chars for c in win):
+            continue
+        if win in skip_ngrams:
+            continue
+        if win in seen:
+            continue
+        seen.add(win)
+        out.append(win)
+    return out[:8]  # 最多 8 个窗，避免 query 过长拖慢
 
 
 def _is_low_value_query(text: str) -> tuple[bool, str]:
@@ -106,18 +150,24 @@ def _fmt_date(dt) -> str:
 
 
 async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
-    """语义召回 top_k 条记忆，每条带形成日期。失败返回空 list，不阻塞主流程。
+    """Hybrid recall（P0-1，Mem0 v3 借鉴 / 2026-05-20）：cosine + ngram + entity 三路 RRF 融合。
 
-    PRD v2 / 5.1：`status = 'stale'` 不召回。
-    PRD v2 / 5.2：召回结果中 `status = 'to_verify'` 且 30min 内没反验证过的，同步跑一次
-    LLM 反验证；still_valid 升回 confirmed，uncertain 保持 to_verify 但打 last_verified_at 戳
-    限速。返回时按最新 status 拼前缀（confirmed 不带，to_verify 带 `[待确认]`）。
+    返回 top_k 条记忆，每条带形成日期。失败返回空 list，不阻塞主流程。
+
+    召回流水：
+    1. A 道门：query 太短/纯口头禅 → 跳过
+    2. cosine 路：embed 后 pgvector 取 top-20，仍带 RECALL_MAX_DISTANCE 上限当噪声底
+    3. ngram 路：query 切 2-char window，对 summary 做 ILIKE substring 命中计数（pg_trgm
+       GIN 索引加速）。比纯 pg_trgm similarity 对中文短词友好。
+    4. entity 路：query 包含 mem.entities 中任一 entity 子串 → 命中数排序 top-20
+    5. RRF 融合：score = Σ 1/(RRF_K + rank_in_path)；按 score 取 top_k
+    6. 5.2 反验证：到 5 步幸存的 to_verify 条目同步跑 LLM 反验证（>30min 没验过的）
 
     格式：`(2026-05-15) 用户最近在减肥` 或 `(2026-05-15) [待确认] ...`
     """
     uid_str = _uid(user_id)
     snippets: list[str] = []
-    distances: list[float] = []
+    audit_paths: dict[str, Any] = {"cosine": 0, "ngram": 0, "entity": 0}
     # A 道门：query 太短/纯口头禅 → 不浪费 embed call
     skipped, skip_reason = _is_low_value_query(user_text)
     if skipped:
@@ -129,37 +179,112 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
     try:
         vec = await embed_client.embed_one(user_text)
         if vec is None:
-            log.debug("recall uid=%s: embed 失败，跳过 RAG", uid_str)
-            audit("memory_recall", user_id=user_id, query=user_text[:200], hits=0, snippets=[])
-            return []
-
+            log.debug("recall uid=%s: embed 失败，跳过 cosine 路（其他路仍走）", uid_str)
         eng = memory_store.engine()
-        # B 道门：cosine 距离阈值——只取距离 < RECALL_MAX_DISTANCE 的
-        # 拿距离一起回来方便 audit
+
+        # ---- 三路并行候选拉取（一个 connection 内顺序执行就行，候选量都不大）----
+        cand_per_path: dict[str, list[dict[str, Any]]] = {}
         with eng.connect() as conn:
-            rows = conn.execute(
+            # 路 1：cosine（保留 distance 上限当噪声底）
+            cosine_rows = []
+            if vec is not None:
+                cosine_rows = conn.execute(
+                    sql_text(
+                        "SELECT id::text AS id, summary, created_at, status, "
+                        "last_verified_at, depends_on, entities, "
+                        "(embedding <=> CAST(:q AS vector)) AS dist "
+                        "FROM memories "
+                        "WHERE user_id = :uid AND status != 'stale' "
+                        "AND embedding IS NOT NULL "
+                        "AND (embedding <=> CAST(:q AS vector)) < :max_dist "
+                        "ORDER BY embedding <=> CAST(:q AS vector) "
+                        "LIMIT :k"
+                    ),
+                    {"uid": user_id, "q": embed_client.vec_literal(vec),
+                     "k": HYBRID_CANDIDATES_PER_PATH,
+                     "max_dist": RECALL_MAX_DISTANCE},
+                ).fetchall()
+            cand_per_path["cosine"] = [_row_to_item(r, dist=True) for r in cosine_rows]
+            audit_paths["cosine"] = len(cosine_rows)
+
+            # 路 2：ngram-ILIKE（中文短词友好；pg_trgm GIN 索引加速 ILIKE '%xxx%'）
+            # 把 query 切 2-char window 列表，每个 window 在 summary 里 substring 命中算 1 分
+            ngrams = _query_ngrams(user_text)
+            if ngrams:
+                # 动态拼 OR 子句：每个 ngram 一个 ILIKE，得分 = 命中 ngram 数
+                ilike_clauses = [
+                    f"(summary ILIKE :ng{i})" for i in range(len(ngrams))
+                ]
+                hits_expr = " + ".join(
+                    f"(CASE WHEN summary ILIKE :ng{i} THEN 1 ELSE 0 END)"
+                    for i in range(len(ngrams))
+                )
+                params: dict[str, Any] = {
+                    "uid": user_id,
+                    "k": HYBRID_CANDIDATES_PER_PATH,
+                    "min_hits": NGRAM_MIN_HITS,
+                }
+                for i, ng in enumerate(ngrams):
+                    params[f"ng{i}"] = f"%{ng}%"
+                ngram_rows = conn.execute(
+                    sql_text(
+                        "SELECT id::text AS id, summary, created_at, status, "
+                        "last_verified_at, depends_on, entities, "
+                        f"({hits_expr}) AS hits "
+                        "FROM memories "
+                        "WHERE user_id = :uid AND status != 'stale' "
+                        f"AND ({' OR '.join(ilike_clauses)}) "
+                        f"AND ({hits_expr}) >= :min_hits "
+                        "ORDER BY hits DESC, created_at DESC "
+                        "LIMIT :k"
+                    ),
+                    params,
+                ).fetchall()
+            else:
+                ngram_rows = []
+            cand_per_path["ngram"] = [_row_to_item(r) for r in ngram_rows]
+            audit_paths["ngram"] = len(ngram_rows)
+
+            # 路 3：entity（query 字面包含 mem.entities 中任一 entity 子串）
+            ent_rows = conn.execute(
                 sql_text(
                     "SELECT id::text AS id, summary, created_at, status, "
-                    "last_verified_at, depends_on, "
-                    "(embedding <=> CAST(:q AS vector)) AS dist "
+                    "last_verified_at, depends_on, entities, "
+                    "(SELECT count(*) FROM unnest(entities) e "
+                    "  WHERE :q ILIKE '%' || e || '%') AS hits "
                     "FROM memories "
                     "WHERE user_id = :uid AND status != 'stale' "
-                    "AND (embedding <=> CAST(:q AS vector)) < :max_dist "
-                    "ORDER BY embedding <=> CAST(:q AS vector) "
+                    "AND entities IS NOT NULL "
+                    "AND EXISTS (SELECT 1 FROM unnest(entities) e "
+                    "  WHERE :q ILIKE '%' || e || '%') "
+                    "ORDER BY hits DESC, created_at DESC "
                     "LIMIT :k"
                 ),
-                {"uid": user_id, "q": embed_client.vec_literal(vec),
-                 "k": top_k, "max_dist": RECALL_MAX_DISTANCE},
+                {"uid": user_id, "q": user_text[:500],
+                 "k": HYBRID_CANDIDATES_PER_PATH},
             ).fetchall()
+            cand_per_path["entity"] = [_row_to_item(r) for r in ent_rows]
+            audit_paths["entity"] = len(ent_rows)
 
-        items = [
-            {
-                "id": r[0], "summary": r[1], "created_at": r[2],
-                "status": r[3], "last_verified_at": r[4], "depends_on": r[5],
-                "dist": float(r[6]) if r[6] is not None else None,
-            }
-            for r in rows
-        ]
+        # ---- RRF 融合 ----
+        rrf_score: dict[str, float] = {}
+        item_by_id: dict[str, dict[str, Any]] = {}
+        per_path_rank: dict[str, dict[str, int]] = {}
+        for path_name, items_p in cand_per_path.items():
+            per_path_rank[path_name] = {}
+            for rank, it in enumerate(items_p, start=1):
+                rid = it["id"]
+                rrf_score[rid] = rrf_score.get(rid, 0.0) + 1.0 / (RRF_K + rank)
+                per_path_rank[path_name][rid] = rank
+                # 第一次见保留所有字段，后面只更新 distance（cosine 路独有）
+                if rid not in item_by_id:
+                    item_by_id[rid] = it
+                elif it.get("dist") is not None and item_by_id[rid].get("dist") is None:
+                    item_by_id[rid]["dist"] = it["dist"]
+
+        # 取 top_k
+        ranked_ids = sorted(rrf_score, key=lambda x: rrf_score[x], reverse=True)[:top_k]
+        items = [item_by_id[rid] for rid in ranked_ids]
 
         # 5.2：找需要反验证的
         now = datetime.now(timezone.utc)
@@ -203,6 +328,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                             {"ts": now, "id": it["id"]},
                         )
 
+        distances: list[float] = []
         for it in items:
             date = _fmt_date(it["created_at"])
             marker = "[待确认] " if it["status"] == "to_verify" else ""
@@ -212,10 +338,13 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                 distances.append(round(it["dist"], 3))
     except Exception as e:
         log.debug("recall uid=%s 失败：%s", uid_str, e)
+        distances = []
 
     log.info(
-        "recall uid=%s query=%r → %d hits%s",
+        "recall uid=%s query=%r → %d hits (paths: cos=%d ng=%d ent=%d)%s",
         uid_str, user_text[:40], len(snippets),
+        audit_paths.get("cosine", 0), audit_paths.get("ngram", 0),
+        audit_paths.get("entity", 0),
         ("：" + " | ".join(s[:40] for s in snippets[:3])) if snippets else "",
     )
     audit(
@@ -226,8 +355,24 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
         snippets=[s[:200] for s in snippets[:top_k]],
         distances=distances[:top_k],
         max_distance_threshold=RECALL_MAX_DISTANCE,
+        candidates_per_path=audit_paths,
     )
     return snippets[:top_k]
+
+
+def _row_to_item(row, *, dist: bool = False) -> dict[str, Any]:
+    """SQL row → dict。三路 SELECT 列顺序保持一致：id/summary/created_at/status/
+    last_verified_at/depends_on/entities/[最后一列各路自己的分数]。"""
+    return {
+        "id": row[0],
+        "summary": row[1],
+        "created_at": row[2],
+        "status": row[3],
+        "last_verified_at": row[4],
+        "depends_on": row[5],
+        "entities": row[6],
+        "dist": float(row[7]) if dist and row[7] is not None else None,
+    }
 
 
 # ============ 短期 buffer ============
@@ -1211,10 +1356,11 @@ _ITEM_RE = re.compile(
 )
 
 
-def _parse_items_loose(raw: str) -> list[tuple[str, str]]:
-    """从 LLM 输出抠出 (type, content) pairs。
+def _parse_items_loose(raw: str) -> list[tuple[str, str, list[str]]]:
+    """从 LLM 输出抠出 (type, content, entities) 三元组。
 
     第一道：strict json.loads 整体；第二道：regex 逐个对象抠（防 LLM 中间漏字段时全部失败）。
+    entities：P0-1 抽取的关键实体词列表（人名/地名/作品/物品等），fallback 路径给空。
     """
     raw = (raw or "").strip()
     if not raw:
@@ -1234,27 +1380,35 @@ def _parse_items_loose(raw: str) -> list[tuple[str, str]]:
             except Exception:
                 parsed = None
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, list[str]]] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
         for it in parsed["items"]:
             if not isinstance(it, dict):
                 continue
             t = (it.get("type") or "").strip()
             c = (it.get("content") or "").strip()
+            ents_raw = it.get("entities") or []
+            ents: list[str] = []
+            if isinstance(ents_raw, list):
+                for e in ents_raw[:5]:  # cap at 5 per item
+                    if isinstance(e, str):
+                        es = e.strip()[:12]
+                        if es:
+                            ents.append(es)
             if t in ("profile", "event") and c:
-                out.append((t, c[:300]))
+                out.append((t, c[:300], ents))
         return out
 
-    # 兜底：strict 失败 → regex 逐对象抠
+    # 兜底：strict 失败 → regex 逐对象抠（fallback 路径丢 entities，给空列表）
     for m in _ITEM_RE.finditer(raw):
         t = m.group(1)
         c = m.group(2).encode().decode("unicode_escape", errors="ignore").strip()
         if c:
-            out.append((t, c[:300]))
+            out.append((t, c[:300], []))
     return out
 
 
-async def _extract_items(batch: list[dict[str, str]]) -> list[tuple[str, str]]:
+async def _extract_items(batch: list[dict[str, str]]) -> list[tuple[str, str, list[str]]]:
     """跑 LLM 抽取，返回 [(type, content), ...]。"""
     if not batch:
         return []
@@ -1293,30 +1447,31 @@ async def _extract_items(batch: list[dict[str, str]]) -> list[tuple[str, str]]:
 
 async def _persist_items(
     user_id: int,
-    items: list[tuple[str, str]],
+    items: list[tuple[str, str, list[str]]],
     *,
     evidence_ref: str | None = None,
     source_episode_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """对每条 (type, content) 算 embedding 并 INSERT 到 memories。
+    """对每条 (type, content, entities) 算 embedding 并 INSERT 到 memories。
 
-    返回 list[dict]，每条 dict 含 id / summary / memory_type / embedding（可能 None）；
+    返回 list[dict]，每条 dict 含 id / summary / memory_type / embedding / entities；
     上层既用这个填 audit，也喂 _fire_conflict_check 复用 embedding。
 
-    P0-4: source_episode_id 是 episodes 表中的 raw turns 反查用——5.2/5.3 LLM 拿
-    原始上下文判断；admin UI 点条目跳"当时聊了啥"。
+    P0-4: source_episode_id 反查原始 turns。
+    P0-1: entities 给 hybrid retrieval 的 entity 路用。
     """
     if not items or not user_id:
         return []
-    summaries = [c for _t, c in items]
+    summaries = [c for _t, c, _e in items]
     vecs = await embed_client.embed_many(summaries)
 
     eng = memory_store.engine()
     now = datetime.now(timezone.utc)
     inserted: list[dict[str, Any]] = []
     with eng.begin() as conn:
-        for (t, c), vec in zip(items, vecs):
+        for (t, c, ents), vec in zip(items, vecs):
             new_id = str(_uuid.uuid4())
+            ents_param = ents if ents else None  # 空列表写 NULL 比 {} 干净
             params: dict[str, Any] = {
                 "id": new_id,
                 "user_id": user_id,
@@ -1326,19 +1481,21 @@ async def _persist_items(
                 "updated_at": now,
                 "evidence_ref": evidence_ref,
                 "source_episode_id": source_episode_id,
+                "entities": ents_param,
             }
             # status / confidence 必须显式给——这俩列在 ALTER 加的时候 NOT NULL，
             # raw INSERT 不走 ORM default、PG 也不会自动填 ALTER 设的 default。
-            # source_episode_id 走 CAST(:source_episode_id AS uuid)；NULL 安全。
+            # source_episode_id / entities 走 CAST；NULL 安全。
             if vec is not None:
                 params["embedding"] = embed_client.vec_literal(vec)
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, embedding, "
-                        "created_at, updated_at, evidence_ref, status, confidence, source_episode_id) "
+                        "created_at, updated_at, evidence_ref, status, confidence, "
+                        "source_episode_id, entities) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
                         "CAST(:embedding AS vector), :created_at, :updated_at, :evidence_ref, "
-                        "'confirmed', 1.0, CAST(:source_episode_id AS uuid))"
+                        "'confirmed', 1.0, CAST(:source_episode_id AS uuid), :entities)"
                     ),
                     params,
                 )
@@ -1346,12 +1503,16 @@ async def _persist_items(
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, "
-                        "created_at, updated_at, evidence_ref, status, confidence, source_episode_id) "
+                        "created_at, updated_at, evidence_ref, status, confidence, "
+                        "source_episode_id, entities) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
                         ":created_at, :updated_at, :evidence_ref, 'confirmed', 1.0, "
-                        "CAST(:source_episode_id AS uuid))"
+                        "CAST(:source_episode_id AS uuid), :entities)"
                     ),
                     params,
                 )
-            inserted.append({"id": new_id, "summary": c, "memory_type": t, "embedding": vec})
+            inserted.append({
+                "id": new_id, "summary": c, "memory_type": t,
+                "embedding": vec, "entities": ents,
+            })
     return inserted

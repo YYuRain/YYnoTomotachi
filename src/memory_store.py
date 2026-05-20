@@ -58,6 +58,11 @@ class Memory(Base):
     # 抽这条 memory 时 buffer 的原始 turns 落在 episodes 表，这里反查用
     source_episode_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
+    # P0-1（2026-05-20，Mem0 v3 hybrid retrieval 借鉴）：entity boost 用
+    # 抽 profile/event 时 LLM 同步输出 entities（人名/地名/爱好/物品等关键 token）
+    # recall 走 RRF 融合 cosine + summary trigram + entity 交集三路
+    entities = Column(ARRAY(Text), nullable=True)
+
     __table_args__ = (
         Index("ix_memories_user_created", "user_id", "created_at"),
         Index("ix_memories_user_status", "user_id", "status"),
@@ -99,16 +104,19 @@ def _db_url() -> str:
 
 
 def engine():
-    """单例 SQLAlchemy engine。第一次调用会建表 + 启用 pgvector + 建 ivfflat 索引。"""
+    """单例 SQLAlchemy engine。第一次调用会建表 + 启用 pgvector / pg_trgm + 建索引。"""
     global _engine
     if _engine is not None:
         return _engine
     _engine = create_engine(_db_url(), future=True)
     with _engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        # P0-1: pg_trgm 给 BM25-like 文本 ranking 用
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     Base.metadata.create_all(_engine)
     _ensure_v2_columns()
     _ensure_vector_index()
+    _ensure_text_indexes()
     log.info("memory_store engine ready (memories table)")
     return _engine
 
@@ -132,6 +140,8 @@ def _ensure_v2_columns() -> None:
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_episode_id UUID NULL",
         "CREATE INDEX IF NOT EXISTS ix_memories_source_episode "
         "ON memories (source_episode_id)",
+        # P0-1 entities（2026-05-20）
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS entities TEXT[] NULL",
     ]
     try:
         with _engine.begin() as conn:  # type: ignore[union-attr]
@@ -139,6 +149,26 @@ def _ensure_v2_columns() -> None:
                 conn.execute(text(ddl))
     except Exception as e:
         log.warning("memories v2 列升级失败：%s", e)
+
+
+def _ensure_text_indexes() -> None:
+    """P0-1: BM25/entity 路的索引——pg_trgm 已在 engine() 装；这里建 GIN。
+
+    - summary trigram GIN：similarity(summary, q) 走得快；
+    - entities GIN：`entities && ARRAY[...]` 交集查询走得快。
+    """
+    ddls = [
+        "CREATE INDEX IF NOT EXISTS ix_memories_summary_trgm "
+        "ON memories USING GIN (summary gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_memories_entities_gin "
+        "ON memories USING GIN (entities)",
+    ]
+    try:
+        with _engine.begin() as conn:  # type: ignore[union-attr]
+            for ddl in ddls:
+                conn.execute(text(ddl))
+    except Exception as e:
+        log.warning("text indexes 创建失败：%s", e)
 
 
 def _ensure_vector_index() -> None:
