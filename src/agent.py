@@ -497,15 +497,21 @@ async def generate_welcome(user_id: int) -> str:
 async def generate_opener(user_id: int, context: dict | None = None) -> str:
     """scheduler 主动发起时用这个。
     context 由 proactive.decide 提供：user_probably_doing / opener_angle / recent_topics。
-    没 context 就退回旧的通用指令。"""
+    没 context 就退回旧的通用指令。
+
+    PRD：必须看 recent + active overrides——避免选已聊过的话题作 opener_angle，
+    避免跟用户表达过的偏好冲突。
+    """
     persona = load_persona_state(user_id)
     top = interests.top(user_id, 5)
     cold_ = interests.cold(user_id, 3)
+    # 传 user_id → build_system_prompt 把 active overrides 拼到 prompt 末尾
     sys_prompt = prompts.build_system_prompt(
         persona=persona,
         memories=[],  # 主动开场不主推记忆，避免显得在翻旧账
         interests_top=top,
         interests_cold=cold_,
+        user_id=user_id,
     )
     hint = prompts.render_proactive_opener(context) if context else prompts.PROACTIVE_OPENER_INSTRUCTIONS
     bits = [f"现在 {clock.now_signal()}"]
@@ -513,10 +519,11 @@ async def generate_opener(user_id: int, context: dict | None = None) -> str:
     if idle_sec != float("inf") and idle_sec > 30:
         bits.append(f"距上次聊 {clock.since_phrase(idle_sec)}")
     hint = "[" + "｜".join(bits) + "]\n\n" + hint
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": hint},
-    ]
+    # 把最近 recent 也喂进去——避免写出"问昨天淋雨没"这种已经聊过的话
+    recent_msgs = list(_recent_per_user.get(str(user_id), []))[-_SHORT_WINDOW * 2 :]
+    messages = [{"role": "system", "content": sys_prompt}]
+    messages.extend(recent_msgs)
+    messages.append({"role": "user", "content": hint})
     text = await llm.chat(messages, temperature=1.0, max_tokens=200)
     text = text.strip()
     audit("proactive_opener_generated", user_id=user_id, text=text, context=context or {},

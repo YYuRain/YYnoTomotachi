@@ -59,6 +59,15 @@ _DECIDE_SYSTEM = """你要决定：现在这个时间点，作为一个普通朋
   - 周末晚 23-1 点比工作日凌晨宽松得多。
   - 当作"朋友会不会这个点给我发微信"来判断。
 
+**关于 recent_history（最近对话片段）和 active_overrides（用户偏好）——非常重要**：
+- `recent_history` 是你跟对方刚聊过的话。**选 opener_angle 时要避开里面已经覆盖的话题**——
+  比如 history 里已经聊完"昨天没下雨/伞在家没事"，就不要选"问昨天淋雨没"这种重复角度
+- `active_overrides` 是用户表达过的偏好/触发指令。如果其中某条已经能覆盖你想说的事
+  （比如用户已请求"下雨提醒带伞"，主动通道会自动管这件事），你就别再凑这个角度
+- 选 opener_angle 时优先**没在 recent_history 出现过的新话题** / 用户感兴趣但近期没聊的事
+- 如果 recent_history 显示对方刚有过情绪倾诉（累/烦躁），且话题没自然结束 → 一般 should=false
+  （让对方先消化），除非你想接着上一条情绪做软回应
+
 输出严格 JSON：
 {
   "should": true|false,
@@ -153,12 +162,36 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
     score = availability.score(user_id, now.weekday(), now.hour)
     top = [t for t, _ in interests.top(user_id, 6)]
 
+    # 拉最近对话片段——避免 LLM 选一个已聊过/已回答过的话题作为 opener_angle
+    recent_history: list[str] = []
+    try:
+        from .agent import _recent_per_user
+        rec = _recent_per_user.get(str(user_id), [])
+        for m in rec[-12:]:
+            role = "user" if m.get("role") == "user" else "asst"
+            content = (m.get("content") or "").strip().replace("\r", "")
+            if content:
+                recent_history.append(f"{role}: {content[:200]}")
+    except Exception as e:
+        log.debug("proactive decide load recent err uid=%s: %s", user_id, e)
+
+    # 拉 active overrides——LLM 选 angle 时要尊重用户已表达的偏好
+    active_overrides: list[str] = []
+    try:
+        from . import storage as _storage
+        for o in _storage.list_active_overrides(user_id)[:8]:
+            active_overrides.append(o.text[:200])
+    except Exception as e:
+        log.debug("proactive decide load overrides err uid=%s: %s", user_id, e)
+
     ctx: dict[str, Any] = {
         "now": now.strftime("%H:%M"),
         "weekday": _WEEKDAYS[now.weekday()],
         "hours_since_user_last_msg": round(idle_sec / 3600, 1),
         "user_active_score_now": round(score, 2),
         "recent_topics": top,
+        "recent_history": recent_history,
+        "active_overrides": active_overrides,
         "opens_today": today_count,
         "daily_cap": DAILY_CAP,
     }
