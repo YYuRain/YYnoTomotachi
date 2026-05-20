@@ -889,8 +889,8 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
         log.info("override_dream uid=%s: 仅 %d 条 active，跳过", user_id, len(overrides))
         return {"reviewed": len(overrides), "merged": 0, "disabled": 0}
 
-    # active trigger（带 cron）的 override 不参与合并/删除——配置会破坏
-    # 但仍喂给 LLM 看（参考），让它输出时忽略这些 id
+    # active trigger（带 cron）：不能参与 merge（merge 会丢 cron / condition_prompt）；
+    # 但**可以被 disable**——如果几条 trigger 互相重叠/冲突，留最优的、disable 其它
     valid_ids = {o.id for o in overrides}
     triggered_ids = {o.id for o in overrides if (o.trigger_kind or "passive") == "active"}
 
@@ -958,13 +958,13 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
         except Exception as e:
             log.warning("override_dream merge err uid=%s: %s", user_id, e)
 
-    # 再处理 disable_ids
+    # 再处理 disable_ids（active trigger 可以被 disable，仅 merge 时才排除）
     for x in disable_ids:
         try:
             oid = int(x)
         except Exception:
             continue
-        if oid not in valid_ids or oid in triggered_ids or oid in touched_ids:
+        if oid not in valid_ids or oid in touched_ids:
             continue
         try:
             from . import storage as __st

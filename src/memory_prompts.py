@@ -267,8 +267,16 @@ OVERRIDE_DREAM_PROMPT = """# 任务（凌晨整理用户偏好）
 3. **保留不动**——
    - 互相不冲突的不同偏好（如"叫我名字" + "别用反问句"）→ 保留两条
    - 拿不准是不是矛盾 → 保留
-   - active trigger 类（带 cron 的 capability）即使有内容相关也**绝对不要合并**——
-     trigger 配置会被破坏。`trigger_kind="active"` 的条目仅在**完全等价重复**时才考虑 disable
+
+## active trigger（带 `[active]` 标记）特殊规则
+
+trigger_kind=active 的条目带 cron/condition_prompt 配置——**永远不能 merge**（merge 会
+丢失 cron 配置导致主动触达失效）。但是：
+
+- **同主题 active trigger 之间允许 disable**：例如两条都是"下雨提醒带伞"，cron 略有差异
+  → 保留 cron 设计更合理那条（如能覆盖"上下班"两个时间段的优于只有早上的），
+  其它放进 disable_ids，不要塞 merge_groups
+- 跨主题 active trigger（一个查天气 + 一个周一问候）→ 保留两条都不动
 
 ## 输出格式（严格 JSON，无围栏）
 
