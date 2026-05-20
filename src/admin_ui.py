@@ -445,6 +445,7 @@ function openModal(title, summary) {
 function closeModal() { $('#modal').classList.remove('on'); _modalCtx = null; }
 $('#modal-save').addEventListener('click', async () => {
   if (!_modalCtx) return;
+  if (_modalCtx.readonly) { closeModal(); return; }
   const s = $('#modal-text').value.trim();
   await _modalCtx.onSave(s);
   closeModal();
@@ -511,6 +512,18 @@ async function loadItems() {
       const ev = el('span', { title: it.evidence_ref }, `源 ${fname}`);
       metaRow.appendChild(ev);
     }
+    // source_episode_id —— 点开看原始对话片段
+    if (it.source_episode_id) {
+      const epLink = el('a', {
+        href: '#', style: 'color:var(--accent);text-decoration:none',
+        title: '查看抽出这条记忆时的原始对话',
+      }, `当时聊了啥`);
+      epLink.onclick = async (e) => {
+        e.preventDefault();
+        await _showEpisode(it.source_episode_id);
+      };
+      metaRow.appendChild(epLink);
+    }
     // last_verified_at
     if (it.last_verified_at) {
       const lva = el('span', { title: '最后一次反验证仍成立的时间' }, `验证 ${fmt(it.last_verified_at)}`);
@@ -575,6 +588,33 @@ function _focusItem(fullId) {
   const short = (fullId || '').slice(0, 8);
   $('#q').value = short;
   loadItems();
+}
+
+// 点"当时聊了啥"：弹 modal 显示 episode 的原始 turns
+async function _showEpisode(epId) {
+  let body = '加载中...';
+  try {
+    const r = await fetch(`/api/episodes/${encodeURIComponent(epId)}`);
+    if (!r.ok) { body = `加载失败：${r.status}`; }
+    else {
+      const j = await r.json();
+      const lines = [];
+      lines.push(`时间：${fmt(j.started_at)} → ${fmt(j.ended_at)}`);
+      lines.push(`轮次：${j.turn_count}`);
+      lines.push('');
+      const turns = j.raw_turns || [];
+      for (const t of turns) {
+        const role = t.role === 'user' ? '👤' : '🤖';
+        lines.push(`${role} ${t.content || ''}`);
+      }
+      body = lines.join('\n');
+    }
+  } catch (e) {
+    body = '加载失败：' + e.message;
+  }
+  // 复用 openModal，但不带 onSave（只读）
+  _modalCtx = { kind: 'episode', readonly: true };
+  openModal(`原始对话（episode ${epId.slice(0, 8)}）`, body);
 }
 
 // ============ graph tab（D3 force-directed） ============
@@ -1334,7 +1374,7 @@ def build_app() -> FastAPI:
         wh = f"WHERE {' AND '.join(where)}" if where else ""
         sql = text(
             f"SELECT id, memory_type, summary, status, confidence, "
-            f"last_verified_at, depends_on, evidence_ref, "
+            f"last_verified_at, depends_on, evidence_ref, source_episode_id, "
             f"created_at, updated_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )
@@ -1347,6 +1387,9 @@ def build_app() -> FastAPI:
             deps = d.get("depends_on")
             if deps:
                 d["depends_on"] = [str(x) for x in deps]
+            sep = d.get("source_episode_id")
+            if sep is not None:
+                d["source_episode_id"] = str(sep)
             out.append(d)
         return out
 
@@ -1406,6 +1449,35 @@ def build_app() -> FastAPI:
             if r.rowcount == 0:
                 raise HTTPException(404, "not found")
         return {"ok": True}
+
+    @app.get("/api/episodes/{ep_id}")
+    async def get_episode_route(
+        ep_id: str,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        """读一条 episode 的原始 turns。普通用户只能看自己的。"""
+        with eng.connect() as c:
+            row = c.execute(
+                text(
+                    "SELECT id::text, user_id, raw_turns, turn_count, "
+                    "started_at, ended_at, created_at FROM episodes "
+                    "WHERE id = CAST(:id AS uuid)"
+                ),
+                {"id": ep_id},
+            ).first()
+        if not row:
+            raise HTTPException(404, "not found")
+        if viewer is not None and int(row[1]) != viewer:
+            raise HTTPException(403, "not yours")
+        return {
+            "id": row[0],
+            "user_id": row[1],
+            "raw_turns": row[2],
+            "turn_count": row[3],
+            "started_at": row[4].isoformat() if row[4] else None,
+            "ended_at": row[5].isoformat() if row[5] else None,
+            "created_at": row[6].isoformat() if row[6] else None,
+        }
 
     # ============ 调教（prompt overrides + skill 库）============
 

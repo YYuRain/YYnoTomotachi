@@ -19,9 +19,9 @@ from typing import Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    BigInteger, Column, DateTime, Float, Index, String, Text, create_engine, text,
+    BigInteger, Column, DateTime, Float, Index, Integer, String, Text, create_engine, text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
@@ -54,9 +54,35 @@ class Memory(Base):
     last_verified_at = Column(DateTime(timezone=True), nullable=True)
     depends_on = Column(ARRAY(UUID(as_uuid=True)), nullable=True)  # 上游 memory id 列表
 
+    # P0-4（2026-05-20，Graphiti episodes 借鉴）：来源 episode 反查
+    # 抽这条 memory 时 buffer 的原始 turns 落在 episodes 表，这里反查用
+    source_episode_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+
     __table_args__ = (
         Index("ix_memories_user_created", "user_id", "created_at"),
         Index("ix_memories_user_status", "user_id", "status"),
+    )
+
+
+class Episode(Base):
+    """一次 flush 的原始对话片段——抽出来的 memory 都 trace 回这里。
+
+    设计：每次 maybe_flush 把当前 buffer 的 raw turns 整体写一行，拿到 episode_id 后
+    再调 LLM 抽 profile/event；落库时 memories.source_episode_id 指过来。
+    用途：(1) 5.2 反验证 / 5.3 Auto Dream LLM 拿原始上下文判断；(2) admin UI 点条目跳"当时聊了啥"。
+    """
+    __tablename__ = "episodes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    raw_turns = Column(JSONB, nullable=False)  # list[{role, content, ts}]
+    turn_count = Column(Integer, nullable=False, default=0)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_episodes_user_ended", "user_id", "ended_at"),
     )
 
 
@@ -102,6 +128,10 @@ def _ensure_v2_columns() -> None:
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS depends_on UUID[] NULL",
         "CREATE INDEX IF NOT EXISTS ix_memories_user_status "
         "ON memories (user_id, status)",
+        # P0-4 episodes（2026-05-20）
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_episode_id UUID NULL",
+        "CREATE INDEX IF NOT EXISTS ix_memories_source_episode "
+        "ON memories (source_episode_id)",
     ]
     try:
         with _engine.begin() as conn:  # type: ignore[union-attr]
@@ -134,6 +164,65 @@ def session():
     if _Session is None:
         _Session = sessionmaker(bind=engine(), expire_on_commit=False, future=True)
     return _Session()
+
+
+# ============ Episodes (P0-4) ============
+
+def add_episode(
+    user_id: int,
+    raw_turns: list[dict],
+    *,
+    started_at: datetime,
+    ended_at: datetime,
+) -> str:
+    """落 episode 行，返回新 episode_id（str）。raw_turns: list[{role, content, ...}]。"""
+    eng = engine()
+    new_id = str(uuid.uuid4())
+    import json as _json
+    with eng.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO episodes (id, user_id, raw_turns, turn_count, "
+                "started_at, ended_at, created_at) "
+                "VALUES (CAST(:id AS uuid), :user_id, CAST(:raw_turns AS jsonb), "
+                ":turn_count, :started_at, :ended_at, :created_at)"
+            ),
+            {
+                "id": new_id,
+                "user_id": user_id,
+                "raw_turns": _json.dumps(raw_turns, ensure_ascii=False),
+                "turn_count": len(raw_turns) // 2,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "created_at": datetime.utcnow(),
+            },
+        )
+    return new_id
+
+
+def get_episode(episode_id: str) -> Optional[dict]:
+    """读一条 episode（admin UI / 反验证用）。"""
+    eng = engine()
+    with eng.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT id::text, user_id, raw_turns, turn_count, "
+                "started_at, ended_at, created_at FROM episodes "
+                "WHERE id = CAST(:id AS uuid)"
+            ),
+            {"id": episode_id},
+        ).first()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "raw_turns": row[2],
+        "turn_count": row[3],
+        "started_at": row[4],
+        "ended_at": row[5],
+        "created_at": row[6],
+    }
 
 
 def reset_engine_for_tests() -> None:

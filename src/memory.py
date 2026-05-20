@@ -19,7 +19,7 @@ import logging
 import re
 import time
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -272,6 +272,8 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
     if not should:
         return False
 
+    prev_flush_ts = last_ts  # 给 episode.started_at 用——锁内会被覆盖
+
     async with _flush_lock:
         buf = _buffer_per_user.get(uid)
         if not buf:
@@ -290,13 +292,30 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
     except Exception as e:
         log.debug("flush write conv json err: %s", e)
 
+    # P0-4：落 episode（不论后续抽取成功与否，都先记上）。失败不影响主流程。
+    # started_at = 上次 flush 完成时间（从那以后的对话都在这个 episode 里）；
+    # 首次 flush 时 prev_flush_ts=0，退化为用 now-1h 占位（真实开始时间无法回溯）。
+    episode_id: str | None = None
+    if user_id_int:
+        try:
+            ended_dt = datetime.now(timezone.utc)
+            if prev_flush_ts > 0:
+                started_dt = datetime.fromtimestamp(prev_flush_ts, tz=timezone.utc)
+            else:
+                started_dt = ended_dt - timedelta(hours=1)
+            episode_id = memory_store.add_episode(
+                user_id_int, batch, started_at=started_dt, ended_at=ended_dt,
+            )
+        except Exception as e:
+            log.debug("flush write episode err uid=%s: %s", uid, e)
+
     # 抽取
     try:
         items = await _extract_items(batch)
     except Exception as e:
         log.exception("extract failed uid=%s: %s", uid, e)
         audit("memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
-              error=f"extract:{type(e).__name__}:{str(e)[:200]}")
+              error=f"extract:{type(e).__name__}:{str(e)[:200]}", episode_id=episode_id)
         # 回滚到 buffer 头部
         async with _flush_lock:
             _buffer_per_user.setdefault(uid, [])[:0] = batch
@@ -306,7 +325,7 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
         log.info("memorize uid=%s ok (%d msgs) -> %s, +0 items（LLM 没抽到）",
                  uid, len(batch), path.name)
         audit("memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
-              new_items=0, new_item_summaries=[])
+              new_items=0, new_item_summaries=[], episode_id=episode_id)
         # 仍然 fire persona update（用户也许聊了内容只是没产生 profile/event）
         _fire_persona_update(user_id_int, batch)
         # 偏好不一定产生 profile/event（"叫我名字"是 prompt 调整不是事实），这里也要 fire
@@ -315,7 +334,9 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
 
     # 入库
     try:
-        new_records = await _persist_items(user_id_int, items, evidence_ref=str(path))
+        new_records = await _persist_items(
+            user_id_int, items, evidence_ref=str(path), source_episode_id=episode_id,
+        )
     except Exception as e:
         log.exception("persist failed uid=%s: %s", uid, e)
         audit("memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
@@ -329,6 +350,7 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
         "memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
         new_items=len(new_summaries),
         new_item_summaries=[s[:200] for s in new_summaries[:10]],
+        episode_id=episode_id,
     )
 
     _fire_persona_update(user_id_int, batch)
@@ -1274,11 +1296,15 @@ async def _persist_items(
     items: list[tuple[str, str]],
     *,
     evidence_ref: str | None = None,
+    source_episode_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """对每条 (type, content) 算 embedding 并 INSERT 到 memories。
 
     返回 list[dict]，每条 dict 含 id / summary / memory_type / embedding（可能 None）；
     上层既用这个填 audit，也喂 _fire_conflict_check 复用 embedding。
+
+    P0-4: source_episode_id 是 episodes 表中的 raw turns 反查用——5.2/5.3 LLM 拿
+    原始上下文判断；admin UI 点条目跳"当时聊了啥"。
     """
     if not items or not user_id:
         return []
@@ -1299,18 +1325,20 @@ async def _persist_items(
                 "created_at": now,
                 "updated_at": now,
                 "evidence_ref": evidence_ref,
+                "source_episode_id": source_episode_id,
             }
             # status / confidence 必须显式给——这俩列在 ALTER 加的时候 NOT NULL，
             # raw INSERT 不走 ORM default、PG 也不会自动填 ALTER 设的 default。
+            # source_episode_id 走 CAST(:source_episode_id AS uuid)；NULL 安全。
             if vec is not None:
                 params["embedding"] = embed_client.vec_literal(vec)
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, embedding, "
-                        "created_at, updated_at, evidence_ref, status, confidence) "
+                        "created_at, updated_at, evidence_ref, status, confidence, source_episode_id) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
                         "CAST(:embedding AS vector), :created_at, :updated_at, :evidence_ref, "
-                        "'confirmed', 1.0)"
+                        "'confirmed', 1.0, CAST(:source_episode_id AS uuid))"
                     ),
                     params,
                 )
@@ -1318,9 +1346,10 @@ async def _persist_items(
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, "
-                        "created_at, updated_at, evidence_ref, status, confidence) "
+                        "created_at, updated_at, evidence_ref, status, confidence, source_episode_id) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
-                        ":created_at, :updated_at, :evidence_ref, 'confirmed', 1.0)"
+                        ":created_at, :updated_at, :evidence_ref, 'confirmed', 1.0, "
+                        "CAST(:source_episode_id AS uuid))"
                     ),
                     params,
                 )
