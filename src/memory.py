@@ -899,7 +899,7 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
         d = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main", temperature=0.1, max_tokens=2000,
+                tier="main", temperature=0.1, max_tokens=4000,
             ),
             timeout=OVERRIDE_DREAM_TIMEOUT_SEC,
         )
@@ -1019,7 +1019,7 @@ async def auto_dream_skills() -> dict[str, Any]:
         d = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main", temperature=0.1, max_tokens=2000,
+                tier="main", temperature=0.1, max_tokens=4000,
             ),
             timeout=SKILL_DREAM_TIMEOUT_SEC,
         )
