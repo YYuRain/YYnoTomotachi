@@ -182,13 +182,25 @@ def _seed_skill_creator(eng) -> None:
     try:
         # 用一个全 0 dummy embedding 占位（不会被 cosine 召回——本就是 meta，feedback_agent
         # 直接按 name 查不走 embedding 召回）
+        # 启动时同步：body / summary 跟代码不一致就 UPDATE。这样改 prompt 重启即生效，
+        # 不用手动 SQL。admin 想覆盖可以 SET status='disabled' 让代码默认不被使用，
+        # 然后用 admin UI 自己加另一个同名 skill（虽然现在没 edit UI）。
+        import json as _json
         with sessionmaker(bind=eng, future=True)() as s:
             existing = s.query(Skill).filter(
                 Skill.name == feedback_prompts.SKILL_CREATOR_NAME
             ).first()
             if existing:
+                changed = False
+                if existing.body != feedback_prompts.SKILL_CREATOR_BODY:
+                    existing.body = feedback_prompts.SKILL_CREATOR_BODY
+                    changed = True
+                if existing.summary != feedback_prompts.SKILL_CREATOR_SUMMARY:
+                    existing.summary = feedback_prompts.SKILL_CREATOR_SUMMARY
+                    changed = True
+                if changed:
+                    s.commit()
                 return
-            import json as _json
             s.add(Skill(
                 name=feedback_prompts.SKILL_CREATOR_NAME,
                 summary=feedback_prompts.SKILL_CREATOR_SUMMARY,

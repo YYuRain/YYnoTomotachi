@@ -199,9 +199,24 @@ SKILL_CREATOR_BODY = """# 任务：把"功能希望"转成 trigger-based 指令
   你的 condition_prompt 要明确告诉 sonnet：可用的工具（web_search 查天气等）、
   判定标准、消息口吻。
 
-**两种都需要附带 active_text_for_bot**：一段塞进 user system prompt 的文本，让 bot
-即便在 passive 路径里被 user 自然提起时也能照应（兜底——active 通道偶尔失败时 bot
-还有 chance 接住）。
+**两种都需要附带 active_text_for_bot**：一段塞进 user system prompt 的**只读声明**，
+告诉 bot **后台已经接管了这件事**，让 bot 不要再主动重复做（cron + active 通道
+已经在按时跑了）。
+
+## active_text_for_bot 的硬约束（**最重要！破坏会让 bot 反复打扰用户**）
+
+active trigger 的 active_text_for_bot **必须**只有以下两种内容：
+- ✅ 声明：告诉 bot "后台 cron 在 [时间] 自动做 [什么] 已经在跑"
+- ✅ 兜底口径：如果 user 主动问起，bot 可以**简短回应当下情况**（比如查一次天气）
+
+active_text_for_bot **绝对不能**写：
+- ❌ "如果对方聊到 X 你就主动 Y"——这会让 bot 每次 user 提到关键词都重复触发
+- ❌ "你顺手 web_search 查一下..."——主动行为该交给 cron，不该 passive 注入
+- ❌ 列举触发关键词（"出门/上班/下班/天气/伞"）——会让 bot 在普通对话里被"上班"两个字勾起整段流程
+- ❌ 任何 "你也可以"/"你顺便"/"如果...你就..." 的指令性句式
+
+如果用户的需求**强依赖 user 主动说**（"我说累了你让我歇会儿"）→ kind 选 passive，
+不要把"如果说累了你就..."硬塞进 active 的 active_text_for_bot。
 
 ## 写作要求
 
@@ -209,7 +224,7 @@ SKILL_CREATOR_BODY = """# 任务：把"功能希望"转成 trigger-based 指令
 2. condition_prompt 要明确：什么算条件成立、用啥工具查（如有）、消息怎么写
 3. 承认 active 通道也不是绝对精确——cron 精度取决于触发频率
 4. 不要要求 cron 太频繁（避免 < 15 min 间隔，浪费成本）
-5. active_text_for_bot ≤ 200 字
+5. active_text_for_bot ≤ 120 字（短为美——它每个 turn 都注入 system prompt）
 
 ## 示例
 
@@ -221,9 +236,12 @@ SKILL_CREATOR_BODY = """# 任务：把"功能希望"转成 trigger-based 指令
   "kind": "active",
   "cron_schedule": "30 17 * * 1-5",
   "condition_prompt": "现在是工作日下班前。你需要：1) 用 web_search 查询「北京昌平 明日天气」；2) 判断明天是否会下雨或有降水概率；3) 如果有雨，生成一条自然口吻的消息提醒对方带伞，例如「明天昌平有雨，伞还在你家吧，记得拿」（≤30 字）；4) 如果没雨，不需要发消息。输出 JSON: {{\\"should_send\\": true|false, \\"message\\": \\"...\\"}}",
-  "active_text_for_bot": "对方有'下雨提前提醒带伞'的诉求，每个工作日下午 17:30 后台会自动查天气并提醒。如果对方主动问起天气或下班时段聊到出门相关话题，你也可以顺便用 web_search 查查昌平天气，遇雨提醒对方带伞——他伞放在家里不一定带在身边。"
+  "active_text_for_bot": "对方有'下雨提前提醒带伞'的诉求，每个工作日 17:30 后台 cron 自动查天气并推送。除非对方主动问起天气，否则不要主动提带伞——避免重复打扰。"
 }}
 ```
+
+注意上例 active_text_for_bot：**只声明后台在做 + 加一句"除非对方问，否则别主动提"**。
+**没**写"如果对方聊到出门你就查"这种 passive 指令。
 
 ## 输出格式（**强制要求**）
 
