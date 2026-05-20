@@ -1,13 +1,27 @@
-# 记忆栈（自搭，2026-05-18 起）
+# 记忆栈（自搭，2026-05-18 起；P0-1/P0-4 升级 2026-05-20）
 
 > 此前用 memU SDK（`memu-py`），1.5.x 多次踩坑后改自搭。架构等价 +
-> PRD v2 三层防线（status 字段 / 写入冲突检测 / 召回反验证 / Auto Dream）。
-> memU 时代的归档说明在 `memu-setup.md`。
+> PRD v2 三层防线（status 字段 / 写入冲突检测 / 召回反验证 / Auto Dream）+
+> P0-1 hybrid retrieval（Mem0 v3）+ P0-4 episodes provenance（Graphiti）。
+> memU 时代的归档说明在 `memu-setup.md`；横向研究分析在 `me/记忆框架横纵分析.md`。
 
 ## 一句话
 
-postgres + pgvector 单表 RAG。flush 时跑 LLM 抽 profile/event 落库，recall 跑 cosine top-k；
-所有事实带 `status`（confirmed/to_verify/stale）让记忆知道"自己有多确定"。
+postgres + pgvector 单表 RAG。**Hot path** = recall 同步走 cosine + ngram + entity 三路 RRF 融合；
+**Background** = flush 后异步抽 + 5.1/persona/feedback + 03:13 Auto Dream。
+所有事实带 `status`（confirmed/to_verify/stale）让记忆知道"自己有多确定"，
++ `source_episode_id` 反查原始 turns（episodes 表）。
+
+## Hot path vs Background（命名借自 LangMem）
+
+| 路径 | 何时跑 | 谁触发 | 阻塞主对话？ | 模块 |
+|------|-------|-------|-------------|------|
+| **Hot path** | 每个 turn 进入时 | agent | 是 | `memory.recall` + 5.2 反验证 |
+| **Background** | flush / cron | scheduler / asyncio.create_task | 否 | `memory._fire_*` + auto_dream |
+
+Hot path 必须快（< 200ms 目标），Background 可以慢（cron 任务半小时一跑也行）。
+两条路径**通过 status 字段共享状态**——hot path 看 to_verify 改 last_verified_at，
+background 看 to_verify 改 status——互相可见但不竞争锁。
 
 ## Schema
 
@@ -27,10 +41,25 @@ postgres + pgvector 单表 RAG。flush 时跑 LLM 抽 profile/event 落库，rec
 | `confidence`                | DOUBLE PRECISION DEFAULT 1.0             | 0.0-1.0；stale=0.0、to_verify=0.5        |
 | `last_verified_at`          | TIMESTAMPTZ                              | 最后一次反验证仍成立的时间（5.2 cooldown 用）          |
 | `depends_on`                | UUID[]                                   | 触发该条变 to_verify/stale 的上游事实 id 列表（去重）  |
+| **P0-1/P0-4（2026-05-20）**：|                                          |                                        |
+| `source_episode_id`         | UUID                                     | 抽这条时 buffer 落在 episodes 表的哪一行（反查原始对话）|
+| `entities`                  | TEXT[]                                   | LLM 抽出的关键名词（人名/地名/作品/物品），entity 路 retrieval 用 |
 
-索引：`(user_id, created_at)`、`(user_id, status)`、`embedding USING ivfflat (vector_cosine_ops)` 100+ 行后自动建。
+索引：`(user_id, created_at)`、`(user_id, status)`、`embedding USING ivfflat (vector_cosine_ops)` 100+ 行后自动建；
+**P0-1**：`summary USING GIN (gin_trgm_ops)` 加速 ILIKE 子串、`entities USING GIN` 加速 array 查询。
 
-## 主链路
+`episodes` 表（P0-4）：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `id` | UUID PK | |
+| `user_id` | BIGINT | |
+| `raw_turns` | JSONB | list[{role, content}]，原始 buffer 内容 |
+| `turn_count` | INTEGER | |
+| `started_at` / `ended_at` | TIMESTAMPTZ | 这次 flush 覆盖的对话起止 |
+| `created_at` | TIMESTAMPTZ | |
+
+## Background：写入流水
 
 ```
 对话 turn
@@ -40,45 +69,60 @@ note_turn(uid, user_text, assistant_text)  → 写 dict[uid, list]
    │
    │ (每 6 turns 或 15 min 强制 flush；APScheduler memu_flush_job 兜底每 15 min 扫所有 user)
    ▼
-maybe_flush(uid, force) ──► _extract_items: LLM (deepseek-flash) 抽 JSON
-                          │   { items: [{type, content}, ...] }
-                          ▼
-                         _persist_items: 算 embedding → INSERT
-                          │  返回 list[{id, summary, memory_type, embedding}]
-                          ▼
-                  (异步) _fire_persona_update(uid, batch)
-                  (异步) _fire_conflict_check(uid, new_records)  ← PRD 5.1
-                                │
-                                ▼
-                       对每条新事实，召回 top-5 旧 profile（同 batch 互排除）
-                       LLM 一次 call 拿 verdicts → UPDATE 旧条目 status / depends_on
+maybe_flush(uid, force)
+   │
+   ├─► add_episode(uid, batch)              ← P0-4：先落 episodes 表，拿 episode_id
+   │
+   ├─► _extract_items: LLM (deepseek-flash) 抽 JSON
+   │      { items: [{type, content, entities}, ...] }   ← P0-1：entities 字段
+   │
+   ├─► _persist_items: 算 embedding → INSERT memories
+   │     带 source_episode_id（P0-4） + entities（P0-1）
+   │     返回 list[{id, summary, memory_type, embedding, entities}]
+   │
+   ├─► (异步) _fire_persona_update(uid, batch)
+   ├─► (异步) _fire_feedback_check(uid, batch)
+   └─► (异步) _fire_conflict_check(uid, new_records)  ← PRD 5.1
+                  │
+                  ▼
+            对每条新事实，召回 top-5 旧 profile（同 batch 互排除）
+            LLM 一次 call 拿 verdicts → UPDATE 旧条目 status / depends_on
 ```
+
+## Hot path：recall 三路 RRF（P0-1，2026-05-20）
 
 ```
 recall(uid, user_text, top_k=3)
    │
-   │ A 道门：query 太短/纯口头禅 → 跳过 recall（hits=0, skipped_reason）
-   │   _is_low_value_query：CJK<6 / 英文<3 词 / 整句口头禅 regex 命中 → skip
+   │ A 道门：query 太短/纯口头禅 → 跳过（hits=0, skipped_reason）
+   │   _is_low_value_query：CJK<3 / 英文<3 词 / 整句口头禅 regex 命中 → skip
+   │   （P0-1 把阈值从 6 → 3：hybrid 时代 ngram/entity 路对短 query 友好）
    │
-   │ embed_one(user_text) → 512-dim 向量
    ▼
-SELECT … FROM memories WHERE status != 'stale'
-  AND (embedding <=> :q) < 0.55  ← B 道门：cosine distance 阈值
-  ORDER BY embedding <=> :q LIMIT k
+三路并行候选拉取（HYBRID_CANDIDATES_PER_PATH=20）：
+  ┌─ cosine 路   embedding <=> :q < 0.55，按 distance 升序
+  ├─ ngram 路    把 query 切 2-char window（去口头禅+黑名单"什么/今天/这个"等过泛词）；
+  │             OR 起来 ILIKE '%win%'，按命中数 DESC（pg_trgm GIN 加速）
+  └─ entity 路   EXISTS unnest(entities) e WHERE :q ILIKE '%'||e||'%'，按命中数 DESC
    │
-   │ items 中 status='to_verify' 且 last_verified_at NULL 或 30min 之前 → due 列表
+   ▼
+RRF 融合：score(doc) = Σ 1/(RRF_K + rank_in_path)，RRF_K=60
+取 top_k 候选
+   │
+   │ 候选中 status='to_verify' 且 last_verified_at NULL 或 30min 之前 → due
    ▼
 asyncio.gather(*[_reverify_one(uid, item, query) for item in due])  ← PRD 5.2 同步阻塞
    │   每条：拉 deps 上游 → LLM (still_valid / uncertain) → UPDATE
    ▼
 按最新 status 拼 snippets：confirmed 不带前缀；to_verify 带 `[待确认]`
-audit memory_recall 加 distances 数组（admin UI 每条 hit 前显示 d=0.32）
+audit memory_recall 加 candidates_per_path（cosine/ngram/entity 各路命中数）
 ```
 
-**精度调优**（`RECALL_MAX_DISTANCE = 0.55`，`RECALL_MIN_QUERY_CJK_CHARS = 6`）：
-- 仍有相关 query 被滤 → 阈值调高（如 0.6）
-- 仍有噪声穿过 → 阈值调低（如 0.45）
-- audit `memory_recall` 每条 hit 自带 `d=` 距离值，admin 直接看分布
+**精度调优**：
+- `RECALL_MAX_DISTANCE = 0.55` 仅 cosine 路用（噪声底）
+- `NGRAM_MIN_HITS = 1` 命中至少一个 ngram 才算候选；调高更严
+- `RRF_K = 60` 工业默认，越大越平均越小越尖锐
+- audit `memory_recall.candidates_per_path` 看每路命中数；某路一直是 0 = 该路设计有问题或数据没填好（如老 memory entities 都是 NULL，需要 backfill 或等新写入）
 
 ```
 03:13 cron auto_dream_job (CST)

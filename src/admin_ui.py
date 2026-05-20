@@ -276,7 +276,7 @@ _INDEX_HTML = """<!doctype html>
 <nav>
   <button data-tab="items" class="active">记忆项</button>
   <button data-tab="graph">图谱</button>
-  <button data-tab="tune">调教</button>
+  <button data-tab="tune" title="Procedural Memory（LangMem 命名）：偏好 / skill 库 / 兴趣热度">调教</button>
   <button data-tab="audit">审计</button>
 </nav>
 
@@ -327,6 +327,9 @@ _INDEX_HTML = """<!doctype html>
 
   <div id="tab-tune" class="tab" style="display:none">
     <div style="display:flex;flex-direction:column;gap:18px">
+      <div style="font-size:11px;color:var(--muted);padding-bottom:4px;border-bottom:1px solid var(--border)">
+        Procedural Memory（LangMem 命名）：跟 memories（semantic / episodic）平级——存的是<b>规则与触发</b>，不是事实。
+      </div>
       <div>
         <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">⏳ 待审核 overrides（high risk pending）</h3>
         <table>

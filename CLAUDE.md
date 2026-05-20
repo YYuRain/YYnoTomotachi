@@ -72,9 +72,9 @@ docker compose logs -f bot   # 看 ready
 | `src/minimax.py` | MiniMax chat/chat_json/embed |
 | `src/embed_client.py` | 本地 :18080 embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
-| `src/memory_store.py` | 自搭记忆栈：`memories` 表 ORM + engine + pgvector 索引 |
-| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
-| `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）+ note_turn（短期 buffer）+ maybe_flush（抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
+| `src/memory_store.py` | 自搭记忆栈：`memories` + `episodes`（P0-4 provenance）表 ORM + engine + pgvector / pg_trgm 索引 |
+| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event / **entities** JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
+| `src/memory.py` | **Hot path**: recall（cosine + ngram + entity 三路 RRF 融合，P0-1 / 2026-05-20）+ 5.2 同步反验证；**Background**: note_turn（短期 buffer）+ maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
 | `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
 | `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
 | `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |
@@ -97,8 +97,8 @@ docker compose logs -f bot   # 看 ready
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + `prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）
-- **记忆栈** via **Postgres + pgvector**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（schema 见 `src/memory_store.py`）
+- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）
+- **记忆栈** via **Postgres + pgvector + pg_trgm**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（带 `entities TEXT[]` / `source_episode_id UUID`）+ `episodes`（P0-4 raw turns provenance）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
 - **静态资源**：`data/stickers/*`（文件名当 tag）；`data/eval/run_*.{jsonl,md}`（模型评测）
@@ -130,10 +130,18 @@ memory 不只是 RAG。三层防线让记忆"知道自己不确定"：
 - **5.2 召回反验证**（同步阻塞 recall）：recall 命中 `to_verify` 条目时，同步跑 LLM 反向验证（输入条目+depends_on 上游+当前 user query）。verdicts ∈ {still_valid / uncertain}（不能直接判 stale 防错杀）。30 min cooldown 用 `last_verified_at` 限速。still_valid → 升回 confirmed；uncertain → 保留 to_verify 仅打戳。
 - **5.3 Auto Dream**（03:13 cron 批量）：对每个用户的所有 to_verify 条目跑一遍三态判定（still_valid / uncertain / stale）。后台无打扰，可激进直判 stale。LLM 拿 deps 上游 + top-5 confirmed 邻居作综合上下文。
 
-`memories` 表新加 4 列：`status` (confirmed/to_verify/stale)、`confidence`、`last_verified_at`、`depends_on UUID[]`。
+`memories` 表加列：`status` (confirmed/to_verify/stale)、`confidence`、`last_verified_at`、`depends_on UUID[]`。
 recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让主 LLM 自己拿捏。
 
 详见 `me/prd_memory.md`（PRD 原文）+ `document/memory-stack.md`（实现细节）。
+
+## Hot path / Background 分层（P0-3 命名一统，借自 LangMem，2026-05-20）
+
+记忆栈两条路径明确分开：
+- **Hot path**（同步阻塞 turn）：`recall` 三路 RRF 融合 + 5.2 反验证。要求 < 200ms。
+- **Background**（异步 / cron）：flush 后的抽取入库、5.1 冲突检测、persona 演化、feedback agent、5.3 Auto Dream、active trigger 扫描。允许慢。
+
+**Procedural memory** = `prompt_overrides` + `skills` + `skill_creator` meta-skill —— 跟 `memories`（semantic/episodic）平级的一类记忆，admin UI 走「调教」tab。
 
 ## Agent Reach 工具
 
