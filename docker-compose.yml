@@ -49,7 +49,7 @@ services:
     volumes:
       - ./data:/app/data
       # 2026-05-21 起 prompt/system_baseline.md 已在镜像里（COPY . .）；删了 stale mount
-      - ./data/.xhs-cookie:/root/.xhs   # 小红书 CLI cookie 持久化（手动注入，详见 agent-reach-integration.md）
+      - ./data/.xhs-cookie:/root/.xiaohongshu-cli   # xhs CLI (jackwener) cookie 持久化；rebuild 不丢
       - cf-shared:/shared:ro   # 读 cloudflared 写的 admin URL（/admin 命令用）
     # 不暴露端口；bot 是出站连接
 
