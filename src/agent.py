@@ -296,13 +296,13 @@ async def _maybe_fetch_context(user_text: str, user_id: int | None = None) -> st
 
         # 不管 needed 与否都 audit——观测决策本身，方便回查"为什么没触发搜"
         if not needed:
-            audit("tool_decision", needed=False, user_text=user_text[:200],
+            audit("tool_decision", user_id=user_id, needed=False, user_text=user_text[:200],
                   tool=tool_name, query=query[:200])
             return ""
 
         func = _TOOL_FUNCS.get(tool_name)
         if not func or not query:
-            audit("tool_decision", needed=True, user_text=user_text[:200],
+            audit("tool_decision", user_id=user_id, needed=True, user_text=user_text[:200],
                   tool=tool_name, query=query[:200],
                   skipped_reason="unknown_tool" if not func else "empty_query")
             return ""
@@ -311,13 +311,13 @@ async def _maybe_fetch_context(user_text: str, user_id: int | None = None) -> st
         result = await func(query)
         if result:
             log.info("tool result: %d chars", len(result))
-        audit("tool_call", tool=tool_name, query=query[:200],
+        audit("tool_call", user_id=user_id, tool=tool_name, query=query[:200],
               user_text=user_text[:200],
               result_chars=len(result or ""), result_preview=(result or "")[:300])
         return result
     except Exception as e:
         log.debug("tool detect/exec error: %s", e)
-        audit("tool_decision", needed=False, user_text=user_text[:200],
+        audit("tool_decision", user_id=user_id, needed=False, user_text=user_text[:200],
               skipped_reason=f"err:{type(e).__name__}:{str(e)[:120]}")
         return ""
 
