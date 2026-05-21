@@ -1,46 +1,76 @@
 # Agent Reach 工具能力集成
 
-> 接入：2026-04-29。**2026-05-19 大改**：mcporter / Exa 退役，search 改 Jina REST；
-> xhs_search 入口取消（账号风控本就失效，并入 web_search）；detect prompt 注入今天日期。
+> 接入：2026-04-29。**2026-05-19**：mcporter / Exa 退役，search 改 Jina REST。
+> **2026-05-21 重接**：借 [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) 选型，把 yt-dlp / xhs / gh CLI 真正装进容器；新加 `read_github` 工具。
 
 ## 背景
 
 陪伴 agent 在感知到用户分享链接或问"最近 X"类话题时，能自动拉取实时信息融入回复——
-不改变对话风格、不暴露"查资料"过程。当前生效的工具只剩两条路径：
-- `read_url(url)` — Jina Reader（r.jina.ai）读网页正文
-- `search_web(query)` — Jina Search（s.jina.ai）网页搜索
+不改变对话风格、不暴露"查资料"过程。
 
-历史上还有 `search_xhs`（pipx xhs）+ Exa via mcporter，2026-05-19 都退役了，原因见下。
+## 当前工具栈（2026-05-21 起）
 
----
+| 工具 | 实现 | 容器依赖 | 触发场景 |
+|------|------|---------|---------|
+| `read_url(url)` | Jina Reader (`r.jina.ai/<url>`) | `JINA_API_KEY` | 网页 URL（自动域名路由的兜底） |
+| `search_web(query)` | Jina Search (`s.jina.ai/?q=`) | `JINA_API_KEY` | 通用全网搜索 |
+| `search_xhs(keyword)` | xhs CLI（pip 包 `xhs`） | xhs（已装容器）+ cookie 文件 | 用户聊到小红书话题 |
+| `read_github(query)` | gh CLI anon API | gh binary（已装容器） | 用户聊到 GitHub 仓库 |
+| URL 自动路由 | `_fetch_one_url` 按域名派发 | 见下 | user 消息含完整 URL |
 
-## 当前工具栈（2026-05-19 起）
+**URL 自动路由**（`tools.fetch_urls_in_message`）按域名派给最合适的实现：
+- 小红书域名（xiaohongshu.com / xhslink.com / xhscdn.com）→ `_read_xhs_note`（xhs CLI）
+- B 站（bilibili.com / b23.tv）+ YouTube（youtube.com / youtu.be）→ `_read_video`（yt-dlp）
+- 其它 → `read_url`（Jina）
 
-只依赖 `JINA_API_KEY`：
-- `read_url(url)` — `https://r.jina.ai/<url>`，Bearer 鉴权
-- `search_web(query)` — `https://s.jina.ai/?q=<query>`，Bearer 鉴权 + `X-Respond-With: no-content`（只要 title/url/desc）
+主路径失败**直接返空**，不再二次降级到 Exa（mcporter 已退役，2026-05-19）。
 
-容器零额外 binary 依赖，Dockerfile 不需要装 node/pipx/mcporter/xhs。
+## 容器依赖（Dockerfile）
 
-## 历史工具退役说明
+```dockerfile
+# gh CLI 官方二进制（amd64）
+ARG GH_VERSION=2.65.0
+RUN curl -fsSL https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz \
+    | tar -xz -C /tmp \
+    && mv /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh_*
 
-### mcporter / Exa（2026-05-19 退役）
+# yt-dlp（YouTube/B站字幕）+ xhs（小红书 CLI）—— pip 包
+RUN pip install --no-cache-dir "yt-dlp>=2024.12.0" "xhs>=0.0.10"
+```
 
-旧 `search_web` 走 `mcporter call exa.web_search_exa(...)` ——`mcporter` 是 npm global、`xhs` 是 pipx，
-本地开发用全局 binary 跑得通；**容器没装** → 所有 `tool_call` 返 0 chars。
+容器内验证：`docker compose exec bot which yt-dlp gh xhs` 三个都返回路径。
 
-诊断时间线：
-1. admin 反馈 search 不工作 → audit 看到 `tool_call` 触发但 `result_chars: 0`
-2. `docker exec aidemo-bot which mcporter` → 不存在
-3. 改用 Jina Search REST（已有 `JINA_API_KEY`），免装额外 binary
+## 小红书 cookie 注入流程（手动一次）
 
-### xhs_search（2026-05-19 退役）
+xhs CLI 在 `/root/.xhs/cookies.json` 存 cookie。compose 已 mount `./data/.xhs-cookie:/root/.xhs`，
+本地 `data/.xhs-cookie/` 持久化（不入 git，已在 `.gitignore` 里）。
 
-xhs 账号被风控（`-104 无权限`），本来就 fallback 到 Exa；现在 Exa 也撤了，xhs 入口完全删除。
-小红书需求统一并入 `web_search`，让 LLM 在 query 里加 `小红书` 关键词即可。
+**注入步骤**（HK 服务器一次性）：
+1. 用户本机 Chrome 已登录 xiaohongshu.com
+2. 用 Cookie-Editor 插件导出 Cookie 为 JSON 数组
+3. 转换成 xhs CLI 期望的 `cookies.json` 格式（`{"a1":"...","web_session":"...",...}` 简单 dict；具体见 `xhs` Python 包文档）
+4. `scp cookies.json hk-bot:~/aidemo/data/.xhs-cookie/`
+5. `docker compose restart bot`
 
-> 历史细节（小红书 a1 cookie 认证 / pipx 安装 / Safari 桥接 等）保留在 `me/0508-进展汇总.md` 与
-> 早期 commit history，本文档不再维护。
+**风控提示**：xhs API 容易 `-104 无权限`，建议**用专用小号**而不是主账号；`tools.search_xhs` 失败时直接返空，
+不影响其他工具，admin UI audit 能看到 `xhs search 失败：<msg>` 日志。
+
+## gh CLI（anon 公开仓库）
+
+不登录直接走匿名 GitHub API，rate limit 60/h，对 bot 用法（用户偶尔分享 repo）足够。
+登录会把 limit 提升到 5000/h，但本轮跳过——用户提同一 repo 频次远低于 anon 限额。
+
+`read_github` 输出格式：
+```
+仓库：anthropic-ai/anthropic-sdk-python（⭐3.5K · Python）
+介绍：The official Anthropic Python SDK
+README 摘要：（前 400 字）...
+最近 issue：
+  #234 [OPEN] AsyncClient connection pooling issue
+  #232 [CLOSED] Type hints for tool_use
+  ...
+```
 
 ---
 
@@ -54,22 +84,19 @@ xhs 账号被风控（`-104 无权限`），本来就 fallback 到 Exa；现在 
 | `search_web(query)` | Jina Search REST 搜网页，返回 ≤1500 字摘要 |
 | `read_url(url)` | Jina Reader 读取网页正文，返回 ≤600 字 |
 
-`agent._TOOL_FUNCS` 映射只剩 `web_search` / `read_url` 两条路径——LLM detect 时也只会
-选这两个 tool 名，xhs_search 已从 prompt 移除。
+`agent._TOOL_FUNCS` 映射 4 条路径——LLM detect prompt 也对应 4 选 1：
+- `web_search` / `read_url` / `search_xhs` / `read_github`
 
 ### URL 路由逻辑
 
-`_fetch_one_url(url)` 按域名路由：
+`_fetch_one_url(url)` 按域名路由（**容器内 binary 都已装**，2026-05-21 起）：
 
 ```
-小红书域名   → _read_xhs_note()  → xhs CLI（仅本地有 xhs 时；容器跳过）
-B 站域名     → _read_video()     → yt-dlp --dump-json（仅本地有 yt-dlp 时）
-YouTube      → _read_video()     → yt-dlp --dump-json
-其他         → read_url()        → Jina Reader (r.jina.ai)
-失败时       → search_web 兜底  → Jina Search (s.jina.ai)
+小红书域名（xiaohongshu.com / xhslink.com / xhscdn.com）→ _read_xhs_note() → xhs CLI（需 cookie）
+B 站（bilibili.com / b23.tv）+ YouTube                  → _read_video()    → yt-dlp --dump-json
+其它                                                    → read_url()       → Jina Reader (r.jina.ai)
+失败时                                                  → 直接返空（不再二次降级）
 ```
-
-容器场景：xhs / yt-dlp 路径都失败 → 直接 fallback 到 Jina Reader / Jina Search。
 
 ### 小红书短链处理
 
@@ -116,13 +143,18 @@ else:
 
 ### LLM 工具判断（_maybe_fetch_context）
 
-使用 `tier="aux"`（Sonnet，快且便宜）判断是否需要实时信息：
+使用 `tier="aux"`（deepseek-flash 等，快且便宜）判断是否需要实时信息：
 
 ```json
-{"needed": true, "tool": "web_search|read_url", "query": "搜索词或URL"}
+{"needed": true, "tool": "web_search|read_url|search_xhs|read_github", "query": "搜索词 / URL / owner/repo"}
 ```
 
-触发条件（prompt 明确列出）：想了解某平台上的内容、问具体事实、提到网址、想知道最近流行什么。
+触发条件（prompt 明确列出）：
+- 想了解 GitHub 仓库 → `read_github`，query=`owner/repo`
+- 用户聊到小红书话题 → `search_xhs`，query=纯关键词（不加"小红书"）
+- 提到网址 → 一般走 URL 自动提取（`fetch_urls_in_message`）
+- 通用搜索 → `web_search`
+
 不触发：闲聊、情绪倾诉、回忆往事、问观点/建议、日常打招呼。宁可少搜不滥搜。
 
 ### 关键：内容注入位置
@@ -145,7 +177,7 @@ messages.append({"role": "user", "content": user_msg})
 
 | 问题 | 根因 | 解决 |
 |------|------|------|
-| 容器 search 全 0 chars | 容器没装 mcporter/xhs | 2026-05-19 改用 Jina Search REST，容器零依赖 |
+| 容器 search 全 0 chars | 容器没装 mcporter/xhs | 2026-05-19 临时改用 Jina Search REST 顶替；2026-05-21 把 xhs/yt-dlp 装进容器，gh CLI 加 binary，正式接入 |
 | LLM 写 query 用 2025 | baseline 训练截止 | `_TOOL_DETECT_SYSTEM` 运行时拼今天日期 + "今年是 2026" |
 | user 问"你能查 X 吗"被判 false | LLM 当成"问能力" | prompt 加规则：试探口吻 + 具体话题 → needed=true |
 | bot 回"我不联网" | sonnet 默认人设 | `_ROLE_DISCIPLINE` 显式说明"你有 read_url/web_search 工具" |

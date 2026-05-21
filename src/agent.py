@@ -249,6 +249,8 @@ def _tool_detect_system() -> str:
 _TOOL_FUNCS = {
     "web_search": tools.search_web,
     "read_url": tools.read_url,
+    "search_xhs": tools.search_xhs,      # 2026-05-21 接入（Agent-Reach 工具集）
+    "read_github": tools.read_github,    # 2026-05-21 接入
 }
 
 

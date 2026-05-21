@@ -20,6 +20,15 @@ dependencies = [
     "anthropic>=0.97",
 ]
 
+[project.optional-dependencies]
+# Agent-Reach 工具集（2026-05-21 接入）：YouTube/B站字幕（yt-dlp）+ 小红书（xhs CLI）
+# 装法：pip install -e ".[tools]"  或 Dockerfile 显式 pip install yt-dlp xhs
+# 注意：gh CLI 是 GitHub 官方二进制，不是 Python 包——Dockerfile 里 curl 下载
+tools = [
+    "yt-dlp>=2024.12.0",
+    "xhs>=0.0.10",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

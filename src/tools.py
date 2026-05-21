@@ -1,12 +1,18 @@
-"""Agent Reach 工具封装。
+"""Agent Reach 工具封装（借自 https://github.com/Panniantong/Agent-Reach 的工具选型）。
 
 对外暴露：
 - fetch_urls_in_message(text)  → 提取消息里的 URL 并读取内容（确定性，无需 LLM）
-- search_xhs(keyword)          → 搜索小红书，返回前 5 条笔记摘要
-- search_web(query)            → 通过 Exa 搜网页
-- read_url(url)                → 通过 Jina Reader 读取网页正文
+- search_xhs(keyword)          → 搜索小红书前 5 条笔记摘要（需 ~/.xhs cookie）
+- search_web(query)            → Jina Search 网页搜索（兼任"全网搜"通道）
+- read_url(url)                → Jina Reader 读取网页正文
+- read_github(query)           → gh CLI 读 GitHub 公开仓库 README + 最近 issue
 
 均使用 asyncio.create_subprocess_exec 执行 CLI，超时 8 秒，失败返回空字符串。
+
+容器二进制（Dockerfile 装）：
+- yt-dlp（pip）：YouTube / B站 / 1800 站字幕
+- gh（GitHub 官方 binary）：公开仓库 anon API（60/h）
+- xhs（pip）：小红书；cookie 在 /root/.xhs/（compose volume 持久化）
 """
 from __future__ import annotations
 
@@ -160,18 +166,9 @@ async def _read_video(url: str) -> str:
         return raw[:400]
 
 
-async def _exa_fetch_url(url: str) -> str:
-    """用 Exa 搜索 URL 内容作为兜底。"""
-    call_expr = f"exa.web_search_exa(query: {json.dumps(url, ensure_ascii=False)}, numResults: 1)"
-    raw = await _run("mcporter", "call", call_expr)
-    # 过滤掉 "小红书 - 你的生活兴趣社区" 这类无效结果
-    if raw and "你的生活兴趣社区" not in raw and len(raw) > 50:
-        return raw[:600]
-    return ""
-
-
 async def _fetch_one_url(url: str) -> str:
-    """根据域名路由到最合适的读取方式，主方式失败时用 Exa 兜底。"""
+    """根据域名路由到最合适的读取方式。主方式失败 → 返空（不再二次降级到 Exa，
+    mcporter 已退役）。"""
     d = _domain(url)
     result = ""
     label = ""
@@ -193,12 +190,6 @@ async def _fetch_one_url(url: str) -> str:
         log.info("url fetch %s: %d chars ← %s", label, len(result), url[:60])
         return f"[{label}]\n{result}"
 
-    # 主方式失败，用 Exa 兜底
-    result = await _exa_fetch_url(url)
-    if result:
-        log.info("url fetch exa fallback: %d chars ← %s", len(result), url[:60])
-        return f"[{label} via 搜索]\n{result}"
-
     log.debug("url fetch failed: %s", url[:60])
     return ""
 
@@ -217,42 +208,36 @@ async def fetch_urls_in_message(text: str) -> str:
 
 async def search_xhs(keyword: str) -> str:
     """搜索小红书，返回前 5 条笔记标题和互动数。
-    xhs CLI 失败时（账号风控 / API 拒绝 / 网络）退化到 Exa 网页搜索作为兜底。"""
-    raw = await _run("xhs", "search", keyword, "--json")
-    if raw:
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            data = None
-        if isinstance(data, dict):
-            # 显式失败标记：xhs CLI 返回 ok:false 表示 API 错误（含 -104 风控）
-            if data.get("ok") is False:
-                err_msg = (data.get("error") or {}).get("message", "")
-                log.info("xhs search 失败，转 Exa 兜底：%s", err_msg[:80])
-            else:
-                items = (data.get("data") or {}).get("items") or []
-                lines: list[str] = []
-                for item in items[:5]:
-                    card = item.get("note_card") or {}
-                    title = card.get("display_title") or card.get("title") or ""
-                    info = card.get("interact_info") or {}
-                    likes = info.get("liked_count") or "0"
-                    if title:
-                        lines.append(f"「{title}」（{likes}赞）")
-                if lines:
-                    return "小红书搜索结果：\n" + "\n".join(lines)
-                # 无结果也走 Exa 兜底（也许是关键词太冷门，xhs 返回空）
 
-    # 兜底：用 Exa 搜 site:xiaohongshu.com 限定的网页结果
-    call_expr = (
-        f"exa.web_search_exa(query: "
-        f"{json.dumps(f'{keyword} site:xiaohongshu.com', ensure_ascii=False)}, "
-        f"numResults: 5)"
-    )
-    fallback = await _run("mcporter", "call", call_expr)
-    if fallback and "你的生活兴趣社区" not in fallback:
-        log.info("xhs search exa fallback: %d chars", len(fallback))
-        return f"小红书搜索（网页结果）：\n{fallback[:600]}"
+    xhs CLI 需要 cookie（容器内挂 `/root/.xhs/`，详见 `document/agent-reach-integration.md`）。
+    失败时返空——上游 agent.py:_maybe_fetch_context 让 LLM 自己拿捏（or 用户重新发问后
+    aux LLM 重选 web_search）。
+    """
+    raw = await _run("xhs", "search", keyword, "--json")
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    # xhs CLI ok:false 一般是 -104 风控或 cookie 失效
+    if data.get("ok") is False:
+        err_msg = (data.get("error") or {}).get("message", "")
+        log.info("xhs search 失败：%s", err_msg[:80])
+        return ""
+    items = (data.get("data") or {}).get("items") or []
+    lines: list[str] = []
+    for item in items[:5]:
+        card = item.get("note_card") or {}
+        title = card.get("display_title") or card.get("title") or ""
+        info = card.get("interact_info") or {}
+        likes = info.get("liked_count") or "0"
+        if title:
+            lines.append(f"「{title}」（{likes}赞）")
+    if lines:
+        return "小红书搜索结果：\n" + "\n".join(lines)
     return ""
 
 
@@ -284,6 +269,88 @@ async def search_web(query: str) -> str:
         log.info("jina search 失败：%s", raw[:120])
         return ""
     return raw[:1500]
+
+
+_GITHUB_RE = re.compile(
+    r"(?:https?://github\.com/)?([a-zA-Z0-9][a-zA-Z0-9_-]*)/([a-zA-Z0-9._-]+?)(?:\.git)?(?:/|$|\s)"
+)
+
+
+async def read_github(query: str) -> str:
+    """读 GitHub 公开仓库的 README 摘要 + 最近 5 个 issue 标题。
+
+    query: `owner/repo` 或 `https://github.com/owner/repo[/...]`
+    用 gh CLI anon API（公开仓库不需登录；rate limit 60/h 对 bot 用量足够）。
+    """
+    q = query.strip()
+    if not q:
+        return ""
+    # 解析 owner/repo
+    m = _GITHUB_RE.search(q + " ")  # 加空格让结尾的 (?:/|$|\s) 命中
+    if not m:
+        # 尝试直接当 owner/repo 用
+        if "/" in q and " " not in q:
+            owner_repo = q.strip("/")
+        else:
+            return ""
+    else:
+        owner_repo = f"{m.group(1)}/{m.group(2)}"
+
+    # gh repo view 拿元信息
+    repo_raw = await _run(
+        "gh", "repo", "view", owner_repo,
+        "--json", "name,description,stargazerCount,primaryLanguage,url",
+    )
+    if not repo_raw:
+        return ""
+    try:
+        repo = json.loads(repo_raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    parts = []
+    name = repo.get("name") or owner_repo
+    desc = repo.get("description") or ""
+    stars = repo.get("stargazerCount") or 0
+    lang = (repo.get("primaryLanguage") or {}).get("name") or ""
+    parts.append(f"仓库：{owner_repo}（⭐{stars}{' · ' + lang if lang else ''}）")
+    if desc:
+        parts.append(f"介绍：{desc[:200]}")
+
+    # README 前 400 字
+    readme_raw = await _run(
+        "gh", "api", f"repos/{owner_repo}/readme",
+        "--jq", ".content",  # base64
+    )
+    if readme_raw:
+        try:
+            import base64
+            readme_text = base64.b64decode(readme_raw).decode("utf-8", errors="replace")
+            # 简单去 markdown header marks/链接（保留可读文本）
+            readme_clean = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", readme_text)  # 去图片
+            readme_clean = re.sub(r"<[^>]+>", "", readme_clean)  # 去 HTML tag
+            readme_clean = readme_clean.strip()
+            if readme_clean:
+                parts.append(f"README 摘要：{readme_clean[:400]}")
+        except Exception as e:
+            log.debug("github readme decode err: %s", e)
+
+    # 最近 issue（开 + 关都看）
+    issues_raw = await _run(
+        "gh", "issue", "list", "-R", owner_repo,
+        "--state", "all", "--limit", "5",
+        "--json", "number,title,state",
+    )
+    if issues_raw:
+        try:
+            issues = json.loads(issues_raw)
+            if isinstance(issues, list) and issues:
+                lines = [f"#{i['number']} [{i['state']}] {i['title'][:80]}" for i in issues]
+                parts.append("最近 issue：\n  " + "\n  ".join(lines))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return "\n".join(parts)
 
 
 async def read_url(url: str) -> str:

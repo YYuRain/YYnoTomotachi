@@ -48,7 +48,8 @@ services:
       TELEGRAM_PROXY: http://mihomo:9981
     volumes:
       - ./data:/app/data
-      - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
+      # 2026-05-21 起 prompt/system_baseline.md 已在镜像里（COPY . .）；删了 stale mount
+      - ./data/.xhs-cookie:/root/.xhs   # 小红书 CLI cookie 持久化（手动注入，详见 agent-reach-integration.md）
       - cf-shared:/shared:ro   # 读 cloudflared 写的 admin URL（/admin 命令用）
     # 不暴露端口；bot 是出站连接
 
@@ -65,7 +66,6 @@ services:
     volumes:
       # 改成读写：admin 现在要 UPDATE prompt_overrides / skills 表（approve/reject/disable）
       - ./data:/app/data
-      - ./System Prompt v0.0.1.md:/app/System Prompt v0.0.1.md:ro
     command: ["python", "-m", "scripts.admin"]
     ports:
       # 公开监听；admin UI 走 HTTP Basic Auth（ADMIN_UI_USER / ADMIN_UI_PASSWORD）
