@@ -172,10 +172,12 @@ async def _read_xhs_note(url: str) -> str:
 
 async def _read_video(url: str) -> str:
     """用 yt-dlp 读取视频元信息（标题 + 描述）。"""
-    raw = await _run("yt-dlp", "--dump-json", "--no-simulate", "--quiet", url)
+    # `--dump-json` 默认 simulate 模式（只拿 metadata 不下载）；之前误加 `--no-simulate`
+    # 会强制真下载视频文件——8 秒 timeout 必然超时（容器 2026-05-21 实测确认）。
+    raw = await _run("yt-dlp", "--dump-json", "--skip-download", "--quiet", url)
     if not raw:
-        # B站短链可能需要代理，重试
-        raw = await _run("yt-dlp", "--dump-json", "--no-simulate", "--quiet", url, proxy=True)
+        # B站国内 IP 限制，重试走 mihomo 美区代理
+        raw = await _run("yt-dlp", "--dump-json", "--skip-download", "--quiet", url, proxy=True)
     if not raw:
         return ""
     try:
