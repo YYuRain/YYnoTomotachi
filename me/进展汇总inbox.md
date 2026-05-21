@@ -114,3 +114,17 @@
 - **P1-6 Auto Dream insight 生成**（Generative Agents reflection）：新 `auto_dream_insights(uid)` 抽样最近 90 天 confirmed memory（profile 8 + event 12）→ sonnet 写 1-3 条跨条目高阶观察 + supporting_ids → INSERT 为 `memory_type='insight' confidence=0.8 depends_on=supporting`；scheduler 03:13 cron 第 3 段；admin UI type 过滤器加 insight / 图谱紫色 stroke r=10 / audit 渲染 `memory_dream_insight` 事件；写 `prompt/memory_insight_dream.md` + `memory_prompts.render_insight_dream` helper
 - **记忆评测调研**：写 `me/记忆评测系统调研.md`（学术 benchmark 对照 LoCoMo/LongMemEval/PerLTQA + 6 维评测设计 + LLM-as-judge 方法 + AIDemo P0/P1/P2 落地建议）
 - **实测**：8058993786 跑 auto_dream_insights → 3 条高质量 insight（工作进取 / 睡眠困难模式 / 饮食随意将就），supporting_ids 正确，conf=0.8
+
+### 2026-05-21 续：Agent-Reach 工具集接入
+
+借 [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) 选型把之前 退役的 yt-dlp / xhs 真正装进容器；新加 GitHub 工具：
+
+- **Dockerfile**: 加 `pip install yt-dlp xhs`（独立 layer 不破坏上面 cache）
+- **gh CLI 进退两难**：装了发现 v2.x 强制 auth（公开仓库 anon API 也要 GH_TOKEN）→ 删掉 binary 改直接 `curl https://api.github.com/repos/...` REST，60/h anon 限额对 bot 用法足够
+- **xhs 包是 SDK 不是 CLI**：PyPI `xhs` (ReaJason) 只是 Python 库，没注册 `xhs` 命令——之前 `subprocess xhs search ...` 全失败的真正原因。改用 `from xhs import XhsClient` 直接调；cookie 从 `/root/.xhs/cookies.txt` 或 env `XHS_COOKIE` 读
+- **新 read_github(query)**：query 是 `owner/repo` 或 GitHub URL；输出 = 仓库元信息 + README 摘要（base64 解码）+ 最近 5 issue
+- **agent.py `_TOOL_FUNCS`**: 加 `search_xhs` / `read_github` 两条
+- **prompt/agent_tool_detect.md**: 工具表扩 4 选 1，加触发规则（小红书话题→search_xhs；GitHub 仓库→read_github）
+- **删 mcporter 残留**：`_exa_fetch_url`、`_fetch_one_url` Exa fallback、`search_xhs` mcporter fallback 全删
+- **docker-compose.yml**: bot 加 `./data/.xhs-cookie:/root/.xhs` volume；删 stale `System Prompt v0.0.1.md` mount（文件已 mv 到 prompt/system_baseline.md）
+- 实测：read_github('python/cpython') 895 字 + 5 issues 正确返回
