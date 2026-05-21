@@ -26,6 +26,20 @@
   例："你能查到五月天北京最后一天的演唱会吗" → needed=true, tool=web_search, query="五月天 北京 演唱会 {today_year}"
 - **"你能看 X 吗"+ 紧跟想看具体内容**（"你能看小红书吗""能看 B 站吗"）→ 用户其实想要内容，
   下一句多半是请求—— needed=true，按平台选 `search_xhs` / `web_search`。**不要**当成纯能力试探。
+- **用户明确指示 bot 搜/找/查/给链接（祈使句）—— 100% 必须 needed=true**：
+  - "你帮我找 X" / "你帮我搜 X" / "你帮我查 X"
+  - "你可以找下 X" / "你查一下 X" / "你搜一下 X"
+  - "找下她的切片，给我个链接" / "找一下 X 的视频"
+  - "去搜 / 去找 / 去查 X"
+  - **"给我个/些链接"** / "给个 url" / "把链接发我"
+  这种祈使句**绝不能**判 needed=false（即使 query 不完整也宁可搜——根据上下文猜补 query）。
+  例：上文聊"afee 是 hiphop reaction up 主"，user 说"找下她的切片给我个链接"→
+    needed=true, tool=web_search, query="afee hiphop reaction 切片 bilibili"
+- **"你知道 X 吗 / 你听过 X 吗"+ X 是具体人事物**——这是**用户在询问具体内容**，bot 不应凭
+  训练数据猜测（很可能猜错），应该 search 一下确认：
+  - 例："你知道 afee 吗"（X 是博主名）→ needed=true, query="afee bilibili up主"
+  - 例："你听过那个 podcast 叫忽左忽右吗" → needed=true, query="忽左忽右 播客"
+  - 例外：X 是常识（"你知道圆周率吗"）/ 抽象概念（"你知道什么是爱情吗"）→ false
 
 ## 不需要查询的情况
 
