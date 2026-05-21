@@ -51,8 +51,12 @@ _VIDEO_DOMAINS = {"youtube.com", "youtu.be", "bilibili.com", "b23.tv"}
 async def _run(*args: str, proxy: bool = False) -> str:
     env = {**_TOOL_ENV}
     if proxy:
-        env["HTTPS_PROXY"] = "http://127.0.0.1:7897"
-        env["HTTP_PROXY"] = "http://127.0.0.1:7897"
+        # 读 .env::TELEGRAM_PROXY——本地 dev 是 http://127.0.0.1:7897 (Clash)，
+        # HK 容器是 http://mihomo:9981（compose 内网名）
+        from .config import settings as _settings
+        proxy_url = _settings().telegram_proxy or "http://127.0.0.1:7897"
+        env["HTTPS_PROXY"] = proxy_url
+        env["HTTP_PROXY"] = proxy_url
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -82,8 +86,10 @@ def _domain(url: str) -> str:
 
 async def _resolve_url(url: str) -> str:
     """对短链（xhslink.com 等）跟随重定向，拿到真实 URL。"""
+    from .config import settings as _settings
+    proxy_url = _settings().telegram_proxy or "http://127.0.0.1:7897"
     raw = await _run(
-        "curl", "-sL", "--proxy", "http://127.0.0.1:7897",
+        "curl", "-sL", "--proxy", proxy_url,
         "--max-time", "6", "-w", "\nFINAL_URL:%{url_effective}", "-o", "/dev/null",
         url,
     )
