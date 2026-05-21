@@ -82,7 +82,7 @@ docker compose logs -f bot   # 看 ready
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
 | `src/tools.py` | Agent Reach 工具集 + `TOOL_SCHEMAS`（OpenAI tool schema，主 LLM native tool_use 用）：search_web (Jina) / search_xhs (xhs CLI) / search_bilibili (bili CLI) / read_url (Jina) / read_github (REST API anon) / URL 域名自动路由 (yt-dlp / xhs / Jina) |
-| `src/proactive.py` | 主动搭话：硬门 + LLM 软门 + 每日限额 |
+| `src/proactive.py` | 主动搭话：软概率门（硬门已软化，违规越深 skip_prob 越高，封顶 0.97 保证最差也降频不彻底拦死）+ LLM 决策（`mode` ∈ {topic_chat / share_discovery}）；**share_discovery** = bot 主动调 search_xhs/bili/web 找有趣内容 → LLM 挑一条最 fit user 的带链接分享；xhs/bili 各日 1 条独立配额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
@@ -97,7 +97,7 @@ docker compose logs -f bot   # 看 ready
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）
+- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / `proactive_fires`（含 `mode`/`platform` 列，2026-05-21 加）/ persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）。`storage._ensure_columns` 启动时自动 ALTER 兜底兼容旧 db
 - **记忆栈** via **Postgres + pgvector + pg_trgm**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（带 `entities TEXT[]` / `source_episode_id UUID`）+ `episodes`（P0-4 raw turns provenance）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）

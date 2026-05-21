@@ -49,8 +49,10 @@
 │   ├─ persona_consolidate    每日 03:07 (CST) per user 衰减/清旧观察│
 │   ├─ auto_dream             每日 03:13 (CST) 4 段流水：5.3 三态判定 / override 整理 / │
 │   │                                insight 生成 P1-6 / skill 库整理 │
-│   ├─ proactive_job          每 25m per user 软门 LLM 判断 │
-│   │                                └─► generate_opener(uid) │
+│   ├─ proactive_job          每 25m per user 软概率门 + LLM 决策 │
+│   │                                └─► decide(uid) → mode={topic_chat|share_discovery} │
+│   │                                    share_discovery: search_xhs/bili/web → LLM 挑一条 │
+│   │                                └─► generate_opener(uid)（看 mode 走对应 prompt）│
 │   │                                └─► bot.make_send_and_typing(uid) │
 │   ├─ triggered_reach_job    每 1m  扫 active trigger override (cron match → sonnet 判 │
 │   │                                condition → 暂存或直发，绕开 proactive 冷却) │
@@ -69,7 +71,7 @@
 | 模块 | 职责 | 状态 |
 |------|------|------|
 | `src/config.py` | `.env` → `Settings` dataclass（含 telegram_proxy / embed_server 字段） | ✅ MVP |
-| `src/storage.py` | SQLite 表：interests / reply_samples / last_interaction / proactive_fires / persona_snapshots / users / invite_codes（多用户起所有表都有 user_id） | ✅ MVP |
+| `src/storage.py` | SQLite 表：interests / reply_samples / last_interaction / proactive_fires（含 mode/platform 列）/ persona_snapshots / users / invite_codes（多用户起所有表都有 user_id）；`_ensure_columns` 启动时 ALTER 兜底 | ✅ MVP |
 | `src/users.py` | 邀请码生成/redeem、用户列表、admin 判定、`wipe_user`（test bot /clear 用）、webUI 共享 HMAC token 工具 | ✅ 接入（2026-05-13） |
 | `src/test_bot.py` | 可选第二个 Telegram bot（`TEST_BOT_TOKEN`）：`/become <label>` 选虚拟 user_id（与 chat_id 解耦），完整邀请码激活流程，`/clear` 清盘——同 telegram 账户能扮演多个用户 | ✅ 接入（2026-05-13，可选） |
 | `src/minimax.py` | 聊天走 OpenAI 兼容端点；embed 走 MiniMax 原生格式；自动剥 `<think>` | ✅ MVP |
@@ -104,7 +106,7 @@
   - `interests(user_id, topic, heat, last_touch)` —— 复合 PK `(user_id, topic)`
   - `reply_samples(id, user_id, ts, weekday, hour, replied_within_sec)`
   - `last_interaction(user_id PK, ts)`
-  - `proactive_fires(id, user_id, ts, why, user_probably_doing, opener_angle, opener_text)`
+  - `proactive_fires(id, user_id, ts, why, user_probably_doing, opener_angle, opener_text, mode, platform)` —— `mode` ∈ {topic_chat, share_discovery}；`platform` ∈ {xhs, bili, web, NULL}（share_discovery 通道用，xhs/bili 各日 1 条独立配额）
   - `persona_snapshots(id, user_id, ts, payload_json)`
   - `users(chat_id PK, status, created_at, note, webui_password)` —— 注册用户表
   - `invite_codes(code PK, created_by, created_at, used_by, used_at)` —— 邀请码
@@ -124,7 +126,7 @@
   - `data/.webui_secret` — webUI session 共享 HMAC 密钥（bot 进程铸 token，admin 进程验签；首启者写盘其他读）
 - **prompt 文件夹**（2026-05-21 抽离）：
   - `prompt/system_baseline.md` — persona baseline（即原 `System Prompt v0.0.1.md`）
-  - `prompt/{memory,feedback,chat,emotion,persona,proactive,agent,interests}_*.md` — 23 个 LLM prompt
+  - `prompt/{memory,feedback,chat,emotion,persona,proactive,agent,interests}_*.md` — 24 个 LLM prompt（含 share_discovery 通道用的 `proactive_share_select.md` + `chat_proactive_opener_share_ctx.md`，2026-05-21）
   - 加载方式：`src.prompt_loader.load(name)` 带 `@lru_cache`；改文件重启即生效
 
 ## 扩展点（为下一期明确预留）
