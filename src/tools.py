@@ -145,7 +145,9 @@ async def _read_xhs_note(url: str) -> str:
         parts.append(f"作者：{user}（{likes}赞）")
     if desc:
         parts.append(f"内容：{desc[:400]}")
-    return "\n".join(parts) if parts else ""
+    # 原 URL 留一份给 bot 引用——user 已经把链接发过来，bot 引回去对方一目了然
+    parts.append(f"链接：{url}")
+    return "\n".join(parts)
 
 
 async def _read_video(url: str) -> str:
@@ -166,6 +168,7 @@ async def _read_video(url: str) -> str:
         uploader = info.get("uploader") or info.get("channel") or ""
         desc = (info.get("description") or "")[:300]
         view_count = info.get("view_count") or ""
+        webpage_url = info.get("webpage_url") or info.get("original_url") or ""
         parts = []
         if title:
             parts.append(f"标题：{title}")
@@ -173,6 +176,8 @@ async def _read_video(url: str) -> str:
             parts.append(f"UP主：{uploader}" + (f"（{view_count}播放）" if view_count else ""))
         if desc:
             parts.append(f"简介：{desc}")
+        if webpage_url:
+            parts.append(f"链接：{webpage_url}")
         return "\n".join(parts) if parts else ""
     except (json.JSONDecodeError, IndexError):
         return raw[:400]
@@ -245,8 +250,20 @@ async def search_xhs(keyword: str) -> str:
         title = card.get("display_title") or card.get("title") or ""
         info = card.get("interact_info") or {}
         likes = info.get("liked_count") or "0"
+        note_id = item.get("id") or ""
+        xsec = item.get("xsec_token") or ""
+        # 拼可点 URL 给 bot 引用——bot 如果觉得这条对用户有用，可以 echo 链接
+        if note_id:
+            url = f"https://www.xiaohongshu.com/explore/{note_id}"
+            if xsec:
+                url += f"?xsec_token={xsec}"
+        else:
+            url = ""
         if title:
-            lines.append(f"「{title}」（{likes}赞）")
+            line = f"「{title}」（{likes}赞）"
+            if url:
+                line += f"\n  {url}"
+            lines.append(line)
     if lines:
         return "小红书搜索结果：\n" + "\n".join(lines)
     return ""
@@ -334,7 +351,9 @@ async def read_github(query: str) -> str:
     desc = repo.get("description") or ""
     stars = repo.get("stargazers_count") or 0
     lang = repo.get("language") or ""
+    html_url = repo.get("html_url") or f"https://github.com/{owner_repo}"
     parts.append(f"仓库：{owner_repo}（⭐{stars}{' · ' + lang if lang else ''}）")
+    parts.append(f"链接：{html_url}")
     if desc:
         parts.append(f"介绍：{desc[:200]}")
 
