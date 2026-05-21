@@ -232,7 +232,7 @@ async def _safe_recall(user_id: int, user_text: str) -> list[str]:
 
 # 主 LLM native tool_use 的工具派发表（2026-05-21 起取代 aux detect 路径）
 _TOOL_FUNCS = {
-    "web_search": tools.search_web,
+    "search_web": tools.search_web,
     "read_url": tools.read_url,
     "search_xhs": tools.search_xhs,
     "search_bilibili": tools.search_bilibili,
@@ -332,6 +332,7 @@ async def handle_user_message(
                     log.warning("tool exec %s err: %s", tc_name, e)
                     tool_result = ""
             else:
+                log.warning("主 LLM 调了未知工具 %s——dispatch table 缺 key", tc_name)
                 tool_result = ""
 
             audit("main_tool_call_result", user_id=user_id, tool=tc_name,
