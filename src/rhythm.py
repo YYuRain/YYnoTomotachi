@@ -36,6 +36,12 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?…\n])")
 # 句中停顿——只在单句超长时作为 fallback 切点
 _COMMA_SPLIT_RE = re.compile(r"(?<=[，、,；;])")
 
+# URL 保护——切分前替换占位符，切完还原。否则 URL query string 里的 `?` `=`
+# 会被 _SENT_SPLIT_RE 当作句末切，导致 https://...explore/{id}?xsec_token=... 被
+# 拆成两条消息（id 那条小红书因缺 token 报"页面不见了"）。
+_URL_RE_RHYTHM = re.compile(r"https?://\S+")
+_URL_PLACEHOLDER = "\x00URL{i}\x00"  # \x00 在普通文本不会出现，安全
+
 
 def strip_markdown(text: str) -> str:
     t = text.strip()
@@ -116,7 +122,33 @@ def split_for_chat(
     max_chars: int = MAX_PIECE_CHARS,
     merge_up_to: int | None = None,
 ) -> list[str]:
-    return _soft_pieces(strip_markdown(text), max_chars=max_chars, merge_up_to=merge_up_to)
+    cleaned = strip_markdown(text)
+    # 把 URL 替换成占位符——避免内部 `?` `=` 被句末切；同时占位符前后加 \n 强制
+    # 把 URL 切成独立原子（_SENT_SPLIT_RE 在 \n 处切），还原后 URL 自成一条消息。
+    urls: list[str] = []
+    def _stash(m: re.Match) -> str:
+        urls.append(m.group(0))
+        return f"\n{_URL_PLACEHOLDER.format(i=len(urls) - 1)}\n"
+    safe = _URL_RE_RHYTHM.sub(_stash, cleaned)
+    pieces = _soft_pieces(safe, max_chars=max_chars, merge_up_to=merge_up_to)
+    if not urls:
+        return pieces
+    # 还原：含占位符的 piece 拆成 ≤3 段（前文 / URL / 后文），URL 独立成消息
+    placeholder_re = re.compile(r"\x00URL(\d+)\x00")
+    out: list[str] = []
+    for p in pieces:
+        last_end = 0
+        for m in placeholder_re.finditer(p):
+            head = p[last_end:m.start()].strip()
+            if head:
+                out.append(head)
+            idx = int(m.group(1))
+            out.append(urls[idx])
+            last_end = m.end()
+        tail = p[last_end:].strip()
+        if tail:
+            out.append(tail)
+    return out
 
 
 async def deliver(
