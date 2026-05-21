@@ -261,8 +261,39 @@ async def _maybe_fetch_context(user_text: str, user_id: int | None = None) -> st
     （"对方说 X 时主动查 Y"），detect 阶段把这些指令也喂给 aux LLM——LLM 看到当前
     user_text 命中 trigger 时强制 needed=true，按 override 指引生成 query。
     主 LLM 这一轮 reply 就能直接整合搜到的内容，不会出现"等等让我查"然后没下文的情况。
+
+    2026-05-21：detect 阶段还要喂最近 6 条对话——"afee" 这种单关键词在没上下文时
+    搜不出有效结果，aux LLM 看到 recent 提到"hiphop reaction up主"会自动把 query 写成
+    "afee hiphop reaction bilibili"，搜索精度立刻上去。
     """
     sys_content = _tool_detect_system()
+
+    # 喂最近 6 条 user/assistant 给 aux LLM 帮它构造更精准的 query
+    recent_block = ""
+    if user_id:
+        try:
+            recent = _recent_per_user.get(str(user_id), [])
+            if recent:
+                lines = []
+                for m in recent[-6:]:
+                    role = "user" if m.get("role") == "user" else "asst"
+                    content = (m.get("content") or "").replace("\n", " ").strip()[:160]
+                    if content:
+                        lines.append(f"{role}: {content}")
+                if lines:
+                    recent_block = "\n".join(lines)
+        except Exception as e:
+            log.debug("tool_detect: load recent err uid=%s: %s", user_id, e)
+
+    if recent_block:
+        sys_content += (
+            "\n\n## 最近对话（构造精准 query 用——把上下文里的具体关键词塞进 query）\n"
+            + recent_block
+            + "\n\n**重要**：query 必须**结合 recent 里的关键词**，不要单写当前 user 提到的"
+            "孤零零一个名字。如果当前 user 说『找下 afee 的切片』，而 recent 提到 hiphop / "
+            "reaction / B 站，那 query 必须写 `afee hiphop reaction bilibili 切片`——单写 "
+            "`afee` 会搜出无关的台湾动漫展。"
+        )
     if user_id:
         try:
             from . import storage
