@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid as _uuid
@@ -45,6 +46,15 @@ HYBRID_CANDIDATES_PER_PATH = 20  # 每路召回多少候选喂给融合
 RRF_K = 60                       # RRF 公式 1/(k+rank)，k=60 是 Cormack et al. 工业默认
 NGRAM_WINDOW = 2                 # query 切 2-char window 做 ILIKE 子串匹配（中文友好）
 NGRAM_MIN_HITS = 1               # 至少命中 1 个 ngram 才算候选
+
+# P0-2 三因子 ranker（Generative Agents 借鉴，2026-05-21）：在 RRF 之上叠加 importance + recency
+# final_score = α·RRF_norm + β·confidence + γ·recency_decay
+# 三个分量都 [0,1]；weighted sum 后取 top_k
+RANKER_W_RELEVANCE = 1.0         # α：RRF 分数（用 candidate set 内 max 归一化）
+RANKER_W_IMPORTANCE = 0.3        # β：confidence（已 [0,1]，stale=0.0 / to_verify=0.5 / confirmed=1.0）
+RANKER_W_RECENCY = 0.3           # γ：exp(-Δt / τ)
+TAU_PROFILE_DAYS = 180           # profile 半年衰减一半（profile 是长期事实，老一点不算太严重）
+TAU_EVENT_DAYS = 14              # event 两周衰减一半（event 时效性强，老 event 不应顶到前面）
 # 一些不带语义的口头话术，整句直接命中就跳过（超出长度门时兜底）
 _RECALL_STOPWORD_PATTERNS = [
     re.compile(r"^[嗯啊哦哎呀哈呵嘿耶吧呢吗的了"
@@ -191,7 +201,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                 cosine_rows = conn.execute(
                     sql_text(
                         "SELECT id::text AS id, summary, created_at, status, "
-                        "last_verified_at, depends_on, entities, "
+                        "last_verified_at, depends_on, entities, memory_type, confidence, "
                         "(embedding <=> CAST(:q AS vector)) AS dist "
                         "FROM memories "
                         "WHERE user_id = :uid AND status != 'stale' "
@@ -229,7 +239,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                 ngram_rows = conn.execute(
                     sql_text(
                         "SELECT id::text AS id, summary, created_at, status, "
-                        "last_verified_at, depends_on, entities, "
+                        "last_verified_at, depends_on, entities, memory_type, confidence, "
                         f"({hits_expr}) AS hits "
                         "FROM memories "
                         "WHERE user_id = :uid AND status != 'stale' "
@@ -249,7 +259,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             ent_rows = conn.execute(
                 sql_text(
                     "SELECT id::text AS id, summary, created_at, status, "
-                    "last_verified_at, depends_on, entities, "
+                    "last_verified_at, depends_on, entities, memory_type, confidence, "
                     "(SELECT count(*) FROM unnest(entities) e "
                     "  WHERE :q ILIKE '%' || e || '%') AS hits "
                     "FROM memories "
@@ -266,7 +276,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             cand_per_path["entity"] = [_row_to_item(r) for r in ent_rows]
             audit_paths["entity"] = len(ent_rows)
 
-        # ---- RRF 融合 ----
+        # ---- RRF 融合（P0-1） ----
         rrf_score: dict[str, float] = {}
         item_by_id: dict[str, dict[str, Any]] = {}
         per_path_rank: dict[str, dict[str, int]] = {}
@@ -282,9 +292,44 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                 elif it.get("dist") is not None and item_by_id[rid].get("dist") is None:
                     item_by_id[rid]["dist"] = it["dist"]
 
-        # 取 top_k
-        ranked_ids = sorted(rrf_score, key=lambda x: rrf_score[x], reverse=True)[:top_k]
+        # ---- P0-2 三因子加权（Generative Agents 借鉴）----
+        # final = α·rel + β·imp + γ·rec
+        #  rel = RRF_norm（用 candidate 内 max 归一化到 [0,1]）
+        #  imp = confidence（已 [0,1]，stale 此处不会进来已被 SQL 滤）
+        #  rec = exp(-Δt / τ)，profile τ=180d、event τ=14d
+        now_for_rank = datetime.now(timezone.utc)
+        rrf_max = max(rrf_score.values()) if rrf_score else 1.0
+        scored: dict[str, dict[str, float]] = {}
+        for rid, raw in rrf_score.items():
+            it = item_by_id[rid]
+            rel = (raw / rrf_max) if rrf_max > 0 else 0.0
+            imp = float(it.get("confidence") or 1.0)
+            mtype = it.get("memory_type") or "profile"
+            tau_days = TAU_EVENT_DAYS if mtype == "event" else TAU_PROFILE_DAYS
+            created = it.get("created_at")
+            try:
+                age_sec = (now_for_rank - created).total_seconds() if created else 0.0
+            except TypeError:
+                # naive datetime fallback
+                age_sec = (datetime.now() - created.replace(tzinfo=None)).total_seconds() if created else 0.0
+            age_days = max(0.0, age_sec / 86400.0)
+            rec = math.exp(-age_days / max(1.0, tau_days))
+            final = (RANKER_W_RELEVANCE * rel
+                     + RANKER_W_IMPORTANCE * imp
+                     + RANKER_W_RECENCY * rec)
+            scored[rid] = {
+                "rel": round(rel, 3), "imp": round(imp, 3),
+                "rec": round(rec, 3), "final": round(final, 3),
+                "raw_rrf": round(raw, 4), "age_days": round(age_days, 1),
+                "tau_days": tau_days,
+            }
+
+        # 取 top_k（按 final 排）
+        ranked_ids = sorted(scored, key=lambda x: scored[x]["final"], reverse=True)[:top_k]
         items = [item_by_id[rid] for rid in ranked_ids]
+        # 把分量贴回 item，audit 时方便看
+        for rid in ranked_ids:
+            item_by_id[rid]["score_components"] = scored[rid]
 
         # 5.2：找需要反验证的
         now = datetime.now(timezone.utc)
@@ -329,6 +374,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                         )
 
         distances: list[float] = []
+        score_breakdown: list[dict[str, Any]] = []
         for it in items:
             date = _fmt_date(it["created_at"])
             marker = "[待确认] " if it["status"] == "to_verify" else ""
@@ -336,9 +382,17 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
             snippets.append(base)
             if it.get("dist") is not None:
                 distances.append(round(it["dist"], 3))
+            sc = it.get("score_components") or {}
+            if sc:
+                score_breakdown.append({
+                    "id": it["id"][:8],
+                    "type": it.get("memory_type"),
+                    **{k: sc[k] for k in ("rel", "imp", "rec", "final", "age_days") if k in sc},
+                })
     except Exception as e:
         log.debug("recall uid=%s 失败：%s", uid_str, e)
         distances = []
+        score_breakdown = []
 
     log.info(
         "recall uid=%s query=%r → %d hits (paths: cos=%d ng=%d ent=%d)%s",
@@ -356,13 +410,17 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
         distances=distances[:top_k],
         max_distance_threshold=RECALL_MAX_DISTANCE,
         candidates_per_path=audit_paths,
+        score_breakdown=score_breakdown,
+        ranker_weights={"rel": RANKER_W_RELEVANCE, "imp": RANKER_W_IMPORTANCE,
+                        "rec": RANKER_W_RECENCY, "tau_profile_d": TAU_PROFILE_DAYS,
+                        "tau_event_d": TAU_EVENT_DAYS},
     )
     return snippets[:top_k]
 
 
 def _row_to_item(row, *, dist: bool = False) -> dict[str, Any]:
     """SQL row → dict。三路 SELECT 列顺序保持一致：id/summary/created_at/status/
-    last_verified_at/depends_on/entities/[最后一列各路自己的分数]。"""
+    last_verified_at/depends_on/entities/memory_type/confidence/[最后一列各路自己的分数]。"""
     return {
         "id": row[0],
         "summary": row[1],
@@ -371,7 +429,9 @@ def _row_to_item(row, *, dist: bool = False) -> dict[str, Any]:
         "last_verified_at": row[4],
         "depends_on": row[5],
         "entities": row[6],
-        "dist": float(row[7]) if dist and row[7] is not None else None,
+        "memory_type": row[7],
+        "confidence": float(row[8]) if row[8] is not None else 1.0,
+        "dist": float(row[9]) if dist and row[9] is not None else None,
     }
 
 

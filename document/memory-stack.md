@@ -89,7 +89,7 @@ maybe_flush(uid, force)
             LLM 一次 call 拿 verdicts → UPDATE 旧条目 status / depends_on
 ```
 
-## Hot path：recall 三路 RRF（P0-1，2026-05-20）
+## Hot path：recall 三路 RRF + 三因子 ranker（P0-1 + P0-2，2026-05-20/21）
 
 ```
 recall(uid, user_text, top_k=3)
@@ -106,8 +106,15 @@ recall(uid, user_text, top_k=3)
   └─ entity 路   EXISTS unnest(entities) e WHERE :q ILIKE '%'||e||'%'，按命中数 DESC
    │
    ▼
-RRF 融合：score(doc) = Σ 1/(RRF_K + rank_in_path)，RRF_K=60
-取 top_k 候选
+RRF 融合：rrf_score(doc) = Σ 1/(RRF_K + rank_in_path)，RRF_K=60
+   │
+   │ P0-2 三因子加权（Generative Agents 借鉴）：在 RRF 上叠加 importance + recency
+   │   rel = rrf_score / max(rrf_score in candidates)
+   │   imp = confidence 字段（[0,1]，stale=0/to_verify=0.5/confirmed=1）
+   │   rec = exp(-age_days / τ)，profile τ=180d、event τ=14d
+   │   final = α·rel + β·imp + γ·rec  （α=1.0, β=0.3, γ=0.3 默认）
+   ▼
+按 final 排序取 top_k
    │
    │ 候选中 status='to_verify' 且 last_verified_at NULL 或 30min 之前 → due
    ▼
@@ -122,7 +129,10 @@ audit memory_recall 加 candidates_per_path（cosine/ngram/entity 各路命中�
 - `RECALL_MAX_DISTANCE = 0.55` 仅 cosine 路用（噪声底）
 - `NGRAM_MIN_HITS = 1` 命中至少一个 ngram 才算候选；调高更严
 - `RRF_K = 60` 工业默认，越大越平均越小越尖锐
-- audit `memory_recall.candidates_per_path` 看每路命中数；某路一直是 0 = 该路设计有问题或数据没填好（如老 memory entities 都是 NULL，需要 backfill 或等新写入）
+- `RANKER_W_RELEVANCE/IMPORTANCE/RECENCY` 三因子权重，默认 1.0 / 0.3 / 0.3。
+  调小 RECENCY 会让老 profile 更容易进 top；调大 RECENCY 让最新 event 更突出。
+- `TAU_PROFILE_DAYS=180 / TAU_EVENT_DAYS=14`：半衰期。event 时效性强（τ 短），profile 长期稳定（τ 长）。
+- audit `memory_recall.candidates_per_path` 看每路命中数；`score_breakdown` 看每条 hit 的 rel/imp/rec/final 分量、`age_days` 和实际 τ。某路一直是 0 = 该路设计有问题或数据没填好（如老 memory entities 都是 NULL，需要 backfill 或等新写入）
 
 ```
 03:13 cron auto_dream_job (CST)
