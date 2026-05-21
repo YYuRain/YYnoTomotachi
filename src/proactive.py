@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -30,13 +31,14 @@ from .storage import ProactiveFire, session
 
 log = logging.getLogger(__name__)
 
-# 硬门参数（夜间不再硬门——交给软门判断）
-MIN_GAP_FROM_USER_SEC = 30 * 60        # 对方刚聊过 30min 内不主动（缩短自 1h，2026-05-14）
-MIN_GAP_FROM_SELF_SEC = 60 * 60        # 自己上次主动 60min 内不连续（缩短自 90min，2026-05-14）
-DAILY_CAP = 6                          # 每天最多主动 6 条
-MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user 回应 → backoff（2026-05-21
-                                       # 加，admin 数据清空后 last_interaction=inf + recent 全是
-                                       # assistant 自己的 opener，bot 反复发同一句不知道停）
+# 软门参数（2026-05-21 改：硬门→概率门——违规越严重 skip_prob 越高，但永不到 100%
+# 保证"最差只是降频，不会完全不主动"）
+MIN_GAP_FROM_USER_SEC = 30 * 60        # 对方刚聊过的参考阈值
+MIN_GAP_FROM_SELF_SEC = 60 * 60        # 自己上次主动的参考阈值
+DAILY_CAP = 6                          # 软上限——超了之后概率快速衰减但仍可能触发
+MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user 回应 → 降频
+SOFT_SKIP_PROB_CAP = 0.97              # 单次 skip_prob 上限——保证 ≥3% 概率突破
+SOFT_SKIP_REASONS_MAX_AUDIT = 4        # audit 记几条 violation
 
 # Share-discovery 通道（2026-05-21）：bot 主动上网找有趣的分享给 user
 SHARE_PLATFORMS = ("xhs", "bili", "web")   # 支持的平台
@@ -205,36 +207,66 @@ def record_fire(
           mode=mode, platform=platform)
 
 
+def _compute_soft_gate_skip(
+    *, idle_sec: float, last_fire: Optional[datetime], now: datetime,
+    today_count: int, consecutive_asst: int,
+) -> tuple[float, list[dict[str, Any]]]:
+    """把所有"门违规"转成 skip_prob——取最大那个决定是否跳过。
+
+    设计：违规越深，skip_prob 越大但永远 ≤ SOFT_SKIP_PROB_CAP（0.97）。
+    保证最差也有 ≥3% 概率发出去——"频率降低但不会完全不主动"。
+    """
+    violations: list[dict[str, Any]] = []
+
+    # 1) 对方刚聊过——0 idle 时 0.95，到达 MIN_GAP 时 0.5，超过线性衰减到 0
+    if idle_sec < MIN_GAP_FROM_USER_SEC:
+        ratio = max(0.0, idle_sec / MIN_GAP_FROM_USER_SEC)
+        prob = 0.95 - 0.45 * ratio  # 0.95 → 0.5
+        violations.append({"reason": "user_cooldown", "prob": round(prob, 3),
+                           "idle_min": round(idle_sec / 60, 1)})
+
+    # 2) 自己上次主动太近——同形状
+    if last_fire is not None:
+        since_self = (now - last_fire).total_seconds()
+        if since_self < MIN_GAP_FROM_SELF_SEC:
+            ratio = max(0.0, since_self / MIN_GAP_FROM_SELF_SEC)
+            prob = 0.95 - 0.45 * ratio  # 0.95 → 0.5
+            violations.append({"reason": "self_cooldown", "prob": round(prob, 3),
+                               "since_min": round(since_self / 60, 1)})
+
+    # 3) 每日上限——刚到 0.85，每超 1 条 +0.04，封顶 cap
+    if today_count >= DAILY_CAP:
+        over = today_count - DAILY_CAP + 1
+        prob = min(SOFT_SKIP_PROB_CAP, 0.85 + 0.04 * over)
+        violations.append({"reason": "daily_cap", "prob": round(prob, 3),
+                           "opens_today": today_count, "cap": DAILY_CAP})
+
+    # 4) 连续没回——1 条 0.7，2 条 0.85，3+ 0.95（仍有 5% 概率突破）
+    if consecutive_asst >= MAX_UNANSWERED_FIRES and last_fire is not None:
+        extras = consecutive_asst - MAX_UNANSWERED_FIRES
+        prob = min(SOFT_SKIP_PROB_CAP, 0.70 + 0.15 * extras)
+        violations.append({"reason": "unanswered_streak", "prob": round(prob, 3),
+                           "consecutive_asst": consecutive_asst})
+
+    if not violations:
+        return 0.0, []
+    skip_prob = max(v["prob"] for v in violations)
+    return min(SOFT_SKIP_PROB_CAP, skip_prob), violations
+
+
 async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str, Any]]:
-    """返回 None = 不主动；否则返回 {why, user_probably_doing, opener_angle}。"""
+    """返回 None = 不主动；否则返回 {why, user_probably_doing, opener_angle}。
+
+    门策略（2026-05-21 改）：所有"硬门"软化为概率跳过。违规越严重 skip_prob 越高
+    （封顶 0.97），但永远不会 100% 拦死——保证"频率降低但不会完全不主动"。
+    """
     now = now or datetime.now()
 
-    # 硬门（夜间不再过滤——交给下面的软门 LLM 看 user_active_score_now 判断）。
-    # 每个硬门拦截都打 audit，方便事后排查"为啥这段时间没主动发"。
     idle_sec = availability.seconds_since_last_interaction(user_id)
     today_count = _count_today(user_id)
     last_fire = _last_fire_ts(user_id)
-    if idle_sec < MIN_GAP_FROM_USER_SEC:
-        audit("proactive_decision", user_id=user_id, should=False,
-              why="hard_gate:user_cooldown",
-              ctx={"idle_min": round(idle_sec / 60, 1),
-                   "min_gap_min": MIN_GAP_FROM_USER_SEC // 60})
-        return None
-    if last_fire and (now - last_fire).total_seconds() < MIN_GAP_FROM_SELF_SEC:
-        audit("proactive_decision", user_id=user_id, should=False,
-              why="hard_gate:self_cooldown",
-              ctx={"since_last_fire_min": round((now - last_fire).total_seconds() / 60, 1),
-                   "min_gap_min": MIN_GAP_FROM_SELF_SEC // 60})
-        return None
-    if today_count >= DAILY_CAP:
-        audit("proactive_decision", user_id=user_id, should=False,
-              why="hard_gate:daily_cap",
-              ctx={"opens_today": today_count, "cap": DAILY_CAP})
-        return None
 
-    # 新硬门（2026-05-21）：连续 MAX_UNANSWERED_FIRES 次 proactive 没等到 user 回应 → backoff
-    # 衡量方法：看 _recent_per_user 末尾连续的 assistant 数量（中间没夹任何 user message）。
-    # 这样 last_interaction 表是否存在不影响判断——直接看实际对话状态。
+    # 连续 N 条没回判定：看 _recent_per_user 末尾连续 assistant 数量
     try:
         from .agent import _recent_per_user
         rec_msgs = _recent_per_user.get(str(user_id), [])
@@ -246,13 +278,23 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
             consecutive_asst += 1
         else:
             break
-    if consecutive_asst >= MAX_UNANSWERED_FIRES and last_fire is not None:
-        audit("proactive_decision", user_id=user_id, should=False,
-              why="hard_gate:unanswered_streak",
-              ctx={"consecutive_asst_msgs": consecutive_asst,
-                   "max_unanswered": MAX_UNANSWERED_FIRES,
-                   "last_fire_min_ago": round((now - last_fire).total_seconds() / 60, 1)})
-        return None
+
+    skip_prob, violations = _compute_soft_gate_skip(
+        idle_sec=idle_sec, last_fire=last_fire, now=now,
+        today_count=today_count, consecutive_asst=consecutive_asst,
+    )
+    if skip_prob > 0:
+        roll = random.random()
+        if roll < skip_prob:
+            audit("proactive_decision", user_id=user_id, should=False,
+                  why=f"soft_gate:{violations[0]['reason']}",
+                  ctx={"skip_prob": round(skip_prob, 3), "roll": round(roll, 3),
+                       "violations": violations[:SOFT_SKIP_REASONS_MAX_AUDIT]})
+            return None
+        # 突破了——继续走软门 LLM；audit 留个痕迹方便观察
+        audit("proactive_soft_gate_passed", user_id=user_id,
+              skip_prob=round(skip_prob, 3), roll=round(roll, 3),
+              violations=violations[:SOFT_SKIP_REASONS_MAX_AUDIT])
 
     score = availability.score(user_id, now.weekday(), now.hour)
     top = [t for t, _ in interests.top(user_id, 6)]
