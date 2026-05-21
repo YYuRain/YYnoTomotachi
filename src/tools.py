@@ -398,9 +398,15 @@ async def search_bilibili(keyword: str) -> str:
     if data.get("ok") is False:
         log.info("bili search 失败：%s", str((data.get("error") or {}).get("message", ""))[:120])
         return ""
-    items = (data.get("data") or {}).get("items") or []
+    # bili-cli 返 `data` 是 list（每条 item 直接），不是 dict——之前误当 dict.get("items")
+    raw_items = data.get("data") or []
+    if isinstance(raw_items, dict):
+        raw_items = raw_items.get("items") or []
+    items = raw_items if isinstance(raw_items, list) else []
     lines: list[str] = []
     for it in items[:5]:
+        if not isinstance(it, dict):
+            continue
         title = it.get("title") or ""
         up = it.get("author") or it.get("uploader") or ""
         plays = it.get("play") or it.get("view") or it.get("view_count") or ""
