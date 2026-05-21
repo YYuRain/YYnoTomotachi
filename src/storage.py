@@ -42,7 +42,12 @@ class LastInteraction(Base):
 
 
 class ProactiveFire(Base):
-    """AI 主动发起（开场）的历史。每条带 user_id；用于节流 / 每日上限 / 最近触发时间。"""
+    """AI 主动发起（开场）的历史。每条带 user_id；用于节流 / 每日上限 / 最近触发时间。
+
+    mode/platform 是 share-discovery 通道（2026-05-21）加的——
+    mode='topic_chat'（默认，老路径）|'share_discovery'（带链接分享）；
+    platform='xhs'|'bili'|'web'|None；用 (user_id, mode, platform, today) 算独立配额。
+    """
     __tablename__ = "proactive_fires"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False, index=True)
@@ -51,6 +56,8 @@ class ProactiveFire(Base):
     user_probably_doing = Column(String, nullable=True)
     opener_angle = Column(String, nullable=True)
     opener_text = Column(String, nullable=True)
+    mode = Column(String, nullable=True)        # 'topic_chat' | 'share_discovery'
+    platform = Column(String, nullable=True)    # 'xhs' | 'bili' | 'web' | None
 
 
 class PersonaSnapshot(Base):
@@ -238,6 +245,13 @@ def _ensure_columns(eng) -> None:
                 conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN condition_prompt TEXT"))
             if "last_fired_at" not in cols:
                 conn.execute(text("ALTER TABLE prompt_overrides ADD COLUMN last_fired_at TIMESTAMP"))
+    if "proactive_fires" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("proactive_fires")}
+        with eng.begin() as conn:
+            if "mode" not in cols:
+                conn.execute(text("ALTER TABLE proactive_fires ADD COLUMN mode TEXT"))
+            if "platform" not in cols:
+                conn.execute(text("ALTER TABLE proactive_fires ADD COLUMN platform TEXT"))
 
 
 def session():

@@ -97,12 +97,15 @@ def build() -> AsyncIOScheduler:
             # 让下一轮 user 回复时上下文能看见这条 opener
             from .agent import record_proactive_message
             record_proactive_message(uid, text)
+            share_item = decision.get("share_item") or {}
             proactive.record_fire(
                 uid,
                 why=decision.get("why", ""),
                 user_probably_doing=decision.get("user_probably_doing", ""),
                 opener_angle=decision.get("opener_angle", ""),
                 opener_text=text,
+                mode=decision.get("mode", "topic_chat"),
+                platform=share_item.get("platform"),
             )
             log.info("proactive opener sent uid=%d: %s", uid, text[:60])
 

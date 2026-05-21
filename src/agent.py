@@ -487,7 +487,12 @@ async def generate_opener(user_id: int, context: dict | None = None) -> str:
         interests_cold=cold_,
         user_id=user_id,
     )
-    hint = prompts.render_proactive_opener(context) if context else prompts.PROACTIVE_OPENER_INSTRUCTIONS
+    if context and context.get("mode") == "share_discovery" and context.get("share_item"):
+        hint = prompts.render_proactive_opener_share(context)
+    elif context:
+        hint = prompts.render_proactive_opener(context)
+    else:
+        hint = prompts.PROACTIVE_OPENER_INSTRUCTIONS
     bits = [f"现在 {clock.now_signal()}"]
     idle_sec = availability.seconds_since_last_interaction(user_id)
     if idle_sec != float("inf") and idle_sec > 30:

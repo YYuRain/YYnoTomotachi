@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 from sqlalchemy import func, select
 
-from . import availability, interests, llm
+from . import availability, interests, llm, tools
 from .audit_log import audit
 from .storage import ProactiveFire, session
 
@@ -37,6 +37,14 @@ DAILY_CAP = 6                          # 每天最多主动 6 条
 MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user 回应 → backoff（2026-05-21
                                        # 加，admin 数据清空后 last_interaction=inf + recent 全是
                                        # assistant 自己的 opener，bot 反复发同一句不知道停）
+
+# Share-discovery 通道（2026-05-21）：bot 主动上网找有趣的分享给 user
+SHARE_PLATFORMS = ("xhs", "bili", "web")   # 支持的平台
+SHARE_DAILY_CAP_PER_PLATFORM = {           # 每日单平台上限
+    "xhs": 1,
+    "bili": 1,
+    "web": 99,                             # web 不限（仍计入 DAILY_CAP 总盘）
+}
 
 
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
@@ -79,9 +87,103 @@ def _last_fire_ts(user_id: int) -> Optional[datetime]:
         return row.ts if row else None
 
 
+def _count_today_share_by_platform(user_id: int, platform: str) -> int:
+    """Share-discovery 通道每日单平台已 fire 次数。"""
+    start, end = _today_range_utc()
+    with session() as sess:
+        stmt = select(func.count(ProactiveFire.id)).where(
+            ProactiveFire.user_id == user_id,
+            ProactiveFire.ts >= start,
+            ProactiveFire.ts < end,
+            ProactiveFire.mode == "share_discovery",
+            ProactiveFire.platform == platform,
+        )
+        return int(sess.execute(stmt).scalar() or 0)
+
+
+def _share_quota_remaining(user_id: int) -> list[str]:
+    """返回今天还能用的 platform 列表。"""
+    out: list[str] = []
+    for p in SHARE_PLATFORMS:
+        cap = SHARE_DAILY_CAP_PER_PLATFORM.get(p, 1)
+        if _count_today_share_by_platform(user_id, p) < cap:
+            out.append(p)
+    return out
+
+
+_SEARCH_FN = {
+    "xhs": tools.search_xhs,
+    "bili": tools.search_bilibili,
+    "web": tools.search_web,
+}
+
+
+async def _select_share_item(
+    user_id: int, platform: str, query: str, *, recent_topics: list[str],
+) -> Optional[dict[str, Any]]:
+    """调对应平台搜索 → LLM 看结果挑一条最 fit user 的。
+
+    返回 {platform, title, url, blurb} 或 None（搜索 0 / LLM 弃选 / 解析失败）。
+    """
+    fn = _SEARCH_FN.get(platform)
+    if fn is None:
+        return None
+    try:
+        raw = await fn(query)
+    except Exception as e:
+        log.info("share search %s err: %s", platform, e)
+        audit("proactive_share_search_error",
+              user_id=user_id, platform=platform, query=query, error=str(e)[:200])
+        return None
+    if not raw:
+        audit("proactive_share_search_empty",
+              user_id=user_id, platform=platform, query=query)
+        return None
+
+    # LLM 挑一条（aux tier 便宜 model 即可）
+    from . import prompt_loader
+    sys_prompt = prompt_loader.load("proactive_share_select")
+    user_msg = json.dumps({
+        "platform": platform,
+        "query": query,
+        "recent_topics": recent_topics,
+        "results": raw,
+    }, ensure_ascii=False, indent=2)
+    try:
+        data = await llm.chat_json(
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=500,
+        )
+    except Exception as e:
+        log.info("share select llm err: %s", e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    idx = data.get("idx")
+    if not isinstance(idx, int) or idx < 0:
+        audit("proactive_share_no_pick",
+              user_id=user_id, platform=platform, query=query,
+              raw_preview=raw[:300])
+        return None
+    title = str(data.get("title") or "").strip()
+    url = str(data.get("url") or "").strip()
+    blurb = str(data.get("blurb") or "").strip()
+    if not (title and url):
+        return None
+    item = {"platform": platform, "title": title[:200], "url": url[:500], "blurb": blurb[:80]}
+    audit("proactive_share_selected",
+          user_id=user_id, platform=platform, query=query,
+          picked_title=item["title"], picked_url=item["url"], blurb=item["blurb"])
+    return item
+
+
 def record_fire(
     user_id: int,
     *, why: str, user_probably_doing: str, opener_angle: str, opener_text: str,
+    mode: str = "topic_chat", platform: Optional[str] = None,
 ) -> None:
     with session() as sess:
         sess.add(
@@ -92,12 +194,15 @@ def record_fire(
                 user_probably_doing=user_probably_doing[:80],
                 opener_angle=opener_angle[:80],
                 opener_text=opener_text[:500],
+                mode=mode,
+                platform=platform,
             )
         )
         sess.commit()
     audit("proactive_fire", user_id=user_id, why=why,
           user_probably_doing=user_probably_doing,
-          opener_angle=opener_angle, opener_text=opener_text)
+          opener_angle=opener_angle, opener_text=opener_text,
+          mode=mode, platform=platform)
 
 
 async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str, Any]]:
@@ -173,6 +278,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
     except Exception as e:
         log.debug("proactive decide load overrides err uid=%s: %s", user_id, e)
 
+    share_quota_remaining = _share_quota_remaining(user_id)
     ctx: dict[str, Any] = {
         "now": now.strftime("%H:%M"),
         "weekday": _WEEKDAYS[now.weekday()],
@@ -183,6 +289,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "active_overrides": active_overrides,
         "opens_today": today_count,
         "daily_cap": DAILY_CAP,
+        "share_quota_remaining": share_quota_remaining,
     }
     user_msg = json.dumps(ctx, ensure_ascii=False, indent=2)
 
@@ -208,15 +315,33 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         audit("proactive_decision", user_id=user_id, should=False, why=why, ctx=ctx)
         return None
 
-    decision = {
+    decision: dict[str, Any] = {
         "why": str(data.get("why") or "")[:80],
         "user_probably_doing": str(data.get("user_probably_doing") or "")[:80],
         "opener_angle": str(data.get("opener_angle") or "")[:80],
         "recent_topics": top,
+        "mode": "topic_chat",
+        "share_item": None,
     }
+
+    # Share-discovery 分支：LLM 输出了 share_intent 且配额够 → 调 search + LLM 挑
+    share_intent = data.get("share_intent") if isinstance(data, dict) else None
+    if isinstance(share_intent, dict):
+        platform = str(share_intent.get("platform") or "").strip()
+        query = str(share_intent.get("query") or "").strip()
+        if platform in SHARE_PLATFORMS and query and platform in share_quota_remaining:
+            item = await _select_share_item(
+                user_id, platform, query, recent_topics=top,
+            )
+            if item:
+                decision["mode"] = "share_discovery"
+                decision["share_item"] = item
+            # 选不出来就 silent 降级到 topic_chat（_select_share_item 内部已 audit）
+
     log.info(
-        "proactive GO uid=%d: why=%r doing=%r angle=%r",
-        user_id, decision["why"], decision["user_probably_doing"], decision["opener_angle"],
+        "proactive GO uid=%d: why=%r doing=%r angle=%r mode=%s",
+        user_id, decision["why"], decision["user_probably_doing"],
+        decision["opener_angle"], decision["mode"],
     )
     audit("proactive_decision", user_id=user_id, should=True, ctx=ctx, **decision)
     return decision

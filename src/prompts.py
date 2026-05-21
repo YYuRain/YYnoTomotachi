@@ -152,3 +152,18 @@ def render_proactive_opener(ctx: dict) -> str:
     return prompt_loader.load("chat_proactive_opener_with_ctx").format(
         user_doing=user_doing, angle=angle, topic_line=topic_line,
     )
+
+
+def render_proactive_opener_share(ctx: dict) -> str:
+    """share_discovery 模式开场白：bot 真搜了一条想分享，prompt 覆盖"不要假装刚刷到"禁令。"""
+    user_doing = ctx.get("user_probably_doing") or "不确定对方在做什么"
+    item = ctx.get("share_item") or {}
+    platform = item.get("platform") or "网上"
+    title = item.get("title") or ""
+    url = item.get("url") or ""
+    blurb = item.get("blurb") or ""
+    platform_label = {"xhs": "小红书", "bili": "B 站", "web": "网上"}.get(platform, platform)
+    return prompt_loader.load("chat_proactive_opener_share_ctx").format(
+        user_doing=user_doing, platform=platform_label,
+        title=title, url=url, blurb=blurb,
+    )
