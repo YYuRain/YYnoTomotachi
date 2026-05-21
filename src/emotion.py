@@ -32,21 +32,10 @@ class EmotionSignal:
     hint: str = ""         # 一句话总结"对方这会儿真的想说什么"
 
 
-_DETECT_SYSTEM = """你是一个对话状态判官。读用户最新消息（可结合最近几轮上下文），输出一个 JSON 判断此刻应该用哪档"聊法"。
-
-四档：
-- casual：日常闲聊、调侃、梗、随口应答、工具性问题、抬杠。**默认档，拿不准就归这里。**
-- empathy：用户在走心——表达脆弱/难过/疲惫、说身边重要的人事、认真的喜悦、被情绪淹没想找人听。关键词线索：叹气、"有点累"、"就……"、省略号、"最近"、"我感觉"、讲亲近关系的人、语句慢下来。**不要把吐槽老板当 empathy——除非他真的是在 breakdown。**
-- depth：用户抛出一个具体问题/议题要你给看法（技术、选择、判断、分析），期待你动脑子。"你觉得"、"怎么办"、"应该……吗"、请教性质的。**不要把闲聊里的"你觉得"当 depth——那是客气。**
-- interest：用户在兴头上——分享让 ta 真兴奋的事、聊到 ta 真喜欢的话题（游戏/番剧/音乐/发现了一件酷事/刚看完什么东西想说）。特征：语气里有明显能量（感叹号、"太…了"、"好…"、"哇"、"真的假的"、反复说某件事），valence 偏正，arousal ≥ 0.6。**只有对方明显"在对这件事上头"才用——漫不经心聊日常不算，还是 casual。**
-
-输出严格 JSON：
-{"mode": "casual|empathy|depth|interest",
- "valence": -1..1 的数（负=负向情绪），
- "arousal": 0..1 的数（情绪强度），
- "hint": "不超过 20 字，对方这会儿真的在说什么"}
-
-判断保守：拿不准就 casual。empathy / depth / interest 都是例外，不是默认。"""
+def _detect_system() -> str:
+    """从 prompt/emotion_detect.md 加载（2026-05-21 抽出）。"""
+    from . import prompt_loader
+    return prompt_loader.load("emotion_detect")
 
 
 _FALLBACK = EmotionSignal(mode="casual")
@@ -77,7 +66,7 @@ async def detect(
     try:
         data = await llm.chat_json(
             [
-                {"role": "system", "content": _DETECT_SYSTEM},
+                {"role": "system", "content": _detect_system()},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2048,

@@ -101,7 +101,7 @@ def load_settings() -> Settings:
         interest_decay_tau_hours=float(_opt("INTEREST_DECAY_TAU_HOURS", "48")),
         app_db_path=(ROOT / _opt("APP_DB_PATH", "./data/app.sqlite")).resolve(),
         root=ROOT,
-        system_prompt_path=ROOT / "System Prompt v0.0.1.md",
+        system_prompt_path=ROOT / "prompt" / "system_baseline.md",
     )
 
 

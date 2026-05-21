@@ -230,40 +230,16 @@ async def _safe_recall(user_id: int, user_text: str) -> list[str]:
         return []
 
 
-_TOOL_DETECT_SYSTEM_TEMPLATE = """你是工具调用判断助手。今天是 {today}（{weekday}）。
-判断用户这条消息是否需要查询实时信息才能更好地回复。
-
-需要查询的情况（必须 needed=true）：
-- 问某人最近做了什么、去了哪里、说了什么（公众人物动态）
-- 问实时数据：股价、行情、天气、汇率
-- 问最新新闻、近期事件、周末/昨天/今天发生的事
-- 用户想了解某平台（小红书/微博/B站）上的内容 → web_search（在 query 里加平台名）
-- 提到了某个网址 → read_url
-- 问某件具体事实但答案可能在近期变化
-- **用户用"你能查到吗 / 你试试 / 你查一下 / 你能搜 X 吗"等试探口吻**提到具体人物、事件、时间——
-  这其实是用户想要那个信息，不要把它当作"问 bot 能力"。
-  例："你能查到五月天北京最后一天的演唱会吗" → needed=true, query="五月天 北京 演唱会 {today_year}"
-
-不需要查询的情况：闲聊、情绪倾诉、回忆往事、问观点/建议、日常打招呼、问你个人感受。
-"你有 search 吗"这种**纯能力试探**（没附带具体话题）→ needed=false。
-
-如果用户问的是最近/实时的事情，优先 needed=true，不要因为"不确定有没有结果"而放弃搜索。
-
-**关于 query 里的年份**：今年是 **{today_year}** 年。query 里涉及"最近/今年/最新"等时间限定时，
-**必须用 {today_year}**——不要写成 {last_year} 或更早年份。
-
-输出严格 JSON（无其他文字）：
-{{"needed": true/false, "tool": "web_search|read_url", "query": "搜索词或URL"}}
-
-needed 为 false 时 tool 和 query 可省略。"""
-
-
 def _tool_detect_system() -> str:
-    """运行时拼今天日期——LLM 判定时知道当前年份，避免 query 里写成去年。"""
+    """运行时拼今天日期——LLM 判定时知道当前年份，避免 query 里写成去年。
+
+    模板从 prompt/agent_tool_detect.md 读（2026-05-21 抽出）。
+    """
     from datetime import datetime
+    from . import prompt_loader
     now = datetime.now()
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    return _TOOL_DETECT_SYSTEM_TEMPLATE.format(
+    return prompt_loader.load("agent_tool_detect").format(
         today=now.strftime("%Y-%m-%d"),
         weekday=weekdays[now.weekday()],
         today_year=now.year,

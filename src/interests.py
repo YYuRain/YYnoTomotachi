@@ -19,11 +19,10 @@ from .storage import Interest, session
 
 log = logging.getLogger(__name__)
 
-_EXTRACT_PROMPT = (
-    "从下面这段话里挑出 1-3 个简短的中文名词短语作为话题关键词，"
-    "每个不超过 6 个汉字，不要加解释。"
-    "输出 JSON：{\"topics\": [\"...\", \"...\"]}。如果没有明显话题输出 {\"topics\": []}。"
-)
+def _extract_prompt() -> str:
+    """从 prompt/interests_extract.md 加载（2026-05-21 抽出）。"""
+    from . import prompt_loader
+    return prompt_loader.load("interests_extract")
 
 
 async def extract_topics(text: str) -> list[str]:
@@ -33,7 +32,7 @@ async def extract_topics(text: str) -> list[str]:
         # 按当前 provider 走 llm.chat_json。
         data = await llm.chat_json(
             [
-                {"role": "system", "content": _EXTRACT_PROMPT},
+                {"role": "system", "content": _extract_prompt()},
                 {"role": "user", "content": text},
             ],
             max_tokens=2048,
