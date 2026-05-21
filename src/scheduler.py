@@ -114,12 +114,13 @@ def build() -> AsyncIOScheduler:
         await _fan_out(_one)
 
     async def auto_dream_job() -> None:
-        """PRD v2 / 5.3：搭便车 persona_consolidate 那班车，03:13 跑批量整理。
+        """PRD v2 / 5.3 + P1-6：搭便车 persona_consolidate 那班车，03:13 跑批量整理。
 
-        三段：
+        四段：
         1. memories 三态判定（auto_dream，per-user）
         2. prompt_overrides 冲突整理（auto_dream_overrides，per-user）
-        3. skill 库整理（auto_dream_skills，全局一次）
+        3. **insight 生成**（auto_dream_insights，per-user）—— P1-6
+        4. skill 库整理（auto_dream_skills，全局一次）
         """
         async def _one(uid: int):
             try:
@@ -130,6 +131,10 @@ def build() -> AsyncIOScheduler:
                 await memory.auto_dream_overrides(uid)
             except Exception as e:
                 log.warning("auto_dream_overrides uid=%d err: %s", uid, e)
+            try:
+                await memory.auto_dream_insights(uid)
+            except Exception as e:
+                log.warning("auto_dream_insights uid=%d err: %s", uid, e)
         await _fan_out(_one)
         # skill 库不分 user，跑一次即可
         try:

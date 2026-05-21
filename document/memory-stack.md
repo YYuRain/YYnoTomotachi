@@ -1,8 +1,10 @@
-# 记忆栈（自搭，2026-05-18 起；P0-1/P0-4 升级 2026-05-20）
+# 记忆栈（自搭，2026-05-18 起；P0-1/P0-4 升级 2026-05-20；P1-5/P1-6 升级 2026-05-21）
 
 > 此前用 memU SDK（`memu-py`），1.5.x 多次踩坑后改自搭。架构等价 +
 > PRD v2 三层防线（status 字段 / 写入冲突检测 / 召回反验证 / Auto Dream）+
-> P0-1 hybrid retrieval（Mem0 v3）+ P0-4 episodes provenance（Graphiti）。
+> P0-1 hybrid retrieval（Mem0 v3）+ P0-4 episodes provenance（Graphiti）+
+> P0-2 三因子 ranker（Generative Agents）+
+> P1-5 bi-temporal 字段（Graphiti）+ P1-6 insight 生成（Generative Agents reflection）。
 > memU 时代的归档说明在 `memu-setup.md`；横向研究分析在 `me/记忆框架横纵分析.md`。
 
 ## 一句话
@@ -32,7 +34,7 @@ background 看 to_verify 改 status——互相可见但不竞争锁。
 | `id`                        | UUID PK                                  |                                        |
 | `user_id`                   | BIGINT NOT NULL, indexed                 | 跟 SQLAlchemy 端 BIGINT 对齐               |
 | `summary`                   | TEXT NOT NULL                            | LLM 抽出的中文事实                            |
-| `memory_type`               | VARCHAR(32) NOT NULL DEFAULT 'profile'   | `profile` / `event`                    |
+| `memory_type`               | VARCHAR(32) NOT NULL DEFAULT 'profile'   | `profile` / `event` / `insight`（P1-6）|
 | `embedding`                 | vector(512)                              | bge-small-zh-v1.5 出的向量                 |
 | `created_at` / `updated_at` | TIMESTAMPTZ                              |                                        |
 | `evidence_ref`              | TEXT                                     | 来源对话 `data/memu_buffer/conv_*.json` 路径 |
@@ -44,6 +46,9 @@ background 看 to_verify 改 status——互相可见但不竞争锁。
 | **P0-1/P0-4（2026-05-20）**：|                                          |                                        |
 | `source_episode_id`         | UUID                                     | 抽这条时 buffer 落在 episodes 表的哪一行（反查原始对话）|
 | `entities`                  | TEXT[]                                   | LLM 抽出的关键名词（人名/地名/作品/物品），entity 路 retrieval 用 |
+| **P1-5 bi-temporal**：       |                                          |                                        |
+| `valid_from`                | TIMESTAMPTZ                              | 事实在世界中开始生效；profile/event 默认 = created_at |
+| `valid_to`                  | TIMESTAMPTZ NULL                         | 失效时间点；NULL=仍生效；5.1/5.3 判 stale 时填 now() |
 
 索引：`(user_id, created_at)`、`(user_id, status)`、`embedding USING ivfflat (vector_cosine_ops)` 100+ 行后自动建；
 **P0-1**：`summary USING GIN (gin_trgm_ops)` 加速 ILIKE 子串、`entities USING GIN` 加速 array 查询。
@@ -137,17 +142,26 @@ audit memory_recall 加 candidates_per_path（cosine/ngram/entity 各路命中�
 ```
 03:13 cron auto_dream_job (CST)
    │
-   ▼
-对每个 active user，拉所有 status='to_verify' 的条目
+   ├─► 1. auto_dream(uid)            ← PRD 5.3 三态判定
+   │   │
+   │   ▼
+   │   拉所有 to_verify 条目；每条召回 top-5 confirmed 邻居作上下文
+   │   _dream_one → LLM 三态判定（still_valid / uncertain / stale）
+   │     · still_valid → status=confirmed conf=1.0
+   │     · stale       → status=stale conf=0.0 + valid_to=now（P1-5）
+   │     · uncertain   → 仅打 last_verified_at 戳
    │
-   │ 每条：召回 top-5 同 user confirmed 邻居作综合上下文
-   ▼
-_dream_one(uid, item) → LLM 三态判定（still_valid / uncertain / stale）  ← PRD 5.3
-                                │
-                                ▼
-              still_valid → status=confirmed conf=1.0
-              stale       → status=stale conf=0.0
-              uncertain   → 仅打 last_verified_at 戳
+   ├─► 2. auto_dream_overrides(uid)   ← prompt_overrides 冲突合并
+   │
+   ├─► 3. auto_dream_insights(uid)   ← P1-6（Generative Agents reflection）
+   │   │
+   │   ▼
+   │   抽样最近 90 天 confirmed memory（profile 8 + event 12）
+   │   sonnet 写 0-3 条跨条目高阶观察 + supporting_ids
+   │   每条 INSERT 为 memory_type='insight', confidence=0.8, depends_on=supporting
+   │   audit memory_dream_insight
+   │
+   └─► 4. auto_dream_skills()         ← skill 库整理（全局一次）
 ```
 
 ## 为什么三层

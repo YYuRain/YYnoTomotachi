@@ -205,6 +205,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                         "(embedding <=> CAST(:q AS vector)) AS dist "
                         "FROM memories "
                         "WHERE user_id = :uid AND status != 'stale' "
+                        "AND (valid_to IS NULL OR valid_to > now()) "
                         "AND embedding IS NOT NULL "
                         "AND (embedding <=> CAST(:q AS vector)) < :max_dist "
                         "ORDER BY embedding <=> CAST(:q AS vector) "
@@ -243,6 +244,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                         f"({hits_expr}) AS hits "
                         "FROM memories "
                         "WHERE user_id = :uid AND status != 'stale' "
+                        "AND (valid_to IS NULL OR valid_to > now()) "
                         f"AND ({' OR '.join(ilike_clauses)}) "
                         f"AND ({hits_expr}) >= :min_hits "
                         "ORDER BY hits DESC, created_at DESC "
@@ -264,6 +266,7 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                     "  WHERE :q ILIKE '%' || e || '%') AS hits "
                     "FROM memories "
                     "WHERE user_id = :uid AND status != 'stale' "
+                    "AND (valid_to IS NULL OR valid_to > now()) "
                     "AND entities IS NOT NULL "
                     "AND EXISTS (SELECT 1 FROM unnest(entities) e "
                     "  WHERE :q ILIKE '%' || e || '%') "
@@ -711,11 +714,14 @@ async def _check_conflicts_for_one(
                 )
             elif verdict in ("to_verify", "stale"):
                 new_conf = 0.0 if verdict == "stale" else 0.5
+                # P1-5：判 stale 时同步写 valid_to=now（保留 status='stale' 双层语义；
+                # to_verify 不动 valid_to——它仍可能仍生效）
                 # 把触发该变化的新事实 id 追加进 old.depends_on（去重，COALESCE 处理 NULL）
                 conn.execute(
                     sql_text(
                         "UPDATE memories SET status = :s, confidence = :c, "
                         "updated_at = :ts, "
+                        "valid_to = CASE WHEN :s = 'stale' THEN :ts ELSE valid_to END, "
                         "depends_on = (SELECT ARRAY(SELECT DISTINCT unnest("
                         "  COALESCE(depends_on, ARRAY[]::uuid[]) || ARRAY[CAST(:dep AS uuid)]"
                         ")) FROM memories WHERE id = CAST(:id AS uuid)) "
@@ -1068,9 +1074,11 @@ async def auto_dream(user_id: int) -> dict[str, Any]:
             with eng.begin() as conn:
                 conn.execute(
                     sql_text(
+                        # P1-5：valid_to=now 保留时间维度
                         "UPDATE memories SET status = 'stale', "
                         "confidence = 0.0, last_verified_at = :ts, "
-                        "updated_at = :ts WHERE id = CAST(:id AS uuid)"
+                        "valid_to = :ts, updated_at = :ts "
+                        "WHERE id = CAST(:id AS uuid)"
                     ),
                     {"ts": now, "id": it["id"]},
                 )
@@ -1092,6 +1100,167 @@ async def auto_dream(user_id: int) -> dict[str, Any]:
     log.info("auto_dream uid=%s 完成：%s", user_id, summary)
     audit("memory_dream", user_id=user_id, **summary)
     return summary
+
+
+# ============ Auto Dream insight（P1-6，Generative Agents reflection 借鉴）============
+
+INSIGHT_DREAM_TIMEOUT_SEC = 30.0
+INSIGHT_SAMPLE_DAYS = 90      # 抽样窗：最近 N 天
+INSIGHT_SAMPLE_PROFILE = 8    # 每次喂 LLM 多少条 profile
+INSIGHT_SAMPLE_EVENT = 12     # 每次喂 LLM 多少条 event
+INSIGHT_DEFAULT_CONFIDENCE = 0.8  # insight 默认 confidence——比原始 profile (1.0) 稍低
+                                  # 三因子 ranker 的 imp 分量也会稍低，避免 insight 压制底层事实
+INSIGHT_MAX_PER_RUN = 3       # 每次 dream 最多生成 N 条（prompt 也会要求）
+
+
+async def auto_dream_insights(user_id: int) -> dict[str, Any]:
+    """对该用户最近事实做跨条目反思，生成 0-3 条 memory_type='insight'。
+
+    流水：
+    1. 拉最近 INSIGHT_SAMPLE_DAYS 天 confirmed memory 抽样（profile + event 混合）
+    2. 调 main tier sonnet 写 insight + supporting_ids
+    3. 每条 insight 算 embedding → INSERT memories(memory_type='insight', confidence=0.8,
+       depends_on=supporting_ids, valid_from=now)
+    4. audit memory_dream_insight
+    """
+    eng = memory_store.engine()
+    started = time.time()
+
+    with eng.connect() as conn:
+        # 用 ORDER BY 三因子 proxy（recency + confidence + memory_type 优先）抽样
+        rows = conn.execute(
+            sql_text(
+                "(SELECT id::text, memory_type, summary, created_at FROM memories "
+                " WHERE user_id = :uid AND status = 'confirmed' "
+                " AND memory_type = 'profile' "
+                " AND created_at > now() - (:days || ' days')::interval "
+                " AND (valid_to IS NULL OR valid_to > now()) "
+                " ORDER BY created_at DESC LIMIT :prof_n) "
+                "UNION ALL "
+                "(SELECT id::text, memory_type, summary, created_at FROM memories "
+                " WHERE user_id = :uid AND status = 'confirmed' "
+                " AND memory_type = 'event' "
+                " AND created_at > now() - (:days || ' days')::interval "
+                " AND (valid_to IS NULL OR valid_to > now()) "
+                " ORDER BY created_at DESC LIMIT :event_n) "
+                "ORDER BY created_at DESC"
+            ),
+            {"uid": user_id, "days": INSIGHT_SAMPLE_DAYS,
+             "prof_n": INSIGHT_SAMPLE_PROFILE, "event_n": INSIGHT_SAMPLE_EVENT},
+        ).fetchall()
+
+    items = [
+        {"id": r[0], "memory_type": r[1], "summary": r[2], "created_at": r[3]}
+        for r in rows
+    ]
+    if len(items) < 4:
+        log.info("auto_dream_insights uid=%s: 只有 %d 条样本，跳过", user_id, len(items))
+        return {"generated": 0, "samples": len(items), "skipped": "too_few_samples"}
+
+    prompt = memory_prompts.render_insight_dream(items)
+    try:
+        data = await asyncio.wait_for(
+            llm.chat_json(
+                [{"role": "user", "content": prompt}],
+                tier="main",
+                max_tokens=2000,
+            ),
+            timeout=INSIGHT_DREAM_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        log.warning("auto_dream_insights uid=%s LLM err: %s", user_id, e)
+        elapsed_ms = int((time.time() - started) * 1000)
+        audit("memory_dream_insight", user_id=user_id, generated=0,
+              samples=len(items), error=f"{type(e).__name__}:{str(e)[:200]}",
+              latency_ms=elapsed_ms)
+        return {"generated": 0, "samples": len(items), "error": str(e)}
+
+    insights_raw = data.get("insights") if isinstance(data, dict) else None
+    if not isinstance(insights_raw, list) or not insights_raw:
+        elapsed_ms = int((time.time() - started) * 1000)
+        log.info("auto_dream_insights uid=%s: 无新 insight 生成", user_id)
+        audit("memory_dream_insight", user_id=user_id, generated=0,
+              samples=len(items), latency_ms=elapsed_ms)
+        return {"generated": 0, "samples": len(items)}
+
+    # 把 supporting_ids 的短 id（前 8 位）解析回完整 UUID（用 items 里的 id 字典查找）
+    id_lookup = {it["id"][:8]: it["id"] for it in items}
+
+    valid_insights = []
+    for ins in insights_raw[:INSIGHT_MAX_PER_RUN]:
+        if not isinstance(ins, dict):
+            continue
+        summary_text = (ins.get("summary") or "").strip()
+        if not summary_text or len(summary_text) > 200:
+            continue
+        sup_short = ins.get("supporting_ids") or []
+        if not isinstance(sup_short, list) or len(sup_short) < 2:
+            continue
+        sup_full = [id_lookup[s] for s in sup_short if isinstance(s, str) and s in id_lookup]
+        if len(sup_full) < 2:
+            continue
+        valid_insights.append({"summary": summary_text, "supporting_ids": sup_full})
+
+    if not valid_insights:
+        elapsed_ms = int((time.time() - started) * 1000)
+        log.info("auto_dream_insights uid=%s: LLM 输出 %d 条但都没通过校验",
+                 user_id, len(insights_raw))
+        audit("memory_dream_insight", user_id=user_id, generated=0,
+              samples=len(items), raw_count=len(insights_raw),
+              latency_ms=elapsed_ms)
+        return {"generated": 0, "samples": len(items), "raw_count": len(insights_raw)}
+
+    # embedding + INSERT
+    summaries = [v["summary"] for v in valid_insights]
+    vecs = await embed_client.embed_many(summaries)
+    now = datetime.now(timezone.utc)
+
+    with eng.begin() as conn:
+        for v, vec in zip(valid_insights, vecs):
+            new_id = str(_uuid.uuid4())
+            params = {
+                "id": new_id,
+                "user_id": user_id,
+                "summary": v["summary"],
+                "now": now,
+                "depends_on": v["supporting_ids"],
+                "conf": INSIGHT_DEFAULT_CONFIDENCE,
+            }
+            if vec is not None:
+                params["embedding"] = embed_client.vec_literal(vec)
+                conn.execute(
+                    sql_text(
+                        "INSERT INTO memories (id, user_id, summary, memory_type, embedding, "
+                        "created_at, updated_at, status, confidence, valid_from, depends_on) "
+                        "VALUES (CAST(:id AS uuid), :user_id, :summary, 'insight', "
+                        "CAST(:embedding AS vector), :now, :now, 'confirmed', :conf, :now, "
+                        "CAST(:depends_on AS uuid[]))"
+                    ),
+                    params,
+                )
+            else:
+                conn.execute(
+                    sql_text(
+                        "INSERT INTO memories (id, user_id, summary, memory_type, "
+                        "created_at, updated_at, status, confidence, valid_from, depends_on) "
+                        "VALUES (CAST(:id AS uuid), :user_id, :summary, 'insight', "
+                        ":now, :now, 'confirmed', :conf, :now, "
+                        "CAST(:depends_on AS uuid[]))"
+                    ),
+                    params,
+                )
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    log.info("auto_dream_insights uid=%s 生成 %d 条 insight (samples=%d, latency=%dms)",
+             user_id, len(valid_insights), len(items), elapsed_ms)
+    audit("memory_dream_insight", user_id=user_id,
+          generated=len(valid_insights), samples=len(items),
+          insights=[{"summary": v["summary"][:120],
+                     "supporting": [s[:8] for s in v["supporting_ids"]]}
+                    for v in valid_insights],
+          latency_ms=elapsed_ms)
+    return {"generated": len(valid_insights), "samples": len(items),
+            "latency_ms": elapsed_ms}
 
 
 # ============ Auto Dream override（PRD 5.3 扩展，整理 prompt_overrides）============
@@ -1546,16 +1715,18 @@ async def _persist_items(
             # status / confidence 必须显式给——这俩列在 ALTER 加的时候 NOT NULL，
             # raw INSERT 不走 ORM default、PG 也不会自动填 ALTER 设的 default。
             # source_episode_id / entities 走 CAST；NULL 安全。
+            # P1-5: valid_from = created_at；valid_to NULL（仍生效）
             if vec is not None:
                 params["embedding"] = embed_client.vec_literal(vec)
                 conn.execute(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, embedding, "
                         "created_at, updated_at, evidence_ref, status, confidence, "
-                        "source_episode_id, entities) "
+                        "source_episode_id, entities, valid_from) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
                         "CAST(:embedding AS vector), :created_at, :updated_at, :evidence_ref, "
-                        "'confirmed', 1.0, CAST(:source_episode_id AS uuid), :entities)"
+                        "'confirmed', 1.0, CAST(:source_episode_id AS uuid), :entities, "
+                        ":created_at)"
                     ),
                     params,
                 )
@@ -1564,10 +1735,10 @@ async def _persist_items(
                     sql_text(
                         "INSERT INTO memories (id, user_id, summary, memory_type, "
                         "created_at, updated_at, evidence_ref, status, confidence, "
-                        "source_episode_id, entities) "
+                        "source_episode_id, entities, valid_from) "
                         "VALUES (CAST(:id AS uuid), :user_id, :summary, :memory_type, "
                         ":created_at, :updated_at, :evidence_ref, 'confirmed', 1.0, "
-                        "CAST(:source_episode_id AS uuid), :entities)"
+                        "CAST(:source_episode_id AS uuid), :entities, :created_at)"
                     ),
                     params,
                 )

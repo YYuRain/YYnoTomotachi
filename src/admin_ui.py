@@ -161,7 +161,7 @@ _INDEX_HTML = """<!doctype html>
   .ev { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .ev.user_msg, .ev.assistant_reply { background: #eef4ff; color: #1a6cff; }
   .ev.memory_recall, .ev.memory_flush, .ev.memory_conflict_check, .ev.memory_reverify,
-  .ev.memory_dream, .ev.memory_dream_one, .ev.override_dream, .ev.skill_dream { background: #ecf8ee; color: #1a8a3a; }
+  .ev.memory_dream, .ev.memory_dream_one, .ev.memory_dream_insight, .ev.override_dream, .ev.skill_dream { background: #ecf8ee; color: #1a8a3a; }
   .ev.persona_update, .ev.persona_consolidate { background: #f5edff; color: #7a3fcc; }
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
@@ -288,6 +288,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="">全部类型</option>
         <option value="profile">profile</option>
         <option value="event">event</option>
+        <option value="insight">insight</option>
       </select>
       <select id="status-filter">
         <option value="">全部状态</option>
@@ -309,6 +310,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="">全部类型</option>
         <option value="profile">profile</option>
         <option value="event">event</option>
+        <option value="insight">insight</option>
       </select>
       <label class="muted"><input type="checkbox" id="graph-only-deps" /> 只看有依赖关系的节点</label>
       <span class="muted" id="graph-hint">拖动节点可调整 · 滚轮缩放 · 鼠标悬停看内容</span>
@@ -374,6 +376,7 @@ _INDEX_HTML = """<!doctype html>
         <option value="memory_reverify">memory_reverify</option>
         <option value="memory_dream">memory_dream</option>
         <option value="memory_dream_one">memory_dream_one</option>
+        <option value="memory_dream_insight">memory_dream_insight</option>
         <option value="override_dream">override_dream</option>
         <option value="skill_dream">skill_dream</option>
         <option value="persona_update">persona_update</option>
@@ -531,6 +534,14 @@ async function loadItems() {
     if (it.last_verified_at) {
       const lva = el('span', { title: '最后一次反验证仍成立的时间' }, `验证 ${fmt(it.last_verified_at)}`);
       metaRow.appendChild(lva);
+    }
+    // P1-5 valid_to —— 仅 stale 条目带，显示失效时间点
+    if (it.valid_to) {
+      const vt = el('span', {
+        title: 'P1-5 bi-temporal：被新事实推翻的时间点',
+        style: 'color:#888',
+      }, `失效于 ${fmt(it.valid_to)}`);
+      metaRow.appendChild(vt);
     }
     // updated（如果跟 created 不同）
     if (it.updated_at && it.created_at && it.updated_at !== it.created_at) {
@@ -701,9 +712,10 @@ function _renderGraph(nodes, links) {
     );
 
   nodeG.append('circle')
-    .attr('r', d => d.type === 'profile' ? 8 : 6)
+    .attr('r', d => d.type === 'insight' ? 10 : (d.type === 'profile' ? 8 : 6))
     .attr('fill', d => GRAPH_COLOR[d.status] || '#aaa')
-    .attr('stroke', '#fff').attr('stroke-width', 1.5)
+    .attr('stroke', d => d.type === 'insight' ? '#7a3fcc' : '#fff')
+    .attr('stroke-width', d => d.type === 'insight' ? 2.5 : 1.5)
     .on('mouseover', (ev, d) => {
       tip.style.display = 'block';
       tip.innerHTML =
@@ -1013,6 +1025,16 @@ function summarizeAudit(d) {
       if (d.neighbors && d.neighbors.length) ctx_parts.push(`邻居 ${d.neighbors.length}`);
       const ctx = ctx_parts.length ? `<div style="color:#888;font-size:11px">${ctx_parts.join(' · ')}</div>` : '';
       return head + reason + ctx;
+    }
+    case 'memory_dream_insight': {
+      const lat = d.latency_ms ? ` ${d.latency_ms}ms` : '';
+      const head = `<span class="k">生成 ${d.generated||0} 条 insight${lat}</span>采样 ${d.samples||0} 条事实`;
+      const acts = (d.insights || []).slice(0, 3).map(i => {
+        const sup = (i.supporting || []).map(s => '#'+s).join(',');
+        return `<div style="color:#888;font-size:11px;margin-top:2px">💡 ${truncate(i.summary||'', 90)} <span style="color:#aaa">(基于 ${sup})</span></div>`;
+      }).join('');
+      const err = d.error ? `<div style="color:#d9554f;font-size:11px">错误：${truncate(d.error, 100)}</div>` : '';
+      return head + acts + err;
     }
     case 'persona_update': {
       const deltas = Object.entries(d.trait_deltas || {})
@@ -1378,6 +1400,7 @@ def build_app() -> FastAPI:
         sql = text(
             f"SELECT id, memory_type, summary, status, confidence, "
             f"last_verified_at, depends_on, evidence_ref, source_episode_id, "
+            f"valid_from, valid_to, "
             f"created_at, updated_at FROM memories {wh} "
             f"ORDER BY created_at DESC LIMIT :limit"
         )

@@ -63,6 +63,14 @@ class Memory(Base):
     # recall 走 RRF 融合 cosine + summary trigram + entity 交集三路
     entities = Column(ARRAY(Text), nullable=True)
 
+    # P1-5（2026-05-21，Graphiti bi-temporal 借鉴）：valid_from/valid_to
+    # valid_from = 事实在世界中开始生效的时间（profile 通常 = created_at）
+    # valid_to   = 失效时间点；NULL = 仍生效；非 NULL = 这之后被新事实推翻
+    # 5.1/5.3 判 stale 时 valid_to=now（不删 status='stale' 标记，保留两层语义）
+    # admin UI 据此显示"曾经-现在"演化时间线
+    valid_from = Column(DateTime(timezone=True), nullable=True)
+    valid_to = Column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         Index("ix_memories_user_created", "user_id", "created_at"),
         Index("ix_memories_user_status", "user_id", "status"),
@@ -142,6 +150,14 @@ def _ensure_v2_columns() -> None:
         "ON memories (source_episode_id)",
         # P0-1 entities（2026-05-20）
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS entities TEXT[] NULL",
+        # P1-5 bi-temporal（2026-05-21）
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ NULL",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ NULL",
+        # 老数据回填：valid_from = created_at（一次性，下次启动时 0 行需要回填会快速跳过）
+        "UPDATE memories SET valid_from = created_at WHERE valid_from IS NULL",
+        # 索引：admin UI 列 stale 条目按 valid_to 排序时用
+        "CREATE INDEX IF NOT EXISTS ix_memories_valid_to "
+        "ON memories (user_id, valid_to) WHERE valid_to IS NOT NULL",
     ]
     try:
         with _engine.begin() as conn:  # type: ignore[union-attr]

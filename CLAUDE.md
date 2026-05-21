@@ -72,9 +72,9 @@ docker compose logs -f bot   # 看 ready
 | `src/minimax.py` | MiniMax chat/chat_json/embed |
 | `src/embed_client.py` | 本地 :18080 embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） |
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
-| `src/memory_store.py` | 自搭记忆栈：`memories` + `episodes`（P0-4 provenance）表 ORM + engine + pgvector / pg_trgm 索引 |
-| `src/memory_prompts.py` | LLM 抽取 prompt（profile / event / **entities** JSON）+ 冲突检测（5.1）+ 反验证（5.2）+ Auto Dream（5.3） |
-| `src/memory.py` | **Hot path**: recall（cosine + ngram + entity 三路 RRF 融合 P0-1，叠加三因子 ranker rel+imp+rec P0-2 / 2026-05-20→21）+ 5.2 同步反验证；**Background**: note_turn（短期 buffer）+ maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测）+ auto_dream（5.3 批量整理） |
+| `src/memory_store.py` | 自搭记忆栈：`memories` (含 P1-5 valid_from/valid_to) + `episodes` (P0-4 provenance) 表 ORM + engine + pgvector / pg_trgm 索引 |
+| `src/memory_prompts.py` | LLM render helpers（抽取 / 冲突检测 5.1 / 反验证 5.2 / Auto Dream 5.3 / **insight 生成 P1-6**），prompt 文本在 `prompt/memory_*.md` |
+| `src/memory.py` | **Hot path**: recall（cosine + ngram + entity 三路 RRF 融合 P0-1，叠加三因子 ranker rel+imp+rec P0-2，bi-temporal 过滤 valid_to P1-5）+ 5.2 同步反验证；**Background**: note_turn（短期 buffer）+ maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测，stale 写 valid_to P1-5）+ auto_dream（5.3 批量整理）+ **auto_dream_insights**（P1-6 跨条目反思，生成 memory_type='insight'） |
 | `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
 | `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
 | `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |

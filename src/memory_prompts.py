@@ -70,6 +70,20 @@ def render_skill_dream(skills: list) -> str:
     return prompt_loader.load("memory_skill_dream").replace("{skills_block}", block)
 
 
+def render_insight_dream(items: list[dict]) -> str:
+    """items: list of {id, memory_type, summary, created_at}（已剪枝采样）。
+
+    P1-6（Generative Agents reflection 借鉴）：插入 prompt 让 LLM 写 1-3 条跨条目 insight。
+    """
+    lines = []
+    for it in items:
+        ts = it["created_at"].strftime("%Y-%m-%d") if it.get("created_at") else "?"
+        short_id = it["id"][:8] if it.get("id") else "????????"
+        lines.append(f"- id={short_id} [{it['memory_type']}] ({ts}) {it['summary']}")
+    block = "\n".join(lines) if lines else "（空）"
+    return prompt_loader.load("memory_insight_dream").replace("{items_block}", block)
+
+
 def render_override_dream(overrides: list) -> str:
     """overrides: list of PromptOverride ORM objects（拿 id / text / trigger_kind / created_at）。
     用 str.replace 而非 .format——prompt 里有大量字面花括号。"""
