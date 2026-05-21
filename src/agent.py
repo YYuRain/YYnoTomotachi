@@ -138,10 +138,10 @@ async def _build_turn(
     emotion_task = asyncio.create_task(emotion.detect(text_for_aux, recent=recent_snapshot))
     memories_task = asyncio.create_task(_safe_recall(user_id, text_for_aux))
     topics_task = asyncio.create_task(interests.extract_topics(text_for_aux))
+    # 2026-05-21：aux detect 路径退役——主 LLM 走 native tool_use 自己决定调工具。
+    # 这里只保留 URL 自动路由（确定性，不需要 LLM 判断）。
     if user_text and tools._URL_RE.search(user_text):
         tool_task = asyncio.create_task(tools.fetch_urls_in_message(user_text))
-    elif user_text:
-        tool_task = asyncio.create_task(_maybe_fetch_context(user_text, user_id=user_id))
     else:
         async def _empty() -> str:
             return ""
@@ -230,128 +230,14 @@ async def _safe_recall(user_id: int, user_text: str) -> list[str]:
         return []
 
 
-def _tool_detect_system() -> str:
-    """运行时拼今天日期——LLM 判定时知道当前年份，避免 query 里写成去年。
-
-    模板从 prompt/agent_tool_detect.md 读（2026-05-21 抽出）。
-    """
-    from datetime import datetime
-    from . import prompt_loader
-    now = datetime.now()
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    return prompt_loader.load("agent_tool_detect").format(
-        today=now.strftime("%Y-%m-%d"),
-        weekday=weekdays[now.weekday()],
-        today_year=now.year,
-        last_year=now.year - 1,
-    )
-
+# 主 LLM native tool_use 的工具派发表（2026-05-21 起取代 aux detect 路径）
 _TOOL_FUNCS = {
     "web_search": tools.search_web,
     "read_url": tools.read_url,
-    "search_xhs": tools.search_xhs,           # 2026-05-21 接入（Agent-Reach 工具集）
-    "search_bilibili": tools.search_bilibili, # 2026-05-21 接入
-    "read_github": tools.read_github,         # 2026-05-21 接入
+    "search_xhs": tools.search_xhs,
+    "search_bilibili": tools.search_bilibili,
+    "read_github": tools.read_github,
 }
-
-
-async def _maybe_fetch_context(user_text: str, user_id: int | None = None) -> str:
-    """判断是否需要搜索，如需要则执行并返回结果字符串，否则返回空字符串。
-
-    PRD（feedback agent v2）：如果该 user 有 active prompt_overrides 含 trigger 风格指令
-    （"对方说 X 时主动查 Y"），detect 阶段把这些指令也喂给 aux LLM——LLM 看到当前
-    user_text 命中 trigger 时强制 needed=true，按 override 指引生成 query。
-    主 LLM 这一轮 reply 就能直接整合搜到的内容，不会出现"等等让我查"然后没下文的情况。
-
-    2026-05-21：detect 阶段还要喂最近 6 条对话——"afee" 这种单关键词在没上下文时
-    搜不出有效结果，aux LLM 看到 recent 提到"hiphop reaction up主"会自动把 query 写成
-    "afee hiphop reaction bilibili"，搜索精度立刻上去。
-    """
-    sys_content = _tool_detect_system()
-
-    # 喂最近 6 条 user/assistant 给 aux LLM 帮它构造更精准的 query
-    recent_block = ""
-    if user_id:
-        try:
-            recent = _recent_per_user.get(str(user_id), [])
-            if recent:
-                lines = []
-                for m in recent[-6:]:
-                    role = "user" if m.get("role") == "user" else "asst"
-                    content = (m.get("content") or "").replace("\n", " ").strip()[:160]
-                    if content:
-                        lines.append(f"{role}: {content}")
-                if lines:
-                    recent_block = "\n".join(lines)
-        except Exception as e:
-            log.debug("tool_detect: load recent err uid=%s: %s", user_id, e)
-
-    if recent_block:
-        sys_content += (
-            "\n\n## 最近对话（构造精准 query 用——把上下文里的具体关键词塞进 query）\n"
-            + recent_block
-            + "\n\n**重要**：query 必须**结合 recent 里的关键词**，不要单写当前 user 提到的"
-            "孤零零一个名字。如果当前 user 说『找下 afee 的切片』，而 recent 提到 hiphop / "
-            "reaction / B 站，那 query 必须写 `afee hiphop reaction bilibili 切片`——单写 "
-            "`afee` 会搜出无关的台湾动漫展。"
-        )
-    if user_id:
-        try:
-            from . import storage
-            rows = storage.list_active_overrides(user_id)
-        except Exception as e:
-            log.debug("tool_detect: load overrides err uid=%s: %s", user_id, e)
-            rows = []
-        if rows:
-            override_block = "\n".join(f"- {r.text}" for r in rows[:10])
-            sys_content += (
-                "\n\n## 该用户的触发性指令（active prompt_overrides）\n"
-                + override_block
-                + "\n\n如果当前 user 消息**命中**上述任何指令的 trigger 条件（具体的关键词/场景描述），"
-                "**强制 needed=true** 并按指令里的描述构造 query。例如指令说"
-                "「对方说『要走了/下班了』时查 X 城市天气」，user 一旦说「下班！」"
-                "就要 query='X 城市 明日天气'。"
-            )
-    try:
-        decision = await llm.chat_json(
-            [
-                {"role": "system", "content": sys_content},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.1,
-            max_tokens=80,
-            tier="aux",
-        )
-        needed = bool(decision and decision.get("needed"))
-        tool_name = (decision or {}).get("tool", "") or ""
-        query = ((decision or {}).get("query", "") or "").strip()
-
-        # 不管 needed 与否都 audit——观测决策本身，方便回查"为什么没触发搜"
-        if not needed:
-            audit("tool_decision", user_id=user_id, needed=False, user_text=user_text[:200],
-                  tool=tool_name, query=query[:200])
-            return ""
-
-        func = _TOOL_FUNCS.get(tool_name)
-        if not func or not query:
-            audit("tool_decision", user_id=user_id, needed=True, user_text=user_text[:200],
-                  tool=tool_name, query=query[:200],
-                  skipped_reason="unknown_tool" if not func else "empty_query")
-            return ""
-
-        log.info("tool call: %s(%r)", tool_name, query[:60])
-        result = await func(query)
-        if result:
-            log.info("tool result: %d chars", len(result))
-        audit("tool_call", user_id=user_id, tool=tool_name, query=query[:200],
-              user_text=user_text[:200],
-              result_chars=len(result or ""), result_preview=(result or "")[:300])
-        return result
-    except Exception as e:
-        log.debug("tool detect/exec error: %s", e)
-        audit("tool_decision", user_id=user_id, needed=False, user_text=user_text[:200],
-              skipped_reason=f"err:{type(e).__name__}:{str(e)[:120]}")
-        return ""
 
 
 async def handle_user_message(
@@ -407,8 +293,74 @@ async def handle_user_message(
         active_model = s.anthropic_model
     else:
         active_model = s.minimax_chat_model
+    # 主 LLM 走 native tool_use（2026-05-21）：第一次 tool_choice='auto'，看 tool_calls；
+    # 如有 → 执行 tool → 二次调用 tool_choice='none' 强制不再循环（避免成本爆炸）。
+    # MiniMax 不支持，chat_with_tools 内部 fallback 等价无 tools chat。
+    reply = ""
+    used_tool: dict[str, Any] | None = None
     try:
-        reply = await llm.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        res1 = await llm.chat_with_tools(
+            messages,
+            tools=tools.TOOL_SCHEMAS,
+            tool_choice="auto",
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if res1.get("tool_calls"):
+            tc = res1["tool_calls"][0]  # 限 1 次循环
+            tc_name = tc.get("function", {}).get("name") or ""
+            tc_id = tc.get("id") or ""
+            args_raw = tc.get("function", {}).get("arguments") or "{}"
+            try:
+                tc_args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
+            except Exception:
+                tc_args = {}
+            log.info("主 LLM tool_use: %s(%s)", tc_name, tc_args)
+            audit("main_tool_call", user_id=user_id, tool=tc_name, args=tc_args, call_id=tc_id)
+
+            func = _TOOL_FUNCS.get(tc_name)
+            if func:
+                try:
+                    tool_result = await func(**tc_args)
+                except TypeError:
+                    # schema 跟函数签名 mismatch 兜底——按位置传第一个值
+                    if tc_args:
+                        tool_result = await func(next(iter(tc_args.values())))
+                    else:
+                        tool_result = ""
+                except Exception as e:
+                    log.warning("tool exec %s err: %s", tc_name, e)
+                    tool_result = ""
+            else:
+                tool_result = ""
+
+            audit("main_tool_call_result", user_id=user_id, tool=tc_name,
+                  result_chars=len(tool_result or ""),
+                  result_preview=(tool_result or "")[:300])
+            used_tool = {"name": tc_name, "args": tc_args, "result_chars": len(tool_result or "")}
+
+            # 把 tool_use + tool_result 加进 messages，第二次调（强 tool_choice='none'）
+            messages2 = list(messages)
+            messages2.append({
+                "role": "assistant",
+                "content": res1.get("text") or "",
+                "tool_calls": res1["tool_calls"],
+            })
+            messages2.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": tool_result or "（工具未返回结果）",
+            })
+            res2 = await llm.chat_with_tools(
+                messages2,
+                tools=tools.TOOL_SCHEMAS,
+                tool_choice="none",
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            reply = res2.get("text", "")
+        else:
+            reply = res1.get("text", "")
     except Exception as e:
         log.exception("chat failed: %s", e)
         audit("assistant_reply", user_id=user_id, text="(脑子卡了一下)", mode=mode,

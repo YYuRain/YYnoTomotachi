@@ -204,6 +204,177 @@ async def chat(
     )
 
 
+async def chat_with_tools(
+    messages: list[dict],
+    *,
+    tools: list[dict],
+    tool_choice: str | dict = "auto",
+    temperature: float = 0.85,
+    max_tokens: int = 1024,
+    model: str | None = None,
+    tier: str = "main",
+) -> dict[str, Any]:
+    """主 LLM 调用 + native tool_use 支持（Anthropic / OpenRouter）。
+
+    返回统一 dict：{"text": str, "tool_calls": list[dict], "finish_reason": str}
+    tool_calls 元素是 OpenAI 格式：
+        {"id": "call_xxx", "type": "function",
+         "function": {"name": "...", "arguments": '{"query": "..."}'}}
+
+    minimax 不支持 native tool_use → fallback 等价 chat()，tool_calls 永远空。
+    """
+    s = settings()
+    if s.llm_provider == "openrouter":
+        m = model
+        if m is None:
+            m = s.openrouter_model_aux if (tier == "aux" and s.openrouter_model_aux) else s.openrouter_model
+        if not m:
+            raise RuntimeError("OPENROUTER_MODEL 未配置")
+        res = await openrouter.chat(
+            messages, m,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice,
+        )
+        if res.get("error") and not res.get("tool_calls"):
+            raise RuntimeError(f"openrouter ({m}): {res['error']}")
+        return {
+            "text": res.get("text", ""),
+            "tool_calls": res.get("tool_calls") or [],
+            "finish_reason": res.get("finish_reason", ""),
+        }
+    if s.llm_provider == "anthropic":
+        return await _anthropic_chat_with_tools(
+            messages, tools=tools, tool_choice=tool_choice,
+            temperature=temperature, max_tokens=max_tokens, model=model, tier=tier,
+        )
+    # minimax fallback：忽略 tools，等价无工具 chat
+    txt = await minimax.chat(
+        messages, temperature=temperature, max_tokens=max_tokens, model=model,
+    )
+    return {"text": txt, "tool_calls": [], "finish_reason": "stop"}
+
+
+async def _anthropic_chat_with_tools(
+    messages: list[dict],
+    *,
+    tools: list[dict],
+    tool_choice: str | dict,
+    temperature: float,
+    max_tokens: int,
+    model: str | None,
+    tier: str,
+) -> dict[str, Any]:
+    """Anthropic SDK 原生 tool_use。把 OpenAI 格式 tools 转成 Anthropic 格式。"""
+    s = settings()
+    if model is None:
+        model = s.anthropic_model_aux if tier == "aux" else s.anthropic_model
+    system_text, rest = _split_system(messages)
+    # Anthropic messages 不接受 role="tool"，要把它转成 user(role) + tool_result block
+    rest = _convert_messages_for_anthropic(rest)
+    if not rest:
+        rest = [{"role": "user", "content": "（空）"}]
+
+    # OpenAI tool schema → Anthropic
+    anth_tools = [
+        {
+            "name": t["function"]["name"],
+            "description": t["function"]["description"],
+            "input_schema": t["function"]["parameters"],
+        }
+        for t in tools
+    ]
+    anth_tool_choice: dict
+    if tool_choice == "auto":
+        anth_tool_choice = {"type": "auto"}
+    elif tool_choice == "none":
+        anth_tool_choice = {"type": "none"}  # SDK 0.x 用 "any"=必调；none = 不许调
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        anth_tool_choice = {"type": "tool", "name": tool_choice["function"]["name"]}
+    else:
+        anth_tool_choice = {"type": "auto"}
+
+    cli = _get_anth()
+    try:
+        resp = await cli.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=min(1.0, max(0.0, temperature)),
+            system=system_text or "",
+            messages=rest,
+            tools=anth_tools,
+            tool_choice=anth_tool_choice,
+        )
+    except Exception as e:
+        log.error("anthropic chat_with_tools failed: %s", e)
+        raise
+
+    # 聚合 content blocks: text + tool_use → 转 OpenAI 格式 tool_calls
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in resp.content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text_parts.append(getattr(block, "text", ""))
+        elif btype == "tool_use":
+            import json as _json
+            tool_calls.append({
+                "id": getattr(block, "id", ""),
+                "type": "function",
+                "function": {
+                    "name": getattr(block, "name", ""),
+                    "arguments": _json.dumps(getattr(block, "input", {}), ensure_ascii=False),
+                },
+            })
+    return {
+        "text": "".join(text_parts).strip(),
+        "tool_calls": tool_calls,
+        "finish_reason": getattr(resp, "stop_reason", ""),
+    }
+
+
+def _convert_messages_for_anthropic(rest: list[dict]) -> list[dict]:
+    """把 OpenAI 风格 messages 转 Anthropic 风格——主要是 role='tool' / assistant tool_calls。"""
+    out: list[dict] = []
+    import json as _json
+    for m in rest:
+        role = m.get("role")
+        if role == "tool":
+            # OpenAI: {"role":"tool", "tool_call_id":"...", "content":"result"}
+            # Anthropic: {"role":"user", "content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}
+            out.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id") or "",
+                    "content": m.get("content") or "",
+                }],
+            })
+        elif role == "assistant" and m.get("tool_calls"):
+            # OpenAI: {"role":"assistant","content":text or null,"tool_calls":[{"id","function":{"name","arguments"}}]}
+            # Anthropic: {"role":"assistant","content":[{"type":"text",...},{"type":"tool_use","id","name","input"}]}
+            blocks: list[dict] = []
+            text = m.get("content")
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args_raw = fn.get("arguments") or "{}"
+                try:
+                    args = _json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or "",
+                    "name": fn.get("name") or "",
+                    "input": args,
+                })
+            out.append({"role": "assistant", "content": blocks})
+        else:
+            out.append(m)
+    return out
+
+
 _JSON_HINT = (
     "\n\n【输出格式】只输出一个合法 JSON 对象，不要任何前后说明、注释、代码块围栏。"
 )

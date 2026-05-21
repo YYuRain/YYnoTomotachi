@@ -97,46 +97,62 @@ async def chat(
     *,
     temperature: float = 0.85,
     max_tokens: int = 600,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict = "auto",
 ) -> dict[str, Any]:
     """
     返回：
-      成功 → {"text": "...", "latency_ms": float, "model": "...", "tokens": int|None}
-      失败 → {"text": "", "error": "...", "latency_ms": float, "model": "..."}
+      成功 → {"text": "...", "tool_calls": [...], "finish_reason": "...",
+              "latency_ms": float, "model": "...", "tokens": int|None}
+      失败 → {"text": "", "tool_calls": [], "error": "...", ...}
+
+    tools / tool_choice：OpenAI 兼容 native tool calling。
+    - tools = None：不传，行为同旧版
+    - tools = [...] + tool_choice="auto"：让模型自己决定
+    - tool_choice="none"：禁止调工具（用于二次循环时）
     """
     cli = _get_client()
     effective_max = max(max_tokens, _MIN_MAX_TOKENS)
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": _normalize_messages(messages),
         "temperature": temperature,
         "max_tokens": effective_max,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
     t0 = time.time()
     try:
         r = await cli.post("/chat/completions", json=payload)
     except Exception as e:
-        return {"text": "", "error": f"http err: {e}", "latency_ms": (time.time() - t0) * 1000, "model": model}
+        return {"text": "", "tool_calls": [], "error": f"http err: {e}",
+                "latency_ms": (time.time() - t0) * 1000, "model": model}
 
     latency_ms = (time.time() - t0) * 1000
     if r.status_code >= 400:
         body = r.text[:300]
         log.warning("openrouter %s %d: %s", model, r.status_code, body)
-        return {"text": "", "error": f"{r.status_code}: {body}", "latency_ms": latency_ms, "model": model}
+        return {"text": "", "tool_calls": [], "error": f"{r.status_code}: {body}",
+                "latency_ms": latency_ms, "model": model}
 
     try:
         data = r.json()
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls") or []
+        finish = (data.get("choices") or [{}])[0].get("finish_reason", "?")
         usage = data.get("usage") or {}
         tokens = usage.get("completion_tokens")
     except Exception as e:
-        return {"text": "", "error": f"parse err: {e}; body={r.text[:200]}", "latency_ms": latency_ms, "model": model}
+        return {"text": "", "tool_calls": [], "error": f"parse err: {e}; body={r.text[:200]}",
+                "latency_ms": latency_ms, "model": model}
 
-    if not content.strip():
-        # 200 但内容空：模型可能 refuse / safety filter / 没产出 content blocks
-        finish = (data.get("choices") or [{}])[0].get("finish_reason", "?")
+    # 200 但 content 和 tool_calls 都空：refuse / safety filter / 没产出 content blocks
+    if not content.strip() and not tool_calls:
         return {
             "text": "",
+            "tool_calls": [],
             "error": f"empty content (finish_reason={finish}, completion_tokens={tokens})",
             "latency_ms": latency_ms,
             "model": model,
@@ -145,6 +161,8 @@ async def chat(
 
     return {
         "text": content,
+        "tool_calls": tool_calls,
+        "finish_reason": finish,
         "latency_ms": latency_ms,
         "model": model,
         "tokens": tokens,

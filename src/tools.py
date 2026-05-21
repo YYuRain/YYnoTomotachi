@@ -299,6 +299,85 @@ async def search_web(query: str) -> str:
     return raw[:1500]
 
 
+# OpenAI 兼容 tool schema 给主 LLM 用（native tool_use，2026-05-21 接入）
+# 参数名跟函数签名严格对齐：search_xhs/bilibili 是 keyword；search_web/read_github 是 query；read_url 是 url
+TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Jina 全网搜索。用于通用查询、最近新闻、时事、人物近况、当下事实。"
+                "query 必带上下文关键词；涉及'最近/今年'要带年份。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_xhs",
+            "description": (
+                "小红书笔记搜索。用户聊到小红书 / 笔记 / 攻略 / 测评 / 探店类才用。"
+                "keyword 是纯关键词，不要加'小红书'三字。返回 5 条带链接。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"keyword": {"type": "string", "description": "搜索关键词（纯主题，不加'小红书'）"}},
+                "required": ["keyword"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_bilibili",
+            "description": (
+                "B 站视频搜索。用户聊到 B 站 / up 主 / 视频博主 / 切片 / 投稿才用。"
+                "keyword 是纯关键词，不要加'B站'/'bilibili'。返回 5 条带 BV 链接。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"keyword": {"type": "string", "description": "搜索关键词（纯主题，不加'B站'）"}},
+                "required": ["keyword"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": (
+                "读单个网页 / 小红书帖子 / 视频元信息。url 是完整 URL。"
+                "**通常不用主动调**——用户消息里直接出现 URL 时另有自动路径，这里只在你想读"
+                "搜索结果中某一条具体链接时用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "完整 URL，含 http(s)://"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_github",
+            "description": "读 GitHub 公开仓库 README + 最近 issue。用户聊到 GitHub 仓库时用。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "owner/repo 或完整 GitHub URL"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+
 async def search_bilibili(keyword: str) -> str:
     """搜索 B 站视频，返回前 5 条标题 + UP主 + 链接。
 
