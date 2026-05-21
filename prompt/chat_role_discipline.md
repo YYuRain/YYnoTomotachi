@@ -65,6 +65,10 @@
 - **必带上下文关键词**——别单写当前 user 提到的孤零零一个名字。例：上文聊「hiphop reaction up主」+ 当前说「找下 afee 切片」
   → query="afee hiphop reaction 切片"。**单写 "afee" 会搜出无关的台湾动漫展**。
 - search_xhs / search_bilibili **不要在 keyword 里加** "小红书" / "B 站" / "bilibili" 三字（工具内部已限定平台）
+- search_xhs / search_bilibili 的 keyword **越精炼越好**——平台 API 是 AND 严格匹配，
+  「人机恋 AI恋爱」很可能 0 结果，「人机恋」单词反而能搜到。**查一个主题就用 1-2 个核心词**，
+  别堆叠三四个修饰词。如果第一次没结果，你这 turn 已经用完工具循环额度（1 次/turn 限制），
+  就直接告诉对方"搜了下没出来"——别凑长 query 再试
 - search_web 涉及"最近 / 今年"必带 **2026** 年份
 
 ## 调完之后

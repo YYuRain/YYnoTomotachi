@@ -223,36 +223,67 @@ async def fetch_urls_in_message(text: str) -> str:
     return "\n\n".join(parts)
 
 
+def _split_kw_fallback(keyword: str) -> str | None:
+    """多关键词搜出 0 时，挑最有信息量的单 token 重试。
+
+    xhs / bili API 对空格分隔多关键词是 AND 匹配——'人机恋 AI恋爱' 比 '人机恋' 命中率低
+    很多。返回最长的非通用 token；只有一个 token 时返 None（无 fallback 可用）。
+    """
+    parts = [p for p in keyword.split() if p.strip()]
+    if len(parts) <= 1:
+        return None
+    # 挑最长（最具体）的；中文按 char 数算
+    parts_sorted = sorted(parts, key=lambda x: len(x), reverse=True)
+    return parts_sorted[0]
+
+
 async def search_xhs(keyword: str) -> str:
     """搜索小红书，返回前 5 条笔记标题和互动数。
 
     用 xiaohongshu-cli (`xhs search KEYWORD --json`)；该 CLI 自带签名实现，cookie 由
-    CLI 自己管理（`xhs auth import` 一次性塞 cookie，详见 agent-reach-integration.md）。
-    失败时返空。
+    CLI 自己管理（容器内 `/root/.xiaohongshu-cli/cookies.json`）。
+
+    多关键词 0 结果时自动用最长单 token 重试（xhs 对多关键词是严格 AND，命中率低）。
     """
     raw = await _run("xhs", "search", keyword, "--json")
+    parsed_lines = _parse_xhs_search(raw)
+    if not parsed_lines:
+        # 多关键词 fallback：拆成单 token 重试一次
+        fb = _split_kw_fallback(keyword)
+        if fb:
+            log.info("xhs search '%s' 0 结果，fallback 重试 '%s'", keyword, fb)
+            raw = await _run("xhs", "search", fb, "--json")
+            parsed_lines = _parse_xhs_search(raw)
+    if parsed_lines:
+        return "小红书搜索结果：\n" + "\n".join(parsed_lines)
+    return ""
+
+
+def _parse_xhs_search(raw: str) -> list[str]:
+    """xhs search --json 的输出 → bot 友好 list[str]。"""
     if not raw:
-        return ""
+        return []
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return ""
+        return []
     if not isinstance(data, dict):
-        return ""
+        return []
     if data.get("ok") is False:
         err_msg = (data.get("error") or {}).get("message", "")
         log.info("xhs search 失败：%s", err_msg[:120])
-        return ""
+        return []
     items = (data.get("data") or {}).get("items") or []
     lines: list[str] = []
     for item in items[:5]:
+        if not isinstance(item, dict):
+            continue
         card = item.get("note_card") or {}
         title = card.get("display_title") or card.get("title") or ""
         info = card.get("interact_info") or {}
         likes = info.get("liked_count") or "0"
         note_id = item.get("id") or ""
         xsec = item.get("xsec_token") or ""
-        # 拼可点 URL 给 bot 引用——bot 如果觉得这条对用户有用，可以 echo 链接
         if note_id:
             url = f"https://www.xiaohongshu.com/explore/{note_id}"
             if xsec:
@@ -264,9 +295,7 @@ async def search_xhs(keyword: str) -> str:
             if url:
                 line += f"\n  {url}"
             lines.append(line)
-    if lines:
-        return "小红书搜索结果：\n" + "\n".join(lines)
-    return ""
+    return lines
 
 
 async def search_web(query: str) -> str:
@@ -381,24 +410,38 @@ TOOL_SCHEMAS: list[dict] = [
 async def search_bilibili(keyword: str) -> str:
     """搜索 B 站视频，返回前 5 条标题 + UP主 + 链接。
 
-    用 bilibili-cli (`bili search KEYWORD --type video --max 5 --json`)。匿名搜索不需 cookie；
-    需要登录的更详细数据本工具不用。失败时返空（让上游 web_search fallback 接管）。
+    用 bilibili-cli (`bili search KEYWORD --type video --max 5 --json`)。匿名搜索不需 cookie。
+    多关键词 0 结果时自动用最长单 token 重试。
     """
     if not keyword.strip():
         return ""
     raw = await _run("bili", "search", keyword, "--type", "video", "--max", "5", "--json")
+    parsed = _parse_bili_search(raw)
+    if not parsed:
+        fb = _split_kw_fallback(keyword)
+        if fb:
+            log.info("bili search '%s' 0 结果，fallback 重试 '%s'", keyword, fb)
+            raw = await _run("bili", "search", fb, "--type", "video", "--max", "5", "--json")
+            parsed = _parse_bili_search(raw)
+    if parsed:
+        return "B 站搜索结果：\n" + "\n".join(parsed)
+    return ""
+
+
+def _parse_bili_search(raw: str) -> list[str]:
+    """bili search --json 输出 → bot 友好 list[str]。"""
     if not raw:
-        return ""
+        return []
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return ""
+        return []
     if not isinstance(data, dict):
-        return ""
+        return []
     if data.get("ok") is False:
         log.info("bili search 失败：%s", str((data.get("error") or {}).get("message", ""))[:120])
-        return ""
-    # bili-cli 返 `data` 是 list（每条 item 直接），不是 dict——之前误当 dict.get("items")
+        return []
+    # bili-cli 返 `data` 是 list（item 直接）
     raw_items = data.get("data") or []
     if isinstance(raw_items, dict):
         raw_items = raw_items.get("items") or []
@@ -416,9 +459,7 @@ async def search_bilibili(keyword: str) -> str:
             if bvid:
                 line += f"\n  https://www.bilibili.com/video/{bvid}"
             lines.append(line)
-    if lines:
-        return "B 站搜索结果：\n" + "\n".join(lines)
-    return ""
+    return lines
 
 
 _GITHUB_RE = re.compile(
