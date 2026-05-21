@@ -99,29 +99,9 @@ async def _resolve_url(url: str) -> str:
     return url
 
 
-_XHS_COOKIE_PATH = "/root/.xhs/cookies.txt"
-
-
-def _load_xhs_cookie() -> str:
-    """从约定路径读 cookie string。本地 fallback 到 ~/.xhs/cookies.txt 让 dev 也能用。"""
-    paths = [_XHS_COOKIE_PATH, _os.path.expanduser("~/.xhs/cookies.txt")]
-    for p in paths:
-        if _os.path.isfile(p):
-            try:
-                return open(p, encoding="utf-8").read().strip()
-            except Exception:
-                continue
-    return _os.environ.get("XHS_COOKIE", "")
-
-
 async def _read_xhs_note(url: str) -> str:
-    """用 xhs Python SDK 读取小红书帖子，返回标题 + 正文。"""
+    """用 xiaohongshu-cli (`xhs read`) 读取小红书帖子，返回标题 + 正文。"""
     from urllib.parse import urlparse, parse_qs, unquote
-
-    cookie = _load_xhs_cookie()
-    if not cookie:
-        log.debug("xhs note read: no cookie configured")
-        return ""
 
     if "xhslink.com" in url:
         url = await _resolve_url(url)
@@ -131,34 +111,32 @@ async def _read_xhs_note(url: str) -> str:
     note_id = path_parts[-1] if path_parts else ""
     qs = parse_qs(parsed.query)
     xsec_token = unquote((qs.get("xsec_token") or [""])[0])
-    if not note_id:
-        return ""
 
+    if xsec_token and note_id:
+        raw = await _run("xhs", "read", note_id, "--xsec-token", xsec_token, "--json")
+    elif note_id:
+        raw = await _run("xhs", "read", note_id, "--json")
+    else:
+        raw = await _run("xhs", "read", url, "--json")
+    if not raw:
+        return ""
     try:
-        # SDK 调用是同步的，扔进 executor 避免阻塞 event loop
-        import asyncio as _asyncio
-        from xhs import XhsClient
-        client = XhsClient(cookie=cookie)
-        loop = _asyncio.get_event_loop()
-        if xsec_token:
-            data = await loop.run_in_executor(
-                None, lambda: client.get_note_by_id(note_id, xsec_token)
-            )
-        else:
-            # 没 xsec_token 走 HTML fallback
-            data = await loop.run_in_executor(
-                None, lambda: client.get_note_by_id_from_html(note_id, xsec_token or "")
-            )
-    except Exception as e:
-        log.info("xhs note read err: %s", e)
-        return ""
-
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw[:400]
     if not isinstance(data, dict):
         return ""
-    title = data.get("title") or data.get("display_title") or ""
-    desc = data.get("desc") or ""
-    user = (data.get("user") or {}).get("nickname") or ""
-    info = data.get("interact_info") or {}
+    if data.get("ok") is False:
+        log.info("xhs read 失败：%s", str((data.get("error") or {}).get("message", ""))[:120])
+        return ""
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return ""
+    card = items[0].get("note_card") or {}
+    title = card.get("title") or card.get("display_title") or ""
+    desc = card.get("desc") or ""
+    user = (card.get("user") or {}).get("nickname") or ""
+    info = card.get("interact_info") or {}
     likes = info.get("liked_count") or "0"
     parts = []
     if title:
@@ -243,29 +221,24 @@ async def fetch_urls_in_message(text: str) -> str:
 async def search_xhs(keyword: str) -> str:
     """搜索小红书，返回前 5 条笔记标题和互动数。
 
-    用 `xhs` Python SDK 的 `XhsClient.get_note_by_keyword`。
-    cookie 从 `/root/.xhs/cookies.txt` 或 env `XHS_COOKIE` 读；缺 cookie 直接返空。
-    详见 `document/agent-reach-integration.md` 的 cookie 注入流程。
+    用 xiaohongshu-cli (`xhs search KEYWORD --json`)；该 CLI 自带签名实现，cookie 由
+    CLI 自己管理（`xhs auth import` 一次性塞 cookie，详见 agent-reach-integration.md）。
+    失败时返空。
     """
-    cookie = _load_xhs_cookie()
-    if not cookie:
-        log.debug("xhs search: no cookie configured")
+    raw = await _run("xhs", "search", keyword, "--json")
+    if not raw:
         return ""
     try:
-        import asyncio as _asyncio
-        from xhs import XhsClient
-        client = XhsClient(cookie=cookie)
-        loop = _asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None, lambda: client.get_note_by_keyword(keyword, page=1, page_size=10)
-        )
-    except Exception as e:
-        log.info("xhs search 失败：%s", str(e)[:120])
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
         return ""
-
     if not isinstance(data, dict):
         return ""
-    items = data.get("items") or []
+    if data.get("ok") is False:
+        err_msg = (data.get("error") or {}).get("message", "")
+        log.info("xhs search 失败：%s", err_msg[:120])
+        return ""
+    items = (data.get("data") or {}).get("items") or []
     lines: list[str] = []
     for item in items[:5]:
         card = item.get("note_card") or {}

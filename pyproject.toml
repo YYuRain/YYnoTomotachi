@@ -26,7 +26,7 @@ dependencies = [
 # 注意：gh CLI 是 GitHub 官方二进制，不是 Python 包——Dockerfile 里 curl 下载
 tools = [
     "yt-dlp>=2024.12.0",
-    "xhs>=0.0.10",
+    "xiaohongshu-cli",  # jackwener/xiaohongshu-cli；注册 'xhs' 命令；带签名
 ]
 
 [build-system]
