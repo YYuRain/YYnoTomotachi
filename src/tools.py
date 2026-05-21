@@ -93,11 +93,30 @@ async def _resolve_url(url: str) -> str:
     return url
 
 
+_XHS_COOKIE_PATH = "/root/.xhs/cookies.txt"
+
+
+def _load_xhs_cookie() -> str:
+    """从约定路径读 cookie string。本地 fallback 到 ~/.xhs/cookies.txt 让 dev 也能用。"""
+    paths = [_XHS_COOKIE_PATH, _os.path.expanduser("~/.xhs/cookies.txt")]
+    for p in paths:
+        if _os.path.isfile(p):
+            try:
+                return open(p, encoding="utf-8").read().strip()
+            except Exception:
+                continue
+    return _os.environ.get("XHS_COOKIE", "")
+
+
 async def _read_xhs_note(url: str) -> str:
-    """用 xhs read 读取小红书帖子，返回标题 + 正文。"""
+    """用 xhs Python SDK 读取小红书帖子，返回标题 + 正文。"""
     from urllib.parse import urlparse, parse_qs, unquote
 
-    # 短链先解析成真实 URL
+    cookie = _load_xhs_cookie()
+    if not cookie:
+        log.debug("xhs note read: no cookie configured")
+        return ""
+
     if "xhslink.com" in url:
         url = await _resolve_url(url)
 
@@ -106,36 +125,43 @@ async def _read_xhs_note(url: str) -> str:
     note_id = path_parts[-1] if path_parts else ""
     qs = parse_qs(parsed.query)
     xsec_token = unquote((qs.get("xsec_token") or [""])[0])
-
-    if xsec_token and note_id:
-        raw = await _run("xhs", "read", note_id, "--xsec-token", xsec_token, "--json")
-    elif note_id:
-        raw = await _run("xhs", "read", note_id, "--json")
-    else:
-        raw = await _run("xhs", "read", url, "--json")
-    if not raw:
+    if not note_id:
         return ""
+
     try:
-        data = json.loads(raw)
-        items = (data.get("data") or {}).get("items") or []
-        if not items:
-            return ""
-        card = items[0].get("note_card") or {}
-        title = card.get("title") or card.get("display_title") or ""
-        desc = card.get("desc") or ""
-        user = (card.get("user") or {}).get("nickname") or ""
-        info = card.get("interact_info") or {}
-        likes = info.get("liked_count") or "0"
-        parts = []
-        if title:
-            parts.append(f"标题：{title}")
-        if user:
-            parts.append(f"作者：{user}（{likes}赞）")
-        if desc:
-            parts.append(f"内容：{desc[:400]}")
-        return "\n".join(parts) if parts else ""
-    except (json.JSONDecodeError, TypeError):
-        return raw[:400]
+        # SDK 调用是同步的，扔进 executor 避免阻塞 event loop
+        import asyncio as _asyncio
+        from xhs import XhsClient
+        client = XhsClient(cookie=cookie)
+        loop = _asyncio.get_event_loop()
+        if xsec_token:
+            data = await loop.run_in_executor(
+                None, lambda: client.get_note_by_id(note_id, xsec_token)
+            )
+        else:
+            # 没 xsec_token 走 HTML fallback
+            data = await loop.run_in_executor(
+                None, lambda: client.get_note_by_id_from_html(note_id, xsec_token or "")
+            )
+    except Exception as e:
+        log.info("xhs note read err: %s", e)
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+    title = data.get("title") or data.get("display_title") or ""
+    desc = data.get("desc") or ""
+    user = (data.get("user") or {}).get("nickname") or ""
+    info = data.get("interact_info") or {}
+    likes = info.get("liked_count") or "0"
+    parts = []
+    if title:
+        parts.append(f"标题：{title}")
+    if user:
+        parts.append(f"作者：{user}（{likes}赞）")
+    if desc:
+        parts.append(f"内容：{desc[:400]}")
+    return "\n".join(parts) if parts else ""
 
 
 async def _read_video(url: str) -> str:
@@ -209,25 +235,29 @@ async def fetch_urls_in_message(text: str) -> str:
 async def search_xhs(keyword: str) -> str:
     """搜索小红书，返回前 5 条笔记标题和互动数。
 
-    xhs CLI 需要 cookie（容器内挂 `/root/.xhs/`，详见 `document/agent-reach-integration.md`）。
-    失败时返空——上游 agent.py:_maybe_fetch_context 让 LLM 自己拿捏（or 用户重新发问后
-    aux LLM 重选 web_search）。
+    用 `xhs` Python SDK 的 `XhsClient.get_note_by_keyword`。
+    cookie 从 `/root/.xhs/cookies.txt` 或 env `XHS_COOKIE` 读；缺 cookie 直接返空。
+    详见 `document/agent-reach-integration.md` 的 cookie 注入流程。
     """
-    raw = await _run("xhs", "search", keyword, "--json")
-    if not raw:
+    cookie = _load_xhs_cookie()
+    if not cookie:
+        log.debug("xhs search: no cookie configured")
         return ""
     try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        import asyncio as _asyncio
+        from xhs import XhsClient
+        client = XhsClient(cookie=cookie)
+        loop = _asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, lambda: client.get_note_by_keyword(keyword, page=1, page_size=10)
+        )
+    except Exception as e:
+        log.info("xhs search 失败：%s", str(e)[:120])
         return ""
+
     if not isinstance(data, dict):
         return ""
-    # xhs CLI ok:false 一般是 -104 风控或 cookie 失效
-    if data.get("ok") is False:
-        err_msg = (data.get("error") or {}).get("message", "")
-        log.info("xhs search 失败：%s", err_msg[:80])
-        return ""
-    items = (data.get("data") or {}).get("items") or []
+    items = data.get("items") or []
     lines: list[str] = []
     for item in items[:5]:
         card = item.get("note_card") or {}
@@ -280,15 +310,14 @@ async def read_github(query: str) -> str:
     """读 GitHub 公开仓库的 README 摘要 + 最近 5 个 issue 标题。
 
     query: `owner/repo` 或 `https://github.com/owner/repo[/...]`
-    用 gh CLI anon API（公开仓库不需登录；rate limit 60/h 对 bot 用量足够）。
+    直接走 GitHub REST API（anon 60/h，对 bot 用法足够）；不依赖 gh CLI——
+    gh CLI v2.x 强制 auth 即便 anon 也要 GH_TOKEN，太麻烦。
     """
     q = query.strip()
     if not q:
         return ""
-    # 解析 owner/repo
-    m = _GITHUB_RE.search(q + " ")  # 加空格让结尾的 (?:/|$|\s) 命中
+    m = _GITHUB_RE.search(q + " ")
     if not m:
-        # 尝试直接当 owner/repo 用
         if "/" in q and " " not in q:
             owner_repo = q.strip("/")
         else:
@@ -296,57 +325,65 @@ async def read_github(query: str) -> str:
     else:
         owner_repo = f"{m.group(1)}/{m.group(2)}"
 
-    # gh repo view 拿元信息
-    repo_raw = await _run(
-        "gh", "repo", "view", owner_repo,
-        "--json", "name,description,stargazerCount,primaryLanguage,url",
-    )
+    from .config import settings as _settings
+    s = _settings()
+
+    async def _gh_api(path: str) -> str:
+        args = ["curl", "-s", "--max-time", "10", "-L"]
+        if s.telegram_proxy:
+            args += ["-x", s.telegram_proxy]
+        args += [
+            "-H", "Accept: application/vnd.github.v3+json",
+            "-H", "User-Agent: aidemo-bot",
+            f"https://api.github.com/{path.lstrip('/')}",
+        ]
+        return await _run(*args)
+
+    repo_raw = await _gh_api(f"repos/{owner_repo}")
     if not repo_raw:
         return ""
     try:
         repo = json.loads(repo_raw)
     except (json.JSONDecodeError, TypeError):
         return ""
+    if "message" in repo and "Not Found" in repo.get("message", ""):
+        return ""
 
     parts = []
-    name = repo.get("name") or owner_repo
     desc = repo.get("description") or ""
-    stars = repo.get("stargazerCount") or 0
-    lang = (repo.get("primaryLanguage") or {}).get("name") or ""
+    stars = repo.get("stargazers_count") or 0
+    lang = repo.get("language") or ""
     parts.append(f"仓库：{owner_repo}（⭐{stars}{' · ' + lang if lang else ''}）")
     if desc:
         parts.append(f"介绍：{desc[:200]}")
 
-    # README 前 400 字
-    readme_raw = await _run(
-        "gh", "api", f"repos/{owner_repo}/readme",
-        "--jq", ".content",  # base64
-    )
+    readme_raw = await _gh_api(f"repos/{owner_repo}/readme")
     if readme_raw:
         try:
-            import base64
-            readme_text = base64.b64decode(readme_raw).decode("utf-8", errors="replace")
-            # 简单去 markdown header marks/链接（保留可读文本）
-            readme_clean = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", readme_text)  # 去图片
-            readme_clean = re.sub(r"<[^>]+>", "", readme_clean)  # 去 HTML tag
-            readme_clean = readme_clean.strip()
-            if readme_clean:
-                parts.append(f"README 摘要：{readme_clean[:400]}")
+            readme_obj = json.loads(readme_raw)
+            content_b64 = readme_obj.get("content", "")
+            if content_b64:
+                import base64
+                readme_text = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+                readme_clean = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", readme_text)
+                readme_clean = re.sub(r"<[^>]+>", "", readme_clean)
+                readme_clean = readme_clean.strip()
+                if readme_clean:
+                    parts.append(f"README 摘要：{readme_clean[:400]}")
         except Exception as e:
-            log.debug("github readme decode err: %s", e)
+            log.debug("github readme parse err: %s", e)
 
-    # 最近 issue（开 + 关都看）
-    issues_raw = await _run(
-        "gh", "issue", "list", "-R", owner_repo,
-        "--state", "all", "--limit", "5",
-        "--json", "number,title,state",
-    )
+    issues_raw = await _gh_api(f"repos/{owner_repo}/issues?state=all&per_page=5")
     if issues_raw:
         try:
             issues = json.loads(issues_raw)
             if isinstance(issues, list) and issues:
-                lines = [f"#{i['number']} [{i['state']}] {i['title'][:80]}" for i in issues]
-                parts.append("最近 issue：\n  " + "\n  ".join(lines))
+                lines = [
+                    f"#{i.get('number')} [{i.get('state')}] {(i.get('title') or '')[:80]}"
+                    for i in issues if isinstance(i, dict)
+                ]
+                if lines:
+                    parts.append("最近 issue：\n  " + "\n  ".join(lines))
         except (json.JSONDecodeError, TypeError):
             pass
 

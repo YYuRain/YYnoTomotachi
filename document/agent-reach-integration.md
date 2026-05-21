@@ -14,8 +14,8 @@
 |------|------|---------|---------|
 | `read_url(url)` | Jina Reader (`r.jina.ai/<url>`) | `JINA_API_KEY` | 网页 URL（自动域名路由的兜底） |
 | `search_web(query)` | Jina Search (`s.jina.ai/?q=`) | `JINA_API_KEY` | 通用全网搜索 |
-| `search_xhs(keyword)` | xhs CLI（pip 包 `xhs`） | xhs（已装容器）+ cookie 文件 | 用户聊到小红书话题 |
-| `read_github(query)` | gh CLI anon API | gh binary（已装容器） | 用户聊到 GitHub 仓库 |
+| `search_xhs(keyword)` | `xhs` Python SDK (XhsClient) | pip 包 `xhs>=0.2.13` + cookie 文件 | 用户聊到小红书话题 |
+| `read_github(query)` | GitHub REST API（curl） | 无（直接 https://api.github.com） | 用户聊到 GitHub 仓库 |
 | URL 自动路由 | `_fetch_one_url` 按域名派发 | 见下 | user 消息含完整 URL |
 
 **URL 自动路由**（`tools.fetch_urls_in_message`）按域名派给最合适的实现：
@@ -28,47 +28,61 @@
 ## 容器依赖（Dockerfile）
 
 ```dockerfile
-# gh CLI 官方二进制（amd64）
-ARG GH_VERSION=2.65.0
-RUN curl -fsSL https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz \
-    | tar -xz -C /tmp \
-    && mv /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
-    && rm -rf /tmp/gh_*
-
-# yt-dlp（YouTube/B站字幕）+ xhs（小红书 CLI）—— pip 包
-RUN pip install --no-cache-dir "yt-dlp>=2024.12.0" "xhs>=0.0.10"
+# yt-dlp（YouTube/B站字幕）+ xhs（小红书 SDK）—— pip 包
+RUN pip install --no-cache-dir "yt-dlp>=2024.12.0" "xhs>=0.2.13"
 ```
 
-容器内验证：`docker compose exec bot which yt-dlp gh xhs` 三个都返回路径。
+容器内验证：
+```bash
+docker compose exec bot which yt-dlp                     # /usr/local/bin/yt-dlp
+docker compose exec bot python -c "from xhs import XhsClient; print('xhs SDK OK')"
+docker compose exec bot python -c "
+import asyncio
+from src import tools
+print(asyncio.run(tools.read_github('python/cpython'))[:200])
+"
+```
+
+**注**：之前考虑过装 gh CLI，但 v2.x 之后强制 auth（公开仓库 anon API 也要 GH_TOKEN）；
+所以 `read_github` 改直接 `curl https://api.github.com/repos/...` REST，不依赖 gh binary。
 
 ## 小红书 cookie 注入流程（手动一次）
 
-xhs CLI 在 `/root/.xhs/cookies.json` 存 cookie。compose 已 mount `./data/.xhs-cookie:/root/.xhs`，
-本地 `data/.xhs-cookie/` 持久化（不入 git，已在 `.gitignore` 里）。
+`xhs` SDK 期望 cookie 是单行字符串（`a1=xxx; web_session=yyy; ...` 半角分号分隔）。
+路径约定：容器内 `/root/.xhs/cookies.txt`（compose mount `./data/.xhs-cookie:/root/.xhs`）。
+fallback 顺序：cookie.txt → 环境变量 `XHS_COOKIE`。
 
 **注入步骤**（HK 服务器一次性）：
-1. 用户本机 Chrome 已登录 xiaohongshu.com
-2. 用 Cookie-Editor 插件导出 Cookie 为 JSON 数组
-3. 转换成 xhs CLI 期望的 `cookies.json` 格式（`{"a1":"...","web_session":"...",...}` 简单 dict；具体见 `xhs` Python 包文档）
-4. `scp cookies.json hk-bot:~/aidemo/data/.xhs-cookie/`
+1. 用户本机 Chrome 已登录 xiaohongshu.com，访问 https://www.xiaohongshu.com
+2. F12 → Network → 任意 xhs API 请求 → 复制 `Cookie:` 请求头的完整 value
+3. ssh 到 HK：`ssh hk-bot 'mkdir -p ~/aidemo/data/.xhs-cookie && cat > ~/aidemo/data/.xhs-cookie/cookies.txt'`
+4. 粘贴 cookie 字符串 + Ctrl+D
 5. `docker compose restart bot`
+
+或者更简单：把 cookie 字符串加到 HK 的 `.env`：
+```
+XHS_COOKIE=a1=xxx; web_session=yyy; ...
+```
+这种方式不需要 mount 也行（但安全角度文件 mount 更标准）。
 
 **风控提示**：xhs API 容易 `-104 无权限`，建议**用专用小号**而不是主账号；`tools.search_xhs` 失败时直接返空，
 不影响其他工具，admin UI audit 能看到 `xhs search 失败：<msg>` 日志。
 
-## gh CLI（anon 公开仓库）
+## GitHub REST API
 
-不登录直接走匿名 GitHub API，rate limit 60/h，对 bot 用法（用户偶尔分享 repo）足够。
-登录会把 limit 提升到 5000/h，但本轮跳过——用户提同一 repo 频次远低于 anon 限额。
+直接走 `https://api.github.com/repos/<owner>/<repo>` 公开 API：
+- anon rate limit 60/h（IP 维度），对 bot 用法（用户偶尔分享 repo）足够
+- 不需要任何 token / 登录
+- HK 出口走 `TELEGRAM_PROXY` 环境变量（`http://mihomo:9981`）
 
 `read_github` 输出格式：
 ```
-仓库：anthropic-ai/anthropic-sdk-python（⭐3.5K · Python）
+仓库：anthropics/anthropic-sdk-python（⭐3.5K · Python）
 介绍：The official Anthropic Python SDK
 README 摘要：（前 400 字）...
 最近 issue：
-  #234 [OPEN] AsyncClient connection pooling issue
-  #232 [CLOSED] Type hints for tool_use
+  #234 [open] AsyncClient connection pooling issue
+  #232 [closed] Type hints for tool_use
   ...
 ```
 

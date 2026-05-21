@@ -7,12 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev gcc curl ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Agent-Reach: gh CLI 官方二进制（amd64；HK Tencent 是 amd64）
-ARG GH_VERSION=2.65.0
-RUN curl -fsSL https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz \
-    | tar -xz -C /tmp \
-    && mv /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
-    && rm -rf /tmp/gh_*
+# 注：之前考虑过装 gh CLI，但 v2.x 之后强制 auth（公开仓库 anon API 也要 GH_TOKEN）；
+# read_github 改直接 curl https://api.github.com/... REST，不依赖 gh binary。
 
 # 中国大陆时区——bot 的 clock.now_signal / availability / proactive 都依赖 datetime.now() 取本地时间
 ENV TZ=Asia/Shanghai

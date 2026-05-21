@@ -81,7 +81,7 @@ docker compose logs -f bot   # 看 ready
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
-| `src/tools.py` | Agent Reach 工具：URL 读取（Jina）/ 全网搜索（Jina）/ 小红书（xhs CLI）/ GitHub（gh CLI）/ YouTube + B站（yt-dlp 域名自动路由） |
+| `src/tools.py` | Agent Reach 工具：URL 读取（Jina）/ 全网搜索（Jina）/ 小红书（xhs Python SDK，需 cookie）/ GitHub（REST API anon）/ YouTube + B站（yt-dlp 域名自动路由） |
 | `src/proactive.py` | 主动搭话：硬门 + LLM 软门 + 每日限额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
@@ -149,10 +149,10 @@ recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让�
 
 - `read_url(url)` — Jina Reader (`r.jina.ai/<url>`)，`JINA_API_KEY` Bearer
 - `search_web(query)` — Jina Search (`s.jina.ai/?q=`)，通用全网搜索
-- `search_xhs(keyword)` — xhs CLI（pip 包），需 `data/.xhs-cookie/cookies.json` 注入；admin UI audit 看 `xhs search 失败：...` 排查
-- `read_github(owner/repo)` — gh CLI anon API，公开仓库 README + 最近 5 issue（rate limit 60/h）
-- URL 自动路由 `_fetch_one_url`：xiaohongshu.com → xhs CLI；bilibili / youtube → yt-dlp；其它 → Jina Reader
-- 历史的 mcporter / Exa 已彻底退役（2026-05-21 删 `_exa_fetch_url` 和所有 fallback）
+- `search_xhs(keyword)` — `xhs` Python SDK (XhsClient)，需 cookie（`data/.xhs-cookie/cookies.txt` 或 env `XHS_COOKIE`）；admin UI audit 看 `xhs search 失败：...` 排查
+- `read_github(owner/repo)` — GitHub REST API anon（`api.github.com/repos/...`）；rate limit 60/h；不需要 GH_TOKEN
+- URL 自动路由 `_fetch_one_url`：xiaohongshu.com → xhs SDK；bilibili / youtube → yt-dlp；其它 → Jina Reader
+- 历史的 mcporter / Exa 已彻底退役（2026-05-21 删 `_exa_fetch_url` 和所有 fallback）；gh CLI 装过又删（v2 强制 auth 不适合 anon API）
 
 工具失败静默跳过，不影响聊天。`prompt/agent_tool_detect.md` 运行时拼今天日期防 LLM 写错年份。
 详见 `document/agent-reach-integration.md`。
