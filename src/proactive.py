@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 MIN_GAP_FROM_USER_SEC = 30 * 60        # 对方刚聊过 30min 内不主动（缩短自 1h，2026-05-14）
 MIN_GAP_FROM_SELF_SEC = 60 * 60        # 自己上次主动 60min 内不连续（缩短自 90min，2026-05-14）
 DAILY_CAP = 6                          # 每天最多主动 6 条
+MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user 回应 → backoff（2026-05-21
+                                       # 加，admin 数据清空后 last_interaction=inf + recent 全是
+                                       # assistant 自己的 opener，bot 反复发同一句不知道停）
 
 
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
@@ -159,14 +162,35 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
               ctx={"opens_today": today_count, "cap": DAILY_CAP})
         return None
 
+    # 新硬门（2026-05-21）：连续 MAX_UNANSWERED_FIRES 次 proactive 没等到 user 回应 → backoff
+    # 衡量方法：看 _recent_per_user 末尾连续的 assistant 数量（中间没夹任何 user message）。
+    # 这样 last_interaction 表是否存在不影响判断——直接看实际对话状态。
+    try:
+        from .agent import _recent_per_user
+        rec_msgs = _recent_per_user.get(str(user_id), [])
+    except Exception:
+        rec_msgs = []
+    consecutive_asst = 0
+    for m in reversed(rec_msgs):
+        if m.get("role") == "assistant":
+            consecutive_asst += 1
+        else:
+            break
+    if consecutive_asst >= MAX_UNANSWERED_FIRES and last_fire is not None:
+        audit("proactive_decision", user_id=user_id, should=False,
+              why="hard_gate:unanswered_streak",
+              ctx={"consecutive_asst_msgs": consecutive_asst,
+                   "max_unanswered": MAX_UNANSWERED_FIRES,
+                   "last_fire_min_ago": round((now - last_fire).total_seconds() / 60, 1)})
+        return None
+
     score = availability.score(user_id, now.weekday(), now.hour)
     top = [t for t, _ in interests.top(user_id, 6)]
 
     # 拉最近对话片段——避免 LLM 选一个已聊过/已回答过的话题作为 opener_angle
     recent_history: list[str] = []
     try:
-        from .agent import _recent_per_user
-        rec = _recent_per_user.get(str(user_id), [])
+        rec = rec_msgs  # 复用上面已读的
         for m in rec[-12:]:
             role = "user" if m.get("role") == "user" else "asst"
             content = (m.get("content") or "").strip().replace("\r", "")
