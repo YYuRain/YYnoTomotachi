@@ -92,3 +92,25 @@
 - **修 admin webUI 「通过」按钮 500**：admin 容器 `./data:/app/data:ro` 改读写——admin UI 现在要 UPDATE prompt_overrides
 - **修 _persist_items NOT NULL bug**：跟 migrate 脚本同坑，INSERT 没列 status/confidence 时 PG 不走 ALTER DEFAULT，显式补
 - **bot 拼上下文段补 [系统暗示]**：active trigger 暂存内容明确指引 bot "**这一轮的回复**要把这条信息**自然地融入**主话题"，避免硬转/罗列
+
+## 2026-05-20
+
+- **横向研究**：写 `me/记忆框架横纵分析.md`（Mem0/Letta/Graphiti/Cognee/LangMem 实拉 README + 经典论文综述 → AIDemo P0/P1/P2 借鉴清单）。**关键反转**：Mem0 v3 (2026-04) 放弃 ADD/UPDATE/DELETE 写入决策，回到 ADD-only + 强 hybrid retrieval（LoCoMo +20 / LongMemEval +27）
+- **P0-4 episodes provenance**（Graphiti 借鉴）：新 `episodes` 表存 raw turns；`memories.source_episode_id` 反查；admin UI 加"当时聊了啥"链接
+- **P0-1 hybrid retrieval**（Mem0 v3）：cosine + ngram(ILIKE) + entity 三路 RRF 融合；新 `memories.entities TEXT[]` + `pg_trgm` ext + GIN 索引；抽取 prompt 增加 entities 字段；`RECALL_MIN_QUERY_CJK_CHARS` 6→3（短 query 走得通）
+- **P0-3 命名一统**（LangMem 借鉴）：文档统一"hot path / background / procedural memory"术语；admin UI 调教 tab 加 LangMem 命名 tooltip
+- **P0-2 三因子 ranker**（Generative Agents）：在 RRF 上叠加 `final = α·rel + β·imp + γ·rec`（α=1.0/β=0.3/γ=0.3；τ_profile=180d/τ_event=14d）；audit 加 `score_breakdown` 看每条 hit 的分量
+- **proactive 加新硬门**：连续 N 次 assistant 没等到 user 回复就 backoff；不依赖 last_interaction 表，看 `_recent` 真实状态——修 admin uid 8120470097 数据被错清后 idle=inf 反复发同一句 opener 的 bug
+- **天气反复打扰修**：active trigger 的 `active_text_for_bot` 写了"如果对方聊到出门/上班/下班...你顺手查天气"这种 passive 指令导致 user 说"上班"就触发——改 override #3 text + 在 `prompt/feedback_skill_creator.md` 加"硬约束"段禁 passive 注入
+- **prompts 减"刻意"感**：`_EMPATHY/INTEREST/DEPTH_DIRECTIVE` 拼掉"可以说嗯/那确实/我就是！" 等 positive examples——LLM 复读 example 让 bot 听起来在演网友；保留 "不要 X" 黑名单
+- **关于时间段**：`_ROLE_DISCIPLINE` 加段——精确分钟时间戳是上下文不是播报词；用"下午/晚饭点/三点多"替代"14:32"
+- **persona baseline 微调**：`System Prompt v0.0.1.md`（后改名 `prompt/system_baseline.md`）user 手动调几句客套话/示例
+- **重大事故**：清空"admin 数据"时把 admin uid 误判成 8120470097（其实是普通用户，admin = 8058993786），13 条 memory + 24 turns + 313 audit 行不可恢复——加两条 feedback memory（`feedback_admin_uid_caution.md` / `feedback_wipe_must_backup.md`）
+
+## 2026-05-21
+
+- **prompt 抽离到 `/prompt`**：22 个 LLM prompt 从 `src/*.py` 三引号串抽到 `prompt/*.md`（扁平 `<module>_<name>.md` 命名）；`System Prompt v0.0.1.md` → `prompt/system_baseline.md`；新加 `src/prompt_loader.py`（lru_cache）；改 prompt 重启即生效零代码改动
+- **P1-5 bi-temporal 字段**（Graphiti）：`memories.valid_from / valid_to` 两列；老数据 valid_from 回填 = created_at；5.1 / 5.3 判 stale 时同步写 `valid_to=now`（保留 status='stale' 双层语义）；recall 三路 SELECT 加 `(valid_to IS NULL OR valid_to > now())` 过滤；admin UI 卡片 stale 条目显示"失效于 X"
+- **P1-6 Auto Dream insight 生成**（Generative Agents reflection）：新 `auto_dream_insights(uid)` 抽样最近 90 天 confirmed memory（profile 8 + event 12）→ sonnet 写 1-3 条跨条目高阶观察 + supporting_ids → INSERT 为 `memory_type='insight' confidence=0.8 depends_on=supporting`；scheduler 03:13 cron 第 3 段；admin UI type 过滤器加 insight / 图谱紫色 stroke r=10 / audit 渲染 `memory_dream_insight` 事件；写 `prompt/memory_insight_dream.md` + `memory_prompts.render_insight_dream` helper
+- **记忆评测调研**：写 `me/记忆评测系统调研.md`（学术 benchmark 对照 LoCoMo/LongMemEval/PerLTQA + 6 维评测设计 + LLM-as-judge 方法 + AIDemo P0/P1/P2 落地建议）
+- **实测**：8058993786 跑 auto_dream_insights → 3 条高质量 insight（工作进取 / 睡眠困难模式 / 饮食随意将就），supporting_ids 正确，conf=0.8

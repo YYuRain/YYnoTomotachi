@@ -235,7 +235,7 @@ admin UI 审计 tab 着色 + 渲染（粉色 chip）。
 | 文件 | 作用 |
 |---|---|
 | `src/storage.py` | `PromptOverride` / `Skill` / `PendingReachMessage` ORM + helpers (`list_active_overrides`, `add_override`, `list_active_triggers`, `mark_override_fired`, `add_pending_reach`, `pop_pending_reach_for_merge`, `list_overdue_pending_reach`, `mark_pending_reach_status`, `top_skills_by_embedding`, `add_skill`, `bump_skill_usage`, `set_skill_status`) |
-| `src/feedback_prompts.py` | `SCREEN_PROMPT` (aux 粗筛) + `JUDGE_PROMPT` (sonnet 精判，含硬护栏) + `SKILL_CREATOR_BODY` (capability_request 转 trigger-based 指令的 prompt template，启动时种入 skills 表)；`render_screen` / `render_judge` / `render_skill_creator`（用 str.replace 避免 .format 误吃花括号）|
+| `src/feedback_prompts.py` | render helpers + `SKILL_CREATOR_NAME/SUMMARY` 常量。**prompt 文本已抽到 `prompt/feedback_*.md`（2026-05-21）**：`feedback_screen` (aux 粗筛) / `feedback_judge` (sonnet 精判) / `feedback_hard_guardrails` / `feedback_skill_creator` (capability_request 转 trigger-based 指令；含 `active_text_for_bot` 硬约束段防止 passive 注入指令，2026-05-20 修)；启动时 `_seed_skill_creator` 同步最新 body 到 skills 表 |
 | `src/feedback_agent.py` | `process(user_id, batch)` 主入口；`_generate_capability_skill` 调 skill_creator；`_passes_guardrails` regex 兜底 |
 | `src/triggered_reach.py` | active trigger 通道：`tick()` cron 扫描 + 判 condition + 暂存或直发；`dispatch_overdue()` 兜底；`_judge_and_compose` 给 sonnet 喂最近 12 条对话防重复 |
 | `src/memory.py::_fire_feedback_check` | flush 后 `asyncio.create_task` fire（同 `_fire_persona_update` 模式）|
@@ -272,8 +272,8 @@ overrides = await case(99, [
 
 ## 限制与未做
 
-- override 之间的语义冲突没检测（PRD v2 5.1 那种思路可借）
-- skill 自动淘汰（usage_count 长期 0 的标 disabled）没做
+- ~~override 之间的语义冲突没检测~~ → **已做**：`auto_dream_overrides` 03:13 cron 整理 prompt_overrides（2026-05-19）
+- ~~skill 自动淘汰~~ → **部分已做**：`auto_dream_skills` 03:13 cron 整理跨用户 skill 库（2026-05-19）；usage_count=0 自动 disable 仍未做
 - override 自动衰减 / 复审（类似 `last_verified_at` 的机制）没做
 - 用户主动删除自己的 override 的 webUI 自助通道没做
 - active trigger 的 `_cron_matches_now` 是手写解析，不是 APScheduler 真 CronTrigger——
@@ -281,3 +281,7 @@ overrides = await case(99, [
   cron 复杂表达式（`L`、`#`、年字段等）不支持
 - triggered_reach 命中后跑 sonnet 判 condition 是同步的；当前 1 min 间隔 + 90s dedupe
   保证一次 cron 时刻不重复 fire，但若 sonnet 调用 > 1 min 会被下一轮跳过
+
+## 历史教训
+
+- **2026-05-20 天气反复打扰 bug**：`active_text_for_bot` 当时写了 "如果对方聊到出门/上班/下班...你顺手 web_search 查天气" 这种 passive 指令，user 一说"上班"整段就生效，cron + passive 双路重叠 = 反复打扰。修复：(1) 修 override #3 text 改为只声明后台 cron + "除非对方主动问，否则不要主动提"；(2) 在 `prompt/feedback_skill_creator.md` 加"硬约束"段——active trigger 的 `active_text_for_bot` 绝对不能写"如果对方说 X 你就 Y"/"你顺手查"/"列举关键词"——主动行为该交给 cron，不该 passive 注入。

@@ -47,7 +47,8 @@
 │   │                               └─► _fire_conflict_check (PRD 5.1 异步) │
 │   │                               └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
 │   ├─ persona_consolidate    每日 03:07 (CST) per user 衰减/清旧观察│
-│   ├─ auto_dream             每日 03:13 (CST) memory.auto_dream(uid) (PRD 5.3) │
+│   ├─ auto_dream             每日 03:13 (CST) 4 段流水：5.3 三态判定 / override 整理 / │
+│   │                                insight 生成 P1-6 / skill 库整理 │
 │   ├─ proactive_job          每 25m per user 软门 LLM 判断 │
 │   │                                └─► generate_opener(uid) │
 │   │                                └─► bot.make_send_and_typing(uid) │
@@ -74,9 +75,10 @@
 | `src/minimax.py` | 聊天走 OpenAI 兼容端点；embed 走 MiniMax 原生格式；自动剥 `<think>` | ✅ MVP |
 | `src/embed_server.py` | 本地 OpenAI 兼容 embedding shim：FastAPI + sentence-transformers (bge-small-zh) :18080 | ✅ MVP |
 | `src/embed_client.py` | embed_server 客户端 + pgvector 字面量序列化（memory_store / admin_ui 共用） | ✅ 接入（2026-05-18） |
-| `src/memory_store.py` | 自搭记忆栈 ORM：`memories` 表 + `_ensure_v2_columns` 启动时 ALTER 兼容老库 | ✅ 接入（2026-05-18） |
-| `src/memory_prompts.py` | 抽取 / 冲突检测 / 反验证 / Auto Dream 4 个 LLM prompt | ✅ 接入（2026-05-18） |
-| `src/memory.py` | recall（pgvector cosine + 5.2 同步反验证）/ note_turn / maybe_flush（抽取入库 + 5.1 异步冲突检测）/ auto_dream（5.3 批量整理）。recall 输出每条带形成日期，stale 不召回，to_verify 带 `[待确认]` 标记 | ✅ MVP（2026-05-18 PRD v2 三层防线接入） |
+| `src/memory_store.py` | 自搭记忆栈 ORM：`memories` 表（含 P1-5 `valid_from / valid_to`、P0-1 `entities[]`、P0-4 `source_episode_id`）+ `episodes` 表（P0-4 raw turns provenance）+ `_ensure_v2_columns` 启动时 ALTER 兼容老库 | ✅ 接入（2026-05-18→21） |
+| `src/memory_prompts.py` | LLM render helpers（抽取 / 冲突检测 5.1 / 反验证 5.2 / Auto Dream 5.3 / Override Dream / Skill Dream / **insight 生成 P1-6**）；prompt 文本抽到 `prompt/memory_*.md`（2026-05-21） | ✅ 接入（2026-05-18→21） |
+| `src/memory.py` | **Hot path**：recall（cosine + ngram + entity 三路 RRF 融合 P0-1 + 三因子 ranker rel/imp/rec P0-2 + bi-temporal valid_to 过滤 P1-5）+ 5.2 同步反验证；**Background**：note_turn / maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测，stale 写 valid_to）+ auto_dream（5.3 三态判定）+ auto_dream_insights（P1-6 跨条目反思生成 memory_type='insight'）。recall 输出每条带形成日期，stale 不召回，to_verify 带 `[待确认]` 标记 | ✅ MVP（PRD v2 三层防线 + P0/P1 升级 2026-05-18→21） |
+| `src/prompt_loader.py` | 统一 prompt 加载器（`prompt/*.md` 扁平结构 + `@lru_cache`）；改 prompt 重启即生效零代码改动 | ✅ 接入（2026-05-21） |
 | `src/interests.py` | 话题抽取（轻量 LLM）+ 热度 bump/decay/top/cold | ✅ MVP |
 | `src/availability.py` | 每次回消息记 (weekday, hour)；`score` 给 proactive 用 | ✅ MVP（带冷启动先验） |
 | `src/emotion.py` | 聊天模式判档：casual / empathy / depth / interest | ✅ MVP |
@@ -85,7 +87,7 @@
 | `src/clock.py` | 中文时间感字符串：`2026-05-08 周五（工作日） 14:32 下午`、`since_phrase` 体感 idle | ✅ 接入（2026-05-07） |
 | `src/stickers.py` | 表情包索引：扫 `data/stickers/`、文件名当 tag、`parse_message` 切 `[sticker:tag]` 段 | ✅ 接入（2026-05-07） |
 | `src/openrouter.py` | OpenAI 兼容 httpx 客户端；主聊天（LLM_PROVIDER=openrouter，2026-05-10 起）+ `scripts/eval_*`；走 Clash 代理 | ✅ 接入（2026-05-08） |
-| `src/prompts.py` | 装配 system prompt + `PROACTIVE_OPENER_INSTRUCTIONS` + 表情包段 + 四档情绪指令（empathy/depth/interest） | ✅ MVP |
+| `src/prompts.py` | 装配 system prompt（baseline + memory + interests + emotion directive + role discipline + tool ctx + per-user overrides）。文本走 `prompt_loader` 从 `prompt/chat_*.md` 加载 | ✅ MVP（prompt 抽离 2026-05-21） |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
 | `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener` + `record_proactive_message`（proactive/welcome/triggered_reach 直发后写 `_recent` 让下轮上下文看见）+ `pop_pending_reach_for_merge`（active trigger 暂存内容拼进 user 消息）；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
 | `src/scheduler.py` | APScheduler 七个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min) | ✅ MVP |
@@ -109,17 +111,21 @@
   - `prompt_overrides(user_id, text, reason, source_skill_id, risk_level, status, trigger_kind, cron_schedule, condition_prompt, last_fired_at, ...)` —— per-user 偏好沉淀（含 active trigger 字段）
   - `skills(name, summary, body, embedding, created_by, usage_count, ...)` —— 跨用户复用的 prompt 片段库（仓库语义，含 `skill_creator` meta-skill）
   - `pending_reach_messages(user_id, override_id, message, expected_send_after, status, ...)` —— active trigger 暂存的待主动发消息
-- **自搭记忆栈**（postgres + pgvector，2026-05-18 替换原 memU SDK）：长期记忆
-  - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json`，调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）→ `_persist_items`（embedding + INSERT 到 `memories` 表）
-  - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（pgvector cosine top-k）
-  - **PRD v2 三层防线**：5.1 写入冲突检测（异步）+ 5.2 召回反验证（同步阻塞 + 30min cooldown）+ 5.3 Auto Dream（03:13 cron 批量整理）；详见 `memory-stack.md`
-  - 容器：`docker memu-postgres`（pgvector，名字沿用旧 memU 时代不改），`localhost:5432/memu`
+- **自搭记忆栈**（postgres + pgvector + pg_trgm，2026-05-18 替换原 memU SDK）：长期记忆
+  - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json` + `episodes` 表行（P0-4 provenance），调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）输出 profile/event/entities → `_persist_items`（embedding + INSERT 到 `memories` 表，带 `source_episode_id` / `entities` / `valid_from`）
+  - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（**P0-1 hybrid retrieval**：cosine + ngram(ILIKE) + entity 三路 RRF 融合，**P0-2 三因子 ranker** rel/imp/rec 加权，**P1-5 valid_to 过滤** 排除已失效）
+  - **PRD v2 三层防线 + P1-6 insight**：5.1 写入冲突检测（异步，stale 时写 valid_to）+ 5.2 召回反验证（同步阻塞 + 30min cooldown）+ 5.3 Auto Dream（03:13 cron 4 段：三态判定 / override 整理 / **insight 生成** / skill 库整理）；详见 `memory-stack.md`
+  - 容器：`docker memu-postgres`（pgvector + pg_trgm，名字沿用旧 memU 时代不改），`localhost:5432/memu`
 - **静态资源**：
   - `data/stickers/*.{jpg,png,gif,webp}` — 表情包，文件名（去后缀）当 tag
   - `data/eval/run_<ts>.{jsonl,md,scores.jsonl,scores.md}` — 模型评测产物（`scripts/eval_*`）
   - `data/recent.json` — `_recent` 持久化（dict[uid, [msgs]]，每用户最近 12 轮；重启接续）
   - `data/audit.jsonl` — 审计事件流（每条带 `user_id` 字段；admin UI 按 viewer 过滤）
   - `data/.webui_secret` — webUI session 共享 HMAC 密钥（bot 进程铸 token，admin 进程验签；首启者写盘其他读）
+- **prompt 文件夹**（2026-05-21 抽离）：
+  - `prompt/system_baseline.md` — persona baseline（即原 `System Prompt v0.0.1.md`）
+  - `prompt/{memory,feedback,chat,emotion,persona,proactive,agent,interests}_*.md` — 23 个 LLM prompt
+  - 加载方式：`src.prompt_loader.load(name)` 带 `@lru_cache`；改文件重启即生效
 
 ## 扩展点（为下一期明确预留）
 
