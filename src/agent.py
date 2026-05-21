@@ -351,14 +351,25 @@ async def handle_user_message(
                 "tool_call_id": tc_id,
                 "content": tool_result or "（工具未返回结果）",
             })
-            res2 = await llm.chat_with_tools(
-                messages2,
-                tools=tools.TOOL_SCHEMAS,
-                tool_choice="none",
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            reply = res2.get("text", "")
+            try:
+                res2 = await llm.chat_with_tools(
+                    messages2,
+                    tools=tools.TOOL_SCHEMAS,
+                    tool_choice="none",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                reply = res2.get("text", "")
+            except RuntimeError as e:
+                # 二次调用偶尔返空（LLM 拿到空 tool_result 时不知道说啥，输出全 whitespace）
+                # 不抛错，给个 fallback：用 res1 已有的 text（如有）或承认没拿到
+                log.info("二次调用空 reply，走 fallback: %s", str(e)[:120])
+                reply = (res1.get("text") or "").strip()
+                if not reply:
+                    if not tool_result:
+                        reply = f"搜了下没找到，关键词换换？"
+                    else:
+                        reply = f"刚搜出来一点东西但不知道有没有用——{tool_result[:200]}"
         else:
             reply = res1.get("text", "")
     except Exception as e:
