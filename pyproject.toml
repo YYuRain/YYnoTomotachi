@@ -27,6 +27,7 @@ dependencies = [
 tools = [
     "yt-dlp>=2024.12.0",
     "xiaohongshu-cli",  # jackwener/xiaohongshu-cli；注册 'xhs' 命令；带签名
+    "bilibili-cli",     # jackwener/bilibili-cli；注册 'bili' 命令；搜索/视频详情
 ]
 
 [build-system]

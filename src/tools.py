@@ -299,6 +299,43 @@ async def search_web(query: str) -> str:
     return raw[:1500]
 
 
+async def search_bilibili(keyword: str) -> str:
+    """搜索 B 站视频，返回前 5 条标题 + UP主 + 链接。
+
+    用 bilibili-cli (`bili search KEYWORD --type video --max 5 --json`)。匿名搜索不需 cookie；
+    需要登录的更详细数据本工具不用。失败时返空（让上游 web_search fallback 接管）。
+    """
+    if not keyword.strip():
+        return ""
+    raw = await _run("bili", "search", keyword, "--type", "video", "--max", "5", "--json")
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("ok") is False:
+        log.info("bili search 失败：%s", str((data.get("error") or {}).get("message", ""))[:120])
+        return ""
+    items = (data.get("data") or {}).get("items") or []
+    lines: list[str] = []
+    for it in items[:5]:
+        title = it.get("title") or ""
+        up = it.get("author") or it.get("uploader") or ""
+        plays = it.get("play") or it.get("view") or it.get("view_count") or ""
+        bvid = it.get("bvid") or it.get("id") or ""
+        if title:
+            line = f"「{title}」 UP主：{up}" + (f"（{plays} 播放）" if plays else "")
+            if bvid:
+                line += f"\n  https://www.bilibili.com/video/{bvid}"
+            lines.append(line)
+    if lines:
+        return "B 站搜索结果：\n" + "\n".join(lines)
+    return ""
+
+
 _GITHUB_RE = re.compile(
     r"(?:https?://github\.com/)?([a-zA-Z0-9][a-zA-Z0-9_-]*)/([a-zA-Z0-9._-]+?)(?:\.git)?(?:/|$|\s)"
 )

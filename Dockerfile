@@ -19,8 +19,9 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir -e ".[persist]" "huggingface-hub[cli]"
 
 # Agent-Reach: yt-dlp（YouTube/B站字幕）+ xiaohongshu-cli（小红书 CLI，jackwener，
-# 注册 'xhs' 命令；含完整签名实现支持 search/read API）—— 单独 layer 让上面 layer 可复用缓存
-RUN pip install --no-cache-dir "yt-dlp>=2024.12.0" "xiaohongshu-cli"
+# 注册 'xhs' 命令）+ bilibili-cli（B 站 CLI，jackwener，注册 'bili' 命令，含搜索/视频
+# 详情）—— 单独 layer 让上面 layer 可复用缓存
+RUN pip install --no-cache-dir "yt-dlp>=2024.12.0" "xiaohongshu-cli" "bilibili-cli"
 
 # bge-small-zh 烤进镜像（~100MB）。新版 huggingface_hub 用 `hf`（旧 `huggingface-cli` 已移除）
 RUN hf download BAAI/bge-small-zh-v1.5 \

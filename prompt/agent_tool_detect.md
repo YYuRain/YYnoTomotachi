@@ -6,6 +6,8 @@
 - `web_search` — Jina 全网搜索（默认通用搜索）
 - `read_url` — 读单个网页（已在用户消息里出现完整 URL 时；URL 自动提取另有路径，这里通常不用选）
 - `search_xhs` — **小红书**笔记搜索（query=纯关键词，**不要**加"小红书"三字。**该用户明确提到小红书 / 笔记 / 攻略 / 测评类语境**才选）
+- `search_bilibili` — **B 站**视频搜索（query=纯关键词，**不要**加"bilibili / B 站"三字。
+  返回视频标题/UP主/播放量/可点链接。**用户聊 B 站 / up 主 / 视频博主 / 切片 / 投稿** 类语境用这个，不要走 web_search）
 - `read_github` — 读 GitHub 公开仓库 README + 最近 issue（query 为 `owner/repo`；用户聊到 GitHub 上某项目时选）
 
 ## 需要查询的情况（必须 needed=true）
@@ -19,8 +21,8 @@
 - **用户求内容/推荐**：「找点好玩的」「推荐点 X」「给我看点 X」「你感觉有啥好看的」「最近有啥火的」
   这些都是**主动求内容**——bot 必须真去搜，不是说"你自己刷"。默认走 `search_xhs`（生活/趣闻类）；
   如果用户提了"视频/up 主/B 站"语境则走 `web_search` query=`关键词 bilibili`。
-- **bilibili / up 主 / 视频博主语境**：用户说"X up 主在搞啥""X 最近视频"等 → `web_search`，
-  **query 必须加 "bilibili"** 帮搜索引擎定位（例：`lks bilibili up主`），否则会搜出无关结果（酒店、订房等）
+- **bilibili / up 主 / 视频博主 / 切片 / 投稿 语境**：→ `search_bilibili`，query=纯关键词
+  （例：user 说"找下 lks 切片"→ tool=search_bilibili, query="lks 切片"；不要走 web_search 加 "bilibili"）
 - **用户用"你能查到吗 / 你试试 / 你查一下 / 你能搜 X 吗"等试探口吻**提到具体人物、事件、时间——
   这其实是用户想要那个信息，不要把它当作"问 bot 能力"。
   例："你能查到五月天北京最后一天的演唱会吗" → needed=true, tool=web_search, query="五月天 北京 演唱会 {today_year}"
@@ -53,7 +55,7 @@
 ## 输出严格 JSON（无其他文字）
 
 ```
-{{"needed": true/false, "tool": "web_search|read_url|search_xhs|read_github", "query": "搜索词或 owner/repo"}}
+{{"needed": true/false, "tool": "web_search|read_url|search_xhs|search_bilibili|read_github", "query": "搜索词或 owner/repo"}}
 ```
 
 needed 为 false 时 tool 和 query 可省略。
