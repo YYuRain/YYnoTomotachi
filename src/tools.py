@@ -62,16 +62,20 @@ async def _run(*args: str, proxy: bool = False, timeout: float | None = None) ->
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=eff_timeout)
-        return stdout.decode("utf-8", errors="replace").strip()
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=eff_timeout)
+        out = stdout.decode("utf-8", errors="replace").strip()
+        if not out:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            log.warning("tool %s rc=%s stdout=empty stderr=%r", args[0], proc.returncode, err[:300])
+        return out
     except asyncio.TimeoutError:
-        log.debug("tool timeout (%.1fs): %s", eff_timeout, args[0])
+        log.warning("tool timeout (%.1fs): %s", eff_timeout, args[0])
         return ""
     except Exception as e:
-        log.debug("tool error: %s", e)
+        log.warning("tool error: %s args=%s", e, args[:3])
         return ""
 
 
