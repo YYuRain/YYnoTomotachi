@@ -48,7 +48,7 @@ _BILI_DOMAINS = {"bilibili.com", "b23.tv"}
 _VIDEO_DOMAINS = {"youtube.com", "youtu.be", "bilibili.com", "b23.tv"}
 
 
-async def _run(*args: str, proxy: bool = False) -> str:
+async def _run(*args: str, proxy: bool = False, timeout: float | None = None) -> str:
     env = {**_TOOL_ENV}
     if proxy:
         # 读 .env::TELEGRAM_PROXY——本地 dev 是 http://127.0.0.1:7897 (Clash)，
@@ -57,6 +57,7 @@ async def _run(*args: str, proxy: bool = False) -> str:
         proxy_url = _settings().telegram_proxy or "http://127.0.0.1:7897"
         env["HTTPS_PROXY"] = proxy_url
         env["HTTP_PROXY"] = proxy_url
+    eff_timeout = timeout if timeout is not None else _TIMEOUT
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -64,10 +65,10 @@ async def _run(*args: str, proxy: bool = False) -> str:
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_TIMEOUT)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=eff_timeout)
         return stdout.decode("utf-8", errors="replace").strip()
     except asyncio.TimeoutError:
-        log.debug("tool timeout: %s", args[0])
+        log.debug("tool timeout (%.1fs): %s", eff_timeout, args[0])
         return ""
     except Exception as e:
         log.debug("tool error: %s", e)
@@ -301,8 +302,8 @@ def _parse_xhs_search(raw: str) -> list[str]:
 async def search_web(query: str) -> str:
     """走 Jina Search API（s.jina.ai）。复用 JINA_API_KEY 不引第三方 CLI。
 
-    历史：原来走 Exa via mcporter，但 mcporter 是本地 nvm 装的、容器没有。
-    Jina Search 免费层每月 1M token，对个人项目够用。
+    Jina Search 偶尔慢——curl --max-time 15s + _run timeout=18s（外层兜底比内层多 3s
+    避免 race condition：curl 内部 timeout 触发返错误体 vs subprocess 被外层 kill 返空）。
     """
     if not query.strip():
         return ""
@@ -318,7 +319,7 @@ async def search_web(query: str) -> str:
     # 默认 Jina 返回长 markdown，截 1500 字让主 LLM 看 3-4 条命中即可
     args += ["-H", "X-Respond-With: no-content"]  # 只要 title+url+desc，不要全文
     args.append(url)
-    raw = await _run(*args)
+    raw = await _run(*args, timeout=18.0)
     if not raw:
         return ""
     # 鉴权/限流失败时返回 JSON 错误体
@@ -498,7 +499,7 @@ async def read_github(query: str) -> str:
             "-H", "User-Agent: aidemo-bot",
             f"https://api.github.com/{path.lstrip('/')}",
         ]
-        return await _run(*args)
+        return await _run(*args, timeout=13.0)
 
     repo_raw = await _gh_api(f"repos/{owner_repo}")
     if not repo_raw:
@@ -569,7 +570,7 @@ async def read_url(url: str) -> str:
     if s.jina_api_key:
         args += ["-H", f"Authorization: Bearer {s.jina_api_key}"]
     args.append(reader_url)
-    raw = await _run(*args)  # 不再依赖 proxy=True 设 env，env_var 与显式 -x 双用易冲突
+    raw = await _run(*args, timeout=13.0)  # 不再依赖 proxy=True 设 env，env_var 与显式 -x 双用易冲突
     if not raw:
         return ""
     # Jina 失败时返回 JSON 错误体，识别后视为失败让 _fetch_one_url 走 Exa
