@@ -81,7 +81,7 @@ docker compose logs -f bot   # 看 ready
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
-| `src/tools.py` | Agent Reach 工具：URL 读取（Jina）/ 全网搜索（Jina）/ 小红书（xhs Python SDK，需 cookie）/ GitHub（REST API anon）/ YouTube + B站（yt-dlp 域名自动路由） |
+| `src/tools.py` | Agent Reach 工具集 + `TOOL_SCHEMAS`（OpenAI tool schema，主 LLM native tool_use 用）：search_web (Jina) / search_xhs (xhs CLI) / search_bilibili (bili CLI) / read_url (Jina) / read_github (REST API anon) / URL 域名自动路由 (yt-dlp / xhs / Jina) |
 | `src/proactive.py` | 主动搭话：硬门 + LLM 软门 + 每日限额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
@@ -145,17 +145,25 @@ recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让�
 
 ## Agent Reach 工具（2026-05-21 起，借 [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) 选型）
 
-容器内 binary 已全装好（Dockerfile）：
+容器内 binary 已全装好（Dockerfile）；**主 LLM 走 native tool_use 自己调**（不再走 aux LLM detect）：
 
-- `read_url(url)` — Jina Reader (`r.jina.ai/<url>`)，`JINA_API_KEY` Bearer
-- `search_web(query)` — Jina Search (`s.jina.ai/?q=`)，通用全网搜索
-- `search_xhs(keyword)` — `xhs` Python SDK (XhsClient)，需 cookie（`data/.xhs-cookie/cookies.txt` 或 env `XHS_COOKIE`）；admin UI audit 看 `xhs search 失败：...` 排查
-- `read_github(owner/repo)` — GitHub REST API anon（`api.github.com/repos/...`）；rate limit 60/h；不需要 GH_TOKEN
-- URL 自动路由 `_fetch_one_url`：xiaohongshu.com → xhs SDK；bilibili / youtube → yt-dlp；其它 → Jina Reader
-- 历史的 mcporter / Exa 已彻底退役（2026-05-21 删 `_exa_fetch_url` 和所有 fallback）；gh CLI 装过又删（v2 强制 auth 不适合 anon API）
+- `search_web(query)` — Jina Search (`s.jina.ai/?q=`) 通用全网搜索
+- `search_xhs(keyword)` — xiaohongshu-cli（PyPI `xiaohongshu-cli` jackwener）；cookie 在容器 `/root/.xiaohongshu-cli/cookies.json`（compose mount 持久化）
+- `search_bilibili(keyword)` — bilibili-cli（PyPI `bilibili-cli` jackwener）；anon 搜索不需 cookie
+- `read_url(url)` — Jina Reader (`r.jina.ai/<url>`)
+- `read_github(query)` — GitHub REST API anon（`api.github.com/repos/...`）；rate limit 60/h
+- URL 自动路由 `_fetch_one_url`：xiaohongshu.com → xhs CLI；bilibili / youtube → yt-dlp；其它 → Jina Reader
 
-工具失败静默跳过，不影响聊天。`prompt/agent_tool_detect.md` 运行时拼今天日期防 LLM 写错年份。
-详见 `document/agent-reach-integration.md`。
+**架构**：每 turn 主 LLM 调用最多 1 次工具循环——
+1. 第一次 `chat_with_tools(tool_choice="auto")` → LLM 输出 tool_calls
+2. agent.py 派发 `_TOOL_FUNCS` 执行工具
+3. 第二次 `chat_with_tools(tool_choice="none")` 把 tool_result 喂回，主 LLM 拿最终 text
+
+audit 新事件 `main_tool_call` / `main_tool_call_result`（替代旧 aux 的 `tool_decision` / `tool_call`）。
+工具失败静默跳过，不影响聊天。详见 `document/agent-reach-integration.md`。
+
+历史退役：mcporter / Exa（2026-05-19）；gh CLI v2 强制 auth 不适合 anon API（2026-05-21 删）；
+aux LLM detect 路径（2026-05-21 删，主 LLM 自己 tool_use）。
 
 ## 常见问题速查
 

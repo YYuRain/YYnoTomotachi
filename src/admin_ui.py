@@ -166,6 +166,8 @@ _INDEX_HTML = """<!doctype html>
   .ev.proactive_decision, .ev.proactive_fire, .ev.proactive_opener_generated { background: #fff3e0; color: #b56500; }
   .ev.tool_call { background: #f0f0f0; color: #555; }
   .ev.tool_decision { background: #f7f3e8; color: #886600; }
+  .ev.main_tool_call { background: #e8f0ff; color: #1a5fcc; }
+  .ev.main_tool_call_result { background: #e8f5ff; color: #1a8a8a; }
   .ev.feedback_screen, .ev.feedback_decision { background: #fff0fb; color: #b6398e; }
   .ev.interest_bump { background: #fffbe5; color: #997300; }
   .ev.startup, .ev.shutdown { background: #fdecec; color: #c53b3b; }
@@ -386,6 +388,8 @@ _INDEX_HTML = """<!doctype html>
         <option value="proactive_opener_generated">proactive_opener_generated</option>
         <option value="tool_call">tool_call</option>
         <option value="tool_decision">tool_decision</option>
+        <option value="main_tool_call">main_tool_call</option>
+        <option value="main_tool_call_result">main_tool_call_result</option>
         <option value="feedback_screen">feedback_screen</option>
         <option value="feedback_decision">feedback_decision</option>
         <option value="interest_bump">interest_bump</option>
@@ -1078,6 +1082,16 @@ function summarizeAudit(d) {
       const u = d.user_text ? `<div style="color:#888;font-size:11px">用户：${t(d.user_text, 100)}</div>` : '';
       const q = d.query ? `<div style="color:#888;font-size:11px">query：${t(d.query, 80)}</div>` : '';
       return `${decided} ${tool} ${skip}${u}${q}`;
+    }
+    case 'main_tool_call': {
+      const head = `<span class="k">主LLM自调 ${d.tool || '?'}</span>`;
+      const args = d.args ? `<div style="color:#888;font-size:11px">args: ${t(JSON.stringify(d.args), 200)}</div>` : '';
+      return head + args;
+    }
+    case 'main_tool_call_result': {
+      const head = `<span class="k">${d.tool || '?'} → ${d.result_chars||0} chars</span>`;
+      const preview = d.result_preview ? `<div style="color:#888;font-size:11px;margin-top:2px">${t(d.result_preview, 200)}</div>` : '';
+      return head + preview;
     }
     case 'feedback_screen': {
       const sig = d.signal ? `<span style="color:#b6398e">✓ 有信号</span>` : `<span style="color:#888">× 无信号</span>`;
