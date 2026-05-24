@@ -330,7 +330,15 @@ async def search_web(query: str) -> str:
     if raw.lstrip().startswith("{") and ('"code":4' in raw or 'AuthenticationRequiredError' in raw):
         log.info("jina search 失败：%s", raw[:120])
         return ""
-    return raw[:1500]
+    # Jina 返回 [1] Title: / [1] URL Source: / [1] Description: 机器模板格式
+    # 实测主 LLM 会原文复制粘贴（"刚搜出来一点东西——[1] Title: ..."），完全违反 prompt
+    # 约束。在结果前加硬性引导段——把"禁止复制"放在最贴近 raw 数据的地方
+    header = (
+        "【以下是 Jina 搜索原始结果（机器格式，仅供你提取信息用）。"
+        "禁止把 `[1] Title:` / `[1] URL Source:` / `[1] Description:` 等字段名"
+        "直接出现在你给用户的回复里——挑一条用你自己的话简述（≤30 字）+ 贴链接即可】\n\n"
+    )
+    return header + raw[:1500]
 
 
 # OpenAI 兼容 tool schema 给主 LLM 用（native tool_use，2026-05-21 接入）
