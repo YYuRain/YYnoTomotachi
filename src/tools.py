@@ -607,11 +607,31 @@ async def read_github(query: str) -> str:
 
 
 async def read_url(url: str) -> str:
-    """通过 Jina Reader 读取网页正文（前 600 字）。
+    """读单个网页正文。
 
-    Jina 对匿名查询限速，IP 信誉差时直接 401。设了 JINA_API_KEY 就带 Authorization 鉴权。
-    返回的 401 / AuthenticationRequiredError JSON 当作失败让上游走 Exa 兜底。
+    按域名路由（跟 _fetch_one_url 一致）——xhs 走 xhs CLI 拿原帖正文 + 图 OCR；
+    B 站 / YouTube 走 yt-dlp 拿视频元信息；其他走 Jina Reader 拿网页正文。
+
+    之前只走 Jina Reader——主 LLM search_xhs 后调 read_url 拿到的是网页二手摘要而
+    不是帖子正文，体感"看不到内容"（2026-05-24 实测翻车）。
     """
+    if not url:
+        return ""
+    domain = _domain(url)
+    # xhs / xhslink → xhs CLI（拿原帖标题 / 作者 / 正文 / 图 OCR）
+    if any(xhs in domain for xhs in _XHS_DOMAINS):
+        result = await _read_xhs_note(url)
+        if result:
+            return result
+        # xhs CLI 失败时 fallback Jina Reader 至少拿网页摘要
+    # 视频域名 → yt-dlp
+    if any(v in domain for v in _VIDEO_DOMAINS):
+        result = await _read_video(url)
+        if result:
+            return result
+        # yt-dlp 失败 fallback Jina
+
+    # 默认 / fallback：Jina Reader
     from .config import settings as _settings
     reader_url = f"https://r.jina.ai/{url}"
     s = _settings()
