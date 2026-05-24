@@ -293,21 +293,44 @@ async def handle_user_message(
         active_model = s.anthropic_model
     else:
         active_model = s.minimax_chat_model
-    # 主 LLM 走 native tool_use（2026-05-21）：第一次 tool_choice='auto'，看 tool_calls；
-    # 如有 → 执行 tool → 二次调用 tool_choice='none' 强制不再循环（避免成本爆炸）。
+    # 主 LLM 走 native tool_use（2026-05-21；2026-05-24 放开到 2 次循环）：
+    # 允许 search → read 这种连续——之前限 1 次循环导致 bot 搜了但没法读详情，反过来
+    # 问 user "你知道吗"。MAX_TOOL_LOOPS=2 让 LLM 自己决定要不要补一次 read_url。
+    # 最后一轮 tool_choice='none' 强制写最终回复防止无限循环。
     # MiniMax 不支持，chat_with_tools 内部 fallback 等价无 tools chat。
+    MAX_TOOL_LOOPS = 2
     reply = ""
     used_tool: dict[str, Any] | None = None
+    last_tool_result = ""
+    last_res_text = ""
+    messages_w = list(messages)
     try:
-        res1 = await llm.chat_with_tools(
-            messages,
-            tools=tools.TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        if res1.get("tool_calls"):
-            tc = res1["tool_calls"][0]  # 限 1 次循环
+        for loop_i in range(MAX_TOOL_LOOPS + 1):
+            is_last = loop_i == MAX_TOOL_LOOPS
+            choice = "none" if is_last else "auto"
+            try:
+                res = await llm.chat_with_tools(
+                    messages_w,
+                    tools=tools.TOOL_SCHEMAS,
+                    tool_choice=choice,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except RuntimeError as e:
+                # 偶尔 LLM 拿到空 tool_result 后返 whitespace-only content
+                log.info("tool loop %d 空 reply: %s", loop_i, str(e)[:120])
+                break
+            tool_calls = res.get("tool_calls") or []
+            last_res_text = res.get("text") or ""
+            if not tool_calls:
+                reply = last_res_text
+                break
+            if is_last:
+                # tool_choice='none' 不应该返 tool_calls；保险——拿 text 退出
+                reply = last_res_text
+                break
+
+            tc = tool_calls[0]
             tc_name = tc.get("function", {}).get("name") or ""
             tc_id = tc.get("id") or ""
             args_raw = tc.get("function", {}).get("arguments") or "{}"
@@ -315,15 +338,15 @@ async def handle_user_message(
                 tc_args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
             except Exception:
                 tc_args = {}
-            log.info("主 LLM tool_use: %s(%s)", tc_name, tc_args)
-            audit("main_tool_call", user_id=user_id, tool=tc_name, args=tc_args, call_id=tc_id)
+            log.info("主 LLM tool_use loop=%d: %s(%s)", loop_i, tc_name, tc_args)
+            audit("main_tool_call", user_id=user_id, tool=tc_name, args=tc_args,
+                  call_id=tc_id, loop=loop_i)
 
             func = _TOOL_FUNCS.get(tc_name)
             if func:
                 try:
                     tool_result = await func(**tc_args)
                 except TypeError:
-                    # schema 跟函数签名 mismatch 兜底——按位置传第一个值
                     if tc_args:
                         tool_result = await func(next(iter(tc_args.values())))
                     else:
@@ -337,42 +360,29 @@ async def handle_user_message(
 
             audit("main_tool_call_result", user_id=user_id, tool=tc_name,
                   result_chars=len(tool_result or ""),
-                  result_preview=(tool_result or "")[:300])
+                  result_preview=(tool_result or "")[:300], loop=loop_i)
+            last_tool_result = tool_result or ""
             used_tool = {"name": tc_name, "args": tc_args, "result_chars": len(tool_result or "")}
 
-            # 把 tool_use + tool_result 加进 messages，第二次调（强 tool_choice='none'）
-            messages2 = list(messages)
-            messages2.append({
+            messages_w.append({
                 "role": "assistant",
-                "content": res1.get("text") or "",
-                "tool_calls": res1["tool_calls"],
+                "content": last_res_text,
+                "tool_calls": [tc],
             })
-            messages2.append({
+            messages_w.append({
                 "role": "tool",
                 "tool_call_id": tc_id,
                 "content": tool_result or "（工具未返回结果）",
             })
-            try:
-                res2 = await llm.chat_with_tools(
-                    messages2,
-                    tools=tools.TOOL_SCHEMAS,
-                    tool_choice="none",
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                reply = res2.get("text", "")
-            except RuntimeError as e:
-                # 二次调用偶尔返空（LLM 拿到空 tool_result 时不知道说啥，输出全 whitespace）
-                # 不抛错，给个 fallback：用 res1 已有的 text（如有）或承认没拿到
-                log.info("二次调用空 reply，走 fallback: %s", str(e)[:120])
-                reply = (res1.get("text") or "").strip()
-                if not reply:
-                    if not tool_result:
-                        reply = f"搜了下没找到，关键词换换？"
-                    else:
-                        reply = f"刚搜出来一点东西但不知道有没有用——{tool_result[:200]}"
-        else:
-            reply = res1.get("text", "")
+
+        # 兜底：tool 跑完但 reply 为空（LLM 返 whitespace 或异常退出）
+        if not reply.strip():
+            if last_res_text.strip():
+                reply = last_res_text
+            elif last_tool_result:
+                reply = f"刚搜出来一点东西但不知道有没有用——{last_tool_result[:200]}"
+            else:
+                reply = "搜了下没找到，关键词换换？"
     except Exception as e:
         log.exception("chat failed: %s", e)
         audit("assistant_reply", user_id=user_id, text="(脑子卡了一下)", mode=mode,
