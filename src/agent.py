@@ -35,6 +35,43 @@ _SHORT_WINDOW = 12
 _recent_per_user: dict[str, list[dict[str, str]]] = {}
 _recent_loaded = False
 
+# 最近 N 分钟内每个用户的工具调用流水——给主 LLM 看"我刚搜过啥"避免反复搜同内容。
+# 之前 _recent_per_user 只存 user/assistant text，不带 tool_call 元数据；导致跨 turn
+# bot 不知道上轮搜过同 keyword 又重新搜（2026-05-24 测试用户实测翻车）。
+_recent_tool_calls: dict[str, list[dict[str, Any]]] = {}
+_TOOL_CALL_TTL_SEC = 300        # 5 分钟外的不再注入
+_TOOL_CALL_KEEP_MAX = 8         # 单 user 最多保留 8 条
+
+
+def _record_tool_call_meta(user_id: int, tool: str, args: dict, result_chars: int) -> None:
+    import time as _t
+    uid = str(user_id)
+    lst = _recent_tool_calls.setdefault(uid, [])
+    lst.append({
+        "ts": _t.time(),
+        "tool": tool,
+        "args": args,
+        "result_chars": result_chars,
+    })
+    cutoff = _t.time() - _TOOL_CALL_TTL_SEC
+    _recent_tool_calls[uid] = [x for x in lst if x["ts"] >= cutoff][-_TOOL_CALL_KEEP_MAX:]
+
+
+def _format_recent_tool_calls(user_id: int) -> str:
+    """生成"[最近你已经查过的]"段——给 user message 注入用，让主 LLM 别重复搜。"""
+    import time as _t
+    uid = str(user_id)
+    lst = _recent_tool_calls.get(uid) or []
+    cutoff = _t.time() - _TOOL_CALL_TTL_SEC
+    items = [x for x in lst if x["ts"] >= cutoff]
+    if not items:
+        return ""
+    lines = []
+    for x in items:
+        args_str = ", ".join(f"{k}={v!r}" for k, v in (x.get("args") or {}).items())
+        lines.append(f"  - {x['tool']}({args_str}) → {x.get('result_chars', 0)}字结果")
+    return "[最近 5 分钟你已经调用过的工具]\n" + "\n".join(lines)
+
 
 def _uid(chat_id: int | str) -> str:
     return str(chat_id)
@@ -197,6 +234,13 @@ async def _build_turn(
         )
     if tool_ctx:
         text_parts.append(f"[链接内容]\n{tool_ctx}")
+    recent_tool_uses = _format_recent_tool_calls(user_id)
+    if recent_tool_uses:
+        text_parts.append(
+            recent_tool_uses
+            + "\n（重复内容不要再调；如果话题相关，**直接用前面已搜到的信息**回答 / 续话题——"
+            "记忆 + 这段历史足够你说话了。要换 keyword 才能搜出新东西时再调一次。）"
+        )
     if image_b64:
         text_parts.append(user_text or "（对方发了一张图，没附文字——你看一眼，自然回应）")
     else:
@@ -363,6 +407,7 @@ async def handle_user_message(
                   result_preview=(tool_result or "")[:300], loop=loop_i)
             last_tool_result = tool_result or ""
             used_tool = {"name": tc_name, "args": tc_args, "result_chars": len(tool_result or "")}
+            _record_tool_call_meta(user_id, tc_name, tc_args, len(tool_result or ""))
 
             messages_w.append({
                 "role": "assistant",
