@@ -143,6 +143,15 @@ async def _read_xhs_note(url: str) -> str:
     user = (card.get("user") or {}).get("nickname") or ""
     info = card.get("interact_info") or {}
     likes = info.get("liked_count") or "0"
+    # 提取图片 URL——xhs 帖子大量信息在图里（穿搭 / 探店 / 美食），最多前 4 张
+    image_list = card.get("image_list") or []
+    image_urls: list[str] = []
+    for img in image_list[:4]:
+        if not isinstance(img, dict):
+            continue
+        url_default = img.get("url_default") or img.get("url") or img.get("url_pre")
+        if url_default:
+            image_urls.append(url_default)
     parts = []
     if title:
         parts.append(f"标题：{title}")
@@ -150,6 +159,13 @@ async def _read_xhs_note(url: str) -> str:
         parts.append(f"作者：{user}（{likes}赞）")
     if desc:
         parts.append(f"内容：{desc[:400]}")
+    if image_urls:
+        # 把图链接列出来——主 LLM 觉得对用户有价值时直接把链接贴进回复，
+        # Telegram 客户端会自动渲染成图片预览
+        parts.append(
+            f"图（共 {len(image_list)} 张，前 {len(image_urls)} 张可分享给用户）："
+            + "\n  ".join([""] + image_urls)
+        )
     # 原 URL 留一份给 bot 引用——user 已经把链接发过来，bot 引回去对方一目了然
     parts.append(f"链接：{url}")
     return "\n".join(parts)
@@ -295,10 +311,21 @@ def _parse_xhs_search(raw: str) -> list[str]:
                 url += f"?xsec_token={xsec}"
         else:
             url = ""
+        # 首图——主 LLM 分享时可附图，Telegram 自动渲染预览
+        cover_url = ""
+        cover = card.get("cover") or {}
+        if isinstance(cover, dict):
+            cover_url = cover.get("url_default") or cover.get("url") or cover.get("url_pre") or ""
+        if not cover_url:
+            img_list = card.get("image_list") or []
+            if img_list and isinstance(img_list[0], dict):
+                cover_url = img_list[0].get("url_default") or img_list[0].get("url") or ""
         if title:
             line = f"「{title}」（{likes}赞）"
             if url:
-                line += f"\n  {url}"
+                line += f"\n  链接：{url}"
+            if cover_url:
+                line += f"\n  封面图：{cover_url}"
             lines.append(line)
     return lines
 
