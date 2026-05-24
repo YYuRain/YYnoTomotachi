@@ -321,6 +321,20 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         log.debug("proactive decide load overrides err uid=%s: %s", user_id, e)
 
     share_quota_remaining = _share_quota_remaining(user_id)
+
+    # 把最近 3 条自己发过的 proactive opener 摘出来——让软门 LLM 看到"我反复戳过这些"
+    # 单独抽是因为 recent_history 是混杂的对话流，LLM 不容易辨认"哪些是我主动发的没回应的"
+    recent_assistant_openers: list[str] = []
+    if consecutive_asst > 0:
+        for m in reversed(rec_msgs):
+            if m.get("role") != "assistant":
+                break
+            content = (m.get("content") or "").strip()
+            if content:
+                recent_assistant_openers.append(content[:200])
+            if len(recent_assistant_openers) >= 3:
+                break
+
     ctx: dict[str, Any] = {
         "now": now.strftime("%H:%M"),
         "weekday": _WEEKDAYS[now.weekday()],
@@ -332,6 +346,8 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "opens_today": today_count,
         "daily_cap": DAILY_CAP,
         "share_quota_remaining": share_quota_remaining,
+        "consecutive_asst_no_reply": consecutive_asst,
+        "recent_assistant_openers": recent_assistant_openers,
     }
     user_msg = json.dumps(ctx, ensure_ascii=False, indent=2)
 
