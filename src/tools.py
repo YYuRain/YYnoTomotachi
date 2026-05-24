@@ -166,6 +166,19 @@ async def _read_xhs_note(url: str) -> str:
             f"图（共 {len(image_list)} 张，前 {len(image_urls)} 张可分享给用户）："
             + "\n  ".join([""] + image_urls)
         )
+        # 前 2 张图跑 OCR——xhs 大量是文字截图（穿搭笔记/教程/语录），不 OCR 主 LLM
+        # 看不见内容。控制 2 张是延迟+成本的折中（每张 vision LLM 调用 ~1-3s + ~$0.003）
+        try:
+            from . import vision
+            ocr_texts = await vision.ocr_image_urls(image_urls[:2])
+            ocr_lines: list[str] = []
+            for i, txt in enumerate(ocr_texts, 1):
+                if txt:
+                    ocr_lines.append(f"图 {i} 内容：{txt[:500]}")
+            if ocr_lines:
+                parts.append("【图内 OCR/描述】\n" + "\n".join(ocr_lines))
+        except Exception as e:
+            log.info("xhs read ocr err: %s", e)
     # 原 URL 留一份给 bot 引用——user 已经把链接发过来，bot 引回去对方一目了然
     parts.append(f"链接：{url}")
     return "\n".join(parts)
