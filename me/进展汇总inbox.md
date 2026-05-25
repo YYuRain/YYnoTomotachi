@@ -128,3 +128,65 @@
 - **删 mcporter 残留**：`_exa_fetch_url`、`_fetch_one_url` Exa fallback、`search_xhs` mcporter fallback 全删
 - **docker-compose.yml**: bot 加 `./data/.xhs-cookie:/root/.xhs` volume；删 stale `System Prompt v0.0.1.md` mount（文件已 mv 到 prompt/system_baseline.md）
 - 实测：read_github('python/cpython') 895 字 + 5 issues 正确返回
+
+## 2026-05-25
+
+### review 修复（10 项加固，commit a5a4c4d）
+
+代码审查找出的并发 / TZ / 资源 / 安全 / 可观测性问题集中修一遍：
+
+- **SQLite 启 WAL + busy_timeout=5000**：多用户并发写不再 `database is locked`
+- **TZ 一致性**：新 `clock.utcnow / now_local / today_bounds_utc` helper；`proactive` / `triggered_reach` 拆 UTC 域（配额 / dedupe）vs local 域（cron / 显示），不再依赖系统 TZ
+- **APScheduler 8 个 job 全配** `max_instances=1 + coalesce=True + misfire_grace_time`，job 跑超时不堆积
+- **wipe_user 反射** `Base.metadata`：覆盖之前漏的 `prompt_overrides / pending_reach_messages / skills(created_by)`；DELETE 前 dump `data/wipe_backup_<uid>_<ts>/` 落地 MEMORY.md 软规则
+- **subprocess kill on timeout**：`tools._run` wait_for 超时 / 异常都 `proc.kill() + wait()`，xhs/bili/yt-dlp 卡住不再僵尸化
+- **admin UI 暴露面收紧**：docker port `0.0.0.0` → `127.0.0.1:18081`（cloudflared 内网走 admin:18081 不受影响）；dev 免鉴权改 `ADMIN_UI_DEV_NO_AUTH=1` 显式开关，避免生产忘配密码裸奔
+- **fire-and-forget task 持引用**：`agent._spawn_bg / memory._spawn_bg` 加 `_BG_TASKS set + add_done_callback`，event loop 不再 GC 丢任务
+- **共享 dict snapshot**：`proactive` / `triggered_reach` 跨 task 读 `_recent_per_user` 用 `list(...)`
+- **postgres 故障告警**：`memory.recall` 失败升 `log.warning + audit + push admin Telegram`，30 min 限速
+- **audit.jsonl 按日切**（`audit.YYYY-MM-DD.jsonl`）+ 新 `daily_cleanup_job` 04:23 跑：audit 30 天 / wipe_backup 7 天
+
+### insight 重复修复（commit c9d4856 + 一次性清理 fd4031f）
+
+观察到 admin uid 4 天里 3 个 pattern 重复改写 10 条 insight。
+
+- **根因**：`auto_dream_insights` 抽样 SQL 仅拉 profile + event，**没把现存 insight 喂回 LLM**——LLM 看不到上次写过什么
+- **修**：prompt 加"已存在的 insight"段（近 30 天，最多 30 条）+ 写入前 cosine 拦截（≥ 0.85）+ audit `dedup_rejected` 字段
+- **历史清理**：`scripts/cleanup_duplicate_insights.py` 按 cosine 聚类（≥ 0.85）每簇保最新，其余 `valid_to=now()`（保留可追溯，非 hard delete），admin uid 跑完 10 → 4 条留
+- **admin UI stale 视觉降权**（commit ed3b168）：行 opacity 0.45 + summary 划线；header 显示"X 有效 / Y 总（Z 已失效）"，跟纯 active 一眼可分
+- **admin UI 审计 tab 修日切断流**（commit 7dc2650）：`_audit_files()` 列 `audit.*.jsonl` + 兼容老 `audit.jsonl` mtime 倒序读
+
+### airi 调研（写 `me/airi-借鉴分析.md`）
+
+读 [moeru-ai/airi](https://github.com/moeru-ai/airi) 39.5K 星的 vtuber companion monorepo（TS）核心架构。
+
+- **核心差异**：airi 走 ticking system 每 60s 让 LLM 自己选 action（含 sleep / break / come_up_ideas / come_up_goals 等元 action），bot 在循环里"活着"
+- **评估结论**：整体 Ticking Loop 在 1:1 陪伴 + 多用户 + 商用 API 约束下不成立——LLM 调用量 24× 爆炸 / 频率不可控 / cron 通道冲突 / observability 坍缩 / 跟陪伴定位拧着
+- **挑出能借鉴的 3 件**（按 ROI）：(1) `come_up_ideas` 进 dream 池（独立、风险低、ROI 高）(2) personality prompt 具象化（参考 ReLU 的"出生日 / 物理存在 / Forget being helpful assistant 三连"）(3) memory.py 拆分（结构债，单独 PR）
+- **不照搬**：Ticking / Hooks / Velin / Live2D / Electron / 多平台 / 实时语音
+
+### agent_ideas pool（commit 65e8dc4 + 三路融合 2c62ff9，airi `come_up_ideas` 借鉴）
+
+让 bot 凌晨自主形成"想做的事"——不是反应式抽 recent_topics。
+
+- **新表 `agent_ideas`**（postgres）：`id / user_id / text / kind / priority / status / source_ids / suggested_query / created_at / used_at / expires_at`；`kind ∈ {question, share, follow_up, observation}`
+- **新模块 `src/agent_ideas.py`**：`form_ideas` / `list_pending` / `mark_idea_used` / `expire_old_ideas`；写入前 cosine ≥ 0.85 拦截
+- **新 prompt** `prompt/memory_form_ideas_dream.md`：sonnet 看最近 30 天事实写 0-5 条；`share` kind 强制带 `suggested_query`（缺则降级 follow_up）
+- **scheduler.auto_dream_job 4 → 5 段**：(1) 三态判定 (2) override 整理 (3) insight 生成（含去重）(4) **form_ideas** (5) skill 库整理 + 全局 `expire_old_ideas`
+- **proactive 三路并行消费**：
+  - 路径 A：消费 `share` kind idea + `suggested_query` 不空 → 自动调 `_select_share_item` 用 idea query 现搜现挑；opener prompt 走"想到 X → 顺手搜了下"双层叙事
+  - 路径 B：LLM 没消费 share idea 但临时输出 `share_intent` → 现搜现挑（"刚翻到一条"）
+  - 路径 C：消费非 share kind idea → topic_chat + opener prompt 走"想起来的事"叙事，按 kind 区分（question/follow_up/observation）
+- 实测：admin uid 跑一次 form_ideas 11.8s 出 3 条干净 idea，share kind 带 query "AI陪伴 情感边界 设计 人机恋 技术实现"
+
+### docs 同步（commit a2f5bcb）
+
+近一日多 commit 的结构变更文档侧没跟，批量补：
+
+- `CLAUDE.md` / `README.md` 项目根更新
+- `document/memory-stack.md` 加 agent_ideas 表 schema + 5 段 auto_dream + 三路并行消费图
+- `document/overview.md` scheduler 流水扩 5 段 / 8 job / proactive 三路 / 模块表加 agent_ideas
+- `document/running.md` 故障排查加 WAL / audit 日切 / stale 视觉；admin tab 三 → 四
+- `document/deployment.md` port 改 127.0.0.1 + ADMIN_UI_DEV_NO_AUTH 注释
+- `document/extension-points.md` 新加 agent_ideas pool 整段
+- 同步顺手清掉 `me/进展汇总inbox` 同名空文件（同名 .md 才是真 inbox）
