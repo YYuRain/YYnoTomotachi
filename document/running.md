@@ -71,7 +71,14 @@ INFO __main__: ready
 nohup .venv/bin/python -m scripts.admin > data/admin.log 2>&1 & disown
 ```
 
-浏览器打开 http://127.0.0.1:18081 ——三个 tab：分类 / 记忆项（带搜索） / 资源。
+浏览器打开 http://127.0.0.1:18081 ——四个 tab：记忆项 / 图谱（D3） / 调教（pending/active overrides + skill 库） / 审计。
+
+**鉴权**：除非显式设 `ADMIN_UI_DEV_NO_AUTH=1`，否则必须有 session cookie——
+开发模式可设 env 跳过；或正常走 Telegram `/memory` 命令拿一次性登录链接。
+（之前"env 都没设就免鉴权"的兜底已废，避免生产忘配密码裸奔。）
+
+云端部署 admin port 已绑回 `127.0.0.1:18081`，cloudflared 内网走 `admin:18081`
+不受影响。要从外部直连走 SSH 隧道：`ssh -L 18081:127.0.0.1:18081 hk`。
 
 停：`pkill -f "scripts.admin"`。不开不会影响 bot 正常工作。
 
@@ -127,6 +134,9 @@ caffeinate -t 3600
 | `Address already in use :18080` | 上一个 bot 进程没死干净。`pkill -f "src\.main"` 再 `pkill -f uvicorn`，等 2 秒重启。 |
 | chat 返回空字符串 | MiniMax-M2 的 `<think>` 块占满 max_tokens。调高 `minimax.chat` 的 max_tokens（默认 1024）。 |
 | 模型加载时网络报错 | HF 被墙。第一次需要 Clash；之后 `HF_HUB_OFFLINE=1` 已经在 `main.py` 里强制设了，不应再联网。 |
+| `database is locked`（SQLite） | 不应再发生——`storage.engine()` 启动时已开 WAL + busy_timeout=5000。如果仍报，检查 `data/app.sqlite-wal` 是否被某个崩溃进程独占。 |
+| audit 看不到最新事件 | 2026-05-25 起按日切：`data/audit.YYYY-MM-DD.jsonl`。老 `data/audit.jsonl` 仍保留作历史。admin UI 审计 tab 自动合并读所有 `audit.*.jsonl`。 |
+| admin UI 看不到 stale 条目变化 | 5/25 起 stale 条目（`valid_to` 不空）整行 opacity 0.45 + summary 划线，header 显示"X 有效 / Y 总（Z 已失效）"。如果还是 N 条全 active 样，确认浏览器强刷过（Cmd+Shift+R）。 |
 
 ## 代码同步（Git）
 

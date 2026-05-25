@@ -47,16 +47,20 @@
 │   │                               └─► _fire_conflict_check (PRD 5.1 异步) │
 │   │                               └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
 │   ├─ persona_consolidate    每日 03:07 (CST) per user 衰减/清旧观察│
-│   ├─ auto_dream             每日 03:13 (CST) 4 段流水：5.3 三态判定 / override 整理 / │
-│   │                                insight 生成 P1-6 / skill 库整理 │
+│   ├─ auto_dream             每日 03:13 (CST) 5 段流水：5.3 三态判定 / override 整理 / │
+│   │                                insight 生成 P1-6（含 cosine 写入去重）/ │
+│   │                                form_ideas（agent_ideas pool / airi 借鉴）/ skill 库整理│
 │   ├─ proactive_job          每 25m per user 软概率门 + LLM 决策 │
-│   │                                └─► decide(uid) → mode={topic_chat|share_discovery} │
-│   │                                    share_discovery: search_xhs/bili/web → LLM 挑一条 │
+│   │                                └─► decide(uid) → mode={topic_chat|share_discovery}, │
+│   │                                    consumed_idea_id（采纳 agent_ideas 一条） │
+│   │                                    share_discovery 三路：(A) idea-driven share / │
+│   │                                    (B) 独立 share_intent / (C) topic_chat │
 │   │                                └─► generate_opener(uid)（看 mode 走对应 prompt）│
 │   │                                └─► bot.make_send_and_typing(uid) │
 │   ├─ triggered_reach_job    每 1m  扫 active trigger override (cron match → sonnet 判 │
 │   │                                condition → 暂存或直发，绕开 proactive 冷却) │
-│   └─ pending_reach_overdue  每 1m  pending 超 5min 仍没融入 → 兜底直发 │
+│   ├─ pending_reach_overdue  每 1m  pending 超 5min 仍没融入 → 兜底直发 │
+│   └─ daily_cleanup_job      每日 04:23 audit.YYYY-MM-DD.jsonl 30 天 / wipe_backup 7 天 │
 │                                                      │
 │  云部署额外组件（docker-compose）                        │
 │   ├─ postgres   pgvector，跨容器名 `postgres:5432`    │
@@ -92,7 +96,8 @@
 | `src/prompts.py` | 装配 system prompt（baseline + memory + interests + emotion directive + role discipline + tool ctx + per-user overrides）。文本走 `prompt_loader` 从 `prompt/chat_*.md` 加载 | ✅ MVP（prompt 抽离 2026-05-21） |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
 | `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener` + `record_proactive_message`（proactive/welcome/triggered_reach 直发后写 `_recent` 让下轮上下文看见）+ `pop_pending_reach_for_merge`（active trigger 暂存内容拼进 user 消息）；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
-| `src/scheduler.py` | APScheduler 七个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min) | ✅ MVP |
+| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit + wipe_backup)。所有 job 配 `max_instances=1 + coalesce=True + misfire_grace_time` 防重叠堆积 | ✅ MVP |
+| `src/agent_ideas.py` | bot 凌晨自主形成"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 sonnet 看最近事实写 0-5 条 idea；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 | ✅ 接入（2026-05-25）|
 | `src/bot.py` | 主 bot：邀请码准入门、命令 `/start /myid /memory /invite /users`、激活后调 `agent.generate_welcome` 发开场白；text + photo handler；`send_sticker` 回调 | ✅ MVP |
 | `src/main.py` | 统一启动/关停（embed_server + prod bot + 可选 test bot + scheduler）；`DEV_SKIP_PROD_BOT=1` 时跳过 prod bot 让本地不抢云端 polling | ✅ MVP |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应 | ✅ MVP |
@@ -116,7 +121,7 @@
 - **自搭记忆栈**（postgres + pgvector + pg_trgm，2026-05-18 替换原 memU SDK）：长期记忆
   - 每 6 轮或 15 分钟 flush rolling buffer 成 `data/memu_buffer/conv_*.json` + `episodes` 表行（P0-4 provenance），调 `_extract_items`（LLM `MEMU_CHAT_MODEL`，默认 deepseek-v4-flash via OpenRouter）输出 profile/event/entities → `_persist_items`（embedding + INSERT 到 `memories` 表，带 `source_episode_id` / `entities` / `valid_from`）
   - 每条用户消息到达时 `memory.recall(uid, query)` 做主动召回（**P0-1 hybrid retrieval**：cosine + ngram(ILIKE) + entity 三路 RRF 融合，**P0-2 三因子 ranker** rel/imp/rec 加权，**P1-5 valid_to 过滤** 排除已失效）
-  - **PRD v2 三层防线 + P1-6 insight**：5.1 写入冲突检测（异步，stale 时写 valid_to）+ 5.2 召回反验证（同步阻塞 + 30min cooldown）+ 5.3 Auto Dream（03:13 cron 4 段：三态判定 / override 整理 / **insight 生成** / skill 库整理）；详见 `memory-stack.md`
+  - **PRD v2 三层防线 + P1-6 insight + agent_ideas**：5.1 写入冲突检测（异步，stale 时写 valid_to）+ 5.2 召回反验证（同步阻塞 + 30min cooldown）+ 5.3 Auto Dream（03:13 cron 5 段：三态判定 / override 整理 / insight 生成（含 cosine 去重）/ **agent_ideas form_ideas** / skill 库整理）；详见 `memory-stack.md`
   - 容器：`docker memu-postgres`（pgvector + pg_trgm，名字沿用旧 memU 时代不改），`localhost:5432/memu`
 - **静态资源**：
   - `data/stickers/*.{jpg,png,gif,webp}` — 表情包，文件名（去后缀）当 tag

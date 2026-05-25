@@ -41,6 +41,7 @@ docker compose logs -f bot   # 看 ready
 | `TEST_BOT_TOKEN` | 可选——第二个 bot token（多用户模拟，`/become` 切虚拟身份） |
 | `TELEGRAM_PROXY` | 本机 `http://127.0.0.1:7897`（Clash）；HK 云直连留空；compose 内 bot 设 `http://mihomo:9981` |
 | `ADMIN_UI_USER` / `ADMIN_UI_PASSWORD` | 备用 admin 凭证（主登录路径已不用密码，靠 Telegram `/memory` 一键登录链接） |
+| `ADMIN_UI_DEV_NO_AUTH` | dev 用——`1` 时跳过鉴权（**仅本地 dev**！容器/生产**绝不**设这个，否则裸奔到公网）；之前"env 都没设就免鉴权"的兜底已废 |
 | `MINIMAX_API_KEY` | MiniMax key |
 | `MINIMAX_GROUP_ID` | MiniMax group id |
 | `MINIMAX_CHAT_MODEL` | 默认 `MiniMax-M2` |
@@ -74,7 +75,8 @@ docker compose logs -f bot   # 看 ready
 | `src/embed_server.py` | 本地 bge-small-zh embedding shim（:18080） |
 | `src/memory_store.py` | 自搭记忆栈：`memories` (含 P1-5 valid_from/valid_to) + `episodes` (P0-4 provenance) 表 ORM + engine + pgvector / pg_trgm 索引 |
 | `src/memory_prompts.py` | LLM render helpers（抽取 / 冲突检测 5.1 / 反验证 5.2 / Auto Dream 5.3 / **insight 生成 P1-6**），prompt 文本在 `prompt/memory_*.md` |
-| `src/memory.py` | **Hot path**: recall（cosine + ngram + entity 三路 RRF 融合 P0-1，叠加三因子 ranker rel+imp+rec P0-2，bi-temporal 过滤 valid_to P1-5）+ 5.2 同步反验证；**Background**: note_turn（短期 buffer）+ maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测，stale 写 valid_to P1-5）+ auto_dream（5.3 批量整理）+ **auto_dream_insights**（P1-6 跨条目反思，生成 memory_type='insight'） |
+| `src/memory.py` | **Hot path**: recall（cosine + ngram + entity 三路 RRF 融合 P0-1，叠加三因子 ranker rel+imp+rec P0-2，bi-temporal 过滤 valid_to P1-5）+ 5.2 同步反验证；**Background**: note_turn（短期 buffer）+ maybe_flush（写 episode + 抽取入库 + 5.1 异步冲突检测，stale 写 valid_to P1-5）+ auto_dream（5.3 批量整理）+ **auto_dream_insights**（P1-6 跨条目反思，含 prompt 喂现存 + cosine ≥0.85 写入去重） |
+| `src/agent_ideas.py` | bot 凌晨自主"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 sonnet 看最近事实写 0-5 条；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 |
 | `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
 | `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
 | `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |
@@ -82,12 +84,12 @@ docker compose logs -f bot   # 看 ready
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
 | `src/tools.py` | Agent Reach 工具集 + `TOOL_SCHEMAS`（OpenAI tool schema，主 LLM native tool_use 用）：search_web (Jina) / search_xhs (xhs CLI) / search_bilibili (bili CLI) / read_url (Jina) / read_github (REST API anon) / URL 域名自动路由 (yt-dlp / xhs / Jina) |
-| `src/proactive.py` | 主动搭话：软概率门（硬门已软化，违规越深 skip_prob 越高，封顶 0.97 保证最差也降频不彻底拦死）+ LLM 决策（`mode` ∈ {topic_chat / share_discovery}）；**share_discovery** = bot 主动调 search_xhs/bili/web 找有趣内容 → LLM 挑一条最 fit user 的带链接分享；xhs/bili 各日 1 条独立配额 |
+| `src/proactive.py` | 主动搭话：软概率门（违规越深 skip_prob 越高，封顶 0.97）+ LLM 决策；**三路并行**（2026-05-25）：(A) 消费 `share` kind agent_idea + suggested_query → 自动调 _select_share_item，opener 走"想到 X → 顺手搜了下"双层叙事；(B) 临时 share_intent → 现搜现挑（"刚翻到一条"）；(C) 消费非 share kind idea → topic_chat opener 走"想起来的事"叙事。xhs/bili 各日 1 条独立配额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
 | `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
-| `src/scheduler.py` | APScheduler 七个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min) |
+| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit 30 天 + wipe_backup 7 天)。所有 job 配 `max_instances=1 + coalesce + misfire_grace_time` 防重叠堆积 |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
 | `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库）」「审计」 |
@@ -97,10 +99,10 @@ docker compose logs -f bot   # 看 ready
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`：interests / reply_samples / last_interaction / `proactive_fires`（含 `mode`/`platform` 列，2026-05-21 加）/ persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）。`storage._ensure_columns` 启动时自动 ALTER 兜底兼容旧 db
-- **记忆栈** via **Postgres + pgvector + pg_trgm**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（带 `entities TEXT[]` / `source_episode_id UUID`）+ `episodes`（P0-4 raw turns provenance）
+- **SQLite** `data/app.sqlite`（启动时启 WAL + busy_timeout=5000，多用户并发写不再 `database is locked`）：interests / reply_samples / last_interaction / `proactive_fires`（含 `mode`/`platform` 列，2026-05-21 加）/ persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）。`storage._ensure_columns` 启动时自动 ALTER 兜底兼容旧 db
+- **记忆栈** via **Postgres + pgvector + pg_trgm**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（带 `entities TEXT[]` / `source_episode_id UUID` / `valid_to`）+ `episodes`（P0-4 raw turns provenance）+ `agent_ideas`（airi `come_up_ideas` pool，2026-05-25 加，含 `suggested_query` 给 share kind 用）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
-- **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.jsonl`（每条带 user_id）；`data/.webui_secret`（HMAC 共享密钥）
+- **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.YYYY-MM-DD.jsonl`（按日切，2026-05-25 起；admin UI 审计 tab 自动合并读所有 `audit.*.jsonl`；老 `audit.jsonl` 作历史保留；`daily_cleanup_job` 04:23 清 30 天前的）；`data/.webui_secret`（HMAC 共享密钥）；`data/wipe_backup_<uid>_<ts>/`（wipe_user 前 dump，保 7 天）
 - **静态资源**：`data/stickers/*`（文件名当 tag）；`data/eval/run_*.{jsonl,md}`（模型评测）
 
 ## Telegram 命令
@@ -191,3 +193,4 @@ aux LLM detect 路径（2026-05-21 删，主 LLM 自己 tool_use）。
 | `document/persona-evolution.md` | 人格演化：traits/mood/observations/milestones 设计 |
 | `document/eval-system.md` | 模型评测系统（OpenRouter 多模型横向 + LLM judge） |
 | `document/session-log.md` | 搭建流水 |
+| `me/airi-借鉴分析.md` | airi 项目调研：ticking loop / `come_up_ideas` 等架构借鉴评估 |

@@ -71,17 +71,23 @@ Telegram ──► bot.py (邀请码门 + 命令)
               ▼
          rhythm.deliver (拆短句 + typing 模拟) ──► Telegram
 
-scheduler (APScheduler 7 个 job)
+scheduler (APScheduler 8 个 job，全配 max_instances=1 + coalesce + misfire_grace 防重叠)
    ├ decay              每 1h 兴趣热度衰减
    ├ memu_flush         每 15m flush 短期 buffer→episode + 抽取 memory + 5.1 异步冲突检测 + feedback agent fire
    ├ persona_consolidate 每日 03:07 衰减自我观察
-   ├ auto_dream         每日 03:13 (1) 三态判定 (2) override 整理 (3) insight 生成 (4) skill 库整理
-   ├ proactive          每 25m 软概率门 + LLM decide → mode={topic_chat | share_discovery} → generate_opener
+   ├ auto_dream         每日 03:13 (1) 三态判定 (2) override 整理 (3) insight 生成（含 cosine 去重）
+   │                                  (4) agent_ideas form_ideas（airi 借鉴）(5) skill 库整理
+   ├ proactive          每 25m 软概率门 + LLM decide → 三路并行：
+   │                       (A) 消费 share kind idea + suggested_query → "想到 X → 顺手搜了下"双层叙事
+   │                       (B) 临时 share_intent → 现搜现挑（"刚翻到一条"）
+   │                       (C) 消费非 share kind idea → "想起来的事"叙事 / 续旧话题
    ├ triggered_reach    每 1m  扫 active trigger override (cron match → sonnet 判 condition → 暂存或直发)
-   └ pending_reach_overdue 每 1m  pending 超 5min 没融入 → 兜底直发
+   ├ pending_reach_overdue 每 1m  pending 超 5min 没融入 → 兜底直发
+   └ daily_cleanup      每日 04:23 清 audit.YYYY-MM-DD.jsonl 30 天 + wipe_backup 7 天
 
 云部署 (docker-compose)
-   bot + admin (:18081 webUI) + postgres (pgvector + pg_trgm) + mihomo (:9981 Clash 内核出美区) + cloudflared (HTTPS tunnel)
+   bot + admin (127.0.0.1:18081 仅 loopback) + postgres (pgvector + pg_trgm)
+   + mihomo (:9981 Clash 内核出美区) + cloudflared (HTTPS tunnel 暴露 admin UI)
 ```
 
 详见 `document/overview.md`。
@@ -150,13 +156,14 @@ docker compose logs -f bot
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users /proactive_test` |
 | `src/test_bot.py` | 可选第二 bot（`/become` 切虚拟身份） |
 | `src/agent.py` | 对话流水线 + `generate_opener` + `generate_welcome` + native tool_use 派发 |
-| `src/memory.py` / `memory_store.py` / `memory_prompts.py` | 自搭记忆栈三层防线（recall hot path / 5.1 写入冲突 / 5.2 反验证 / 5.3 Auto Dream / P1-6 insight） |
-| `src/proactive.py` | 主动搭话：软概率门 + LLM decide（topic_chat / share_discovery） + `_select_share_item` |
+| `src/memory.py` / `memory_store.py` / `memory_prompts.py` | 自搭记忆栈三层防线（recall hot path / 5.1 写入冲突 / 5.2 反验证 / 5.3 Auto Dream / P1-6 insight 含去重） |
+| `src/agent_ideas.py` | bot 凌晨"想做的事" pool（airi `come_up_ideas` 借鉴）；form_ideas / list_pending / mark_idea_used / expire_old_ideas |
+| `src/proactive.py` | 主动搭话：软概率门 + LLM decide → 三路并行（idea-driven share / 临时 share_intent / topic_chat） |
 | `src/triggered_reach.py` | active trigger 通道：cron match → 判 condition → 暂存或直发 |
 | `src/feedback_agent.py` / `feedback_prompts.py` | 偏好沉淀 sub-agent + skill 库（含 SCREEN/JUDGE 双层 + 硬护栏） |
 | `src/persona.py` | 人格演化（traits / mood / observations / milestones） |
 | `src/tools.py` | 5 工具 + URL 自动路由（小红书/B站/YouTube → 对应 CLI；其他 → Jina Reader） |
-| `src/prompts.py` / `prompt_loader.py` | system prompt 装配 + `prompt/*.md` 扁平加载（24 个 prompt） |
+| `src/prompts.py` / `prompt_loader.py` | system prompt 装配 + `prompt/*.md` 扁平加载（26 个 prompt） |
 | `src/storage.py` | SQLite 表 + 启动 ALTER 兜底（自动补新增 nullable 列） |
 | `src/admin_ui.py` | webUI :18081（4 tab：记忆 / 图谱 / 调教 / 审计） |
 | `src/scheduler.py` | APScheduler 7 个 job |

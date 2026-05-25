@@ -64,6 +64,27 @@ background 看 to_verify 改 status——互相可见但不竞争锁。
 | `started_at` / `ended_at` | TIMESTAMPTZ | 这次 flush 覆盖的对话起止 |
 | `created_at` | TIMESTAMPTZ | |
 
+`agent_ideas` 表（airi 借鉴，2026-05-25）：
+
+bot 凌晨自主形成的"想做的事" pool。proactive 决策时优先消费当 opener_angle，
+让 bot 显得"想起来一件事"而不是机械抽 recent_topics。
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `id` | SERIAL PK | |
+| `user_id` | BIGINT | |
+| `text` | TEXT | "想问她那个 PR 后来咋样了" |
+| `kind` | VARCHAR(32) | `question` / `share` / `follow_up` / `observation` |
+| `priority` | INTEGER 1-10 | LLM 自评；6+ 优先消费 |
+| `status` | VARCHAR(16) | `open` / `used` / `expired` |
+| `source_ids` | UUID[] | 引用了哪些 memories.id（admin 跳出处用）|
+| `suggested_query` | TEXT | **share kind 必带**——proactive 消费时当 search query |
+| `created_at` | TIMESTAMPTZ | |
+| `used_at` | TIMESTAMPTZ | mark_idea_used 时填 |
+| `expires_at` | TIMESTAMPTZ | 默认 created_at + 7 天；expire_old_ideas 标 expired |
+
+索引：`(user_id, status)` / `(user_id, priority)`。模块：`src/agent_ideas.py`。
+
 ## Background：写入流水
 
 ```
@@ -157,11 +178,54 @@ audit memory_recall 加 candidates_per_path（cosine/ngram/entity 各路命中�
    │   │
    │   ▼
    │   抽样最近 90 天 confirmed memory（profile 8 + event 12）
+   │   拉最近 30 天 existing insights 喂回 prompt（避免重写同 pattern）
    │   sonnet 写 0-3 条跨条目高阶观察 + supporting_ids
-   │   每条 INSERT 为 memory_type='insight', confidence=0.8, depends_on=supporting
-   │   audit memory_dream_insight
+   │   每条算 embedding，与现存 insight + 同 batch cosine 比；≥ 0.85 拦截（去重）
+   │   通过的 INSERT 为 memory_type='insight', confidence=0.8, depends_on=supporting
+   │   audit memory_dream_insight（含 dedup_rejected / duplicates 字段）
    │
-   └─► 4. auto_dream_skills()         ← skill 库整理（全局一次）
+   ├─► 4. agent_ideas.form_ideas(uid)  ← airi `come_up_ideas` 借鉴（2026-05-25）
+   │   │
+   │   ▼
+   │   抽样最近 30 天 profile + event；拉近 14 天现存 idea（open + used）作"已写过"清单
+   │   sonnet 自主形成 0-5 条"想问她 X / 想跟进 Y / 想分享 Z"
+   │   kind ∈ {question, share, follow_up, observation}；priority 1-10
+   │   share kind 必带 suggested_query（具体搜索关键词）；缺则降级 follow_up
+   │   写入前 cosine 去重（≥ 0.85 拦）；通过的 INSERT agent_ideas 表
+   │   expires_at = now + 7 天；7 天没 used 自动 expire（daily_cleanup 跑）
+   │   audit agent_ideas_form
+   │
+   └─► 5. auto_dream_skills()         ← skill 库整理（全局一次）
+```
+
+### agent_ideas 怎么被消费
+
+`proactive.decide` 调用 `list_pending(uid, top_n=3)` 拉优先级最高的 3 条 idea 塞进
+ctx，喂给软门 LLM。软门 LLM 输出 `consumed_idea_id`（可选）表示采纳哪条；校验 id
+必须在 pending 列表里防伪造。**采纳的处理走三路并行**：
+
+```
+LLM 输出 consumed_idea_id
+   │
+   ▼
+┌─────────────────────────────────────────────────────┐
+│ 路径 A：share kind idea + suggested_query 不空      │
+│   → 自动用 query 调 _select_share_item              │
+│   → mode=share_discovery + share_item 来自 idea     │
+│   → opener prompt 走"想到 X → 顺手搜了下"双层叙事    │
+├─────────────────────────────────────────────────────┤
+│ 路径 B：LLM 没消费 share idea 但临时输出 share_intent│
+│   → 现搜现挑（现状 share_discovery 路径，"刚翻到一条"）│
+├─────────────────────────────────────────────────────┤
+│ 路径 C：question/follow_up/observation kind         │
+│   → topic_chat + opener prompt 走"想起来的事"叙事   │
+└─────────────────────────────────────────────────────┘
+
+无论哪路，采纳后 mark_idea_used(id) → status='used'
+```
+
+设计意图：营造"有时看了某些帖子引发的思考，有时只是单纯想分享"的并存感觉，
+而不是 share 跟 idea 互不通气。
 ```
 
 ## 为什么三层

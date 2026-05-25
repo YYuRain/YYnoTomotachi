@@ -116,3 +116,33 @@ PRD v2 三层防线（5.1/5.2/5.3）的 status / confidence / depends_on / last_
 迁移：`scripts/migrate_to_multiuser.py` 把 "me" 单用户老库整体归到 `ADMIN_CHAT_ID`（SQLite 加列 + memU postgres `UPDATE WHERE user_id='me'`）。
 
 详细设计：`document/deployment.md`（部署 + 多用户测试流程），CLAUDE.md（env / 命令清单）。
+
+---
+
+## agent_ideas pool ✅（2026-05-25 接入，airi `come_up_ideas` 借鉴）
+
+让 bot 凌晨自主形成"想做的事"——不是反应式抽 recent_topics，是真的"想起来一件事"。
+完整设计参考 `me/airi-借鉴分析.md`、实现细节见 `document/memory-stack.md` 的 auto_dream 流水。
+
+落地三件事：
+
+- **新表** `agent_ideas`（postgres，与 memories 同库）：`id / user_id / text / kind /
+  priority / status / source_ids / suggested_query / created_at / used_at / expires_at`。
+  `kind ∈ {question, share, follow_up, observation}`；`status ∈ {open, used, expired}`。
+- **新模块** `src/agent_ideas.py`：`form_ideas(uid)` 让 sonnet 写 0-5 条 / `list_pending`
+  返 top-3 优先级 / `mark_idea_used(id)` 采纳后落 used / `expire_old_ideas()` 7 天兜底。
+  写入前 cosine 跟现存 + 同 batch 比对，`≥ 0.85` 拦截去重。
+- **scheduler 加段**：`auto_dream_job` 03:13 多跑一段 `form_ideas(uid)`；全局加一段 expire。
+
+**proactive 三路并行消费**：
+- 路径 A：消费 `share` kind idea + `suggested_query` → 自动调 `_select_share_item` 用 idea
+  query 现搜现挑；opener prompt 走"想到 X → 顺手搜了下"双层叙事
+- 路径 B：LLM 没消费 share idea 但临时输出 `share_intent` → 现搜现挑（"刚翻到一条"）
+- 路径 C：消费非 share kind idea → topic_chat + opener prompt 走"想起来的事"叙事
+
+营造"有时看了某些帖子引发的思考，有时只是单纯想分享"的并存感觉。
+
+**P1-6 insight 去重**（2026-05-25 修）：之前 auto_dream_insights 没把 existing insight 喂回
+LLM，4 天里同一 pattern 反复改写 7-10 条。现在 prompt 喂近 30 天现存 + 写入前 cosine
+（≥ 0.85）拦截。一次性历史清理脚本 `scripts/cleanup_duplicate_insights.py` 按聚类标
+`valid_to=now()` 而非 hard delete（保留可追溯）。

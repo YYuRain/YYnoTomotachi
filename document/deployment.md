@@ -10,7 +10,7 @@
 | service | 镜像 | 端口（host） | 作用 |
 |---------|------|------|------|
 | `bot` | 自构建 `aidemo-bot` | 无 | 主 bot + 可选 test bot；含 embed_server :18080（容器内） |
-| `admin` | 自构建 `aidemo-admin` | `0.0.0.0:18081` | webUI |
+| `admin` | 自构建 `aidemo-admin` | `127.0.0.1:18081`（仅 loopback，2026-05-25 起）| webUI；外部走 cloudflared HTTPS 或 SSH 隧道 |
 | `postgres` | `pgvector/pgvector:pg16` | 无（compose 内网） | 自搭记忆栈 `memories` 表持久化（容器名 `memu-postgres` 沿用旧名） |
 | `mihomo` | `metacubex/mihomo:latest` | 无 | Clash 内核——HK 出口 IP 被 Anthropic 限制时给 OpenRouter 走美区代理 |
 | `cloudflared` | `cloudflare/cloudflared:latest` | 无 | 把 admin :18081 反向代理出 `https://*.trycloudflare.com`（HTTPS + 不开公网端口）|
@@ -53,6 +53,7 @@ MEMU_DB_URL=postgresql+psycopg://postgres:postgres@postgres:5432/memu
 MEMU_CHAT_MODEL=deepseek/deepseek-v4-flash
 ADMIN_UI_USER=<env 凭证用户名，备用，登录主路径已不用密码>
 ADMIN_UI_PASSWORD=<env 凭证密码>
+# ADMIN_UI_DEV_NO_AUTH=1   # 仅本地 dev！容器/生产**绝不**设这个，否则裸奔到公网
 TEST_BOT_TOKEN=                          # 可选，第二个 bot 用于多用户模拟
 ```
 
