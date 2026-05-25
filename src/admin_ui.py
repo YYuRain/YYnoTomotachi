@@ -27,6 +27,25 @@ from . import embed_client, storage
 from .config import settings
 
 
+def _audit_files() -> list[Path]:
+    """返回 audit.* 文件列表，按 mtime 倒序（最新在前）。
+
+    2026-05-25 起 audit 按日切：audit.YYYY-MM-DD.jsonl。
+    兼容老的 audit.jsonl（切日前的历史）。读侧合并，新→旧。
+    """
+    base = settings().root / "data"
+    if not base.exists():
+        return []
+    files: list[Path] = []
+    # 切日后的文件
+    files.extend(base.glob("audit.*.jsonl"))
+    # 老的单文件——存在就并入
+    legacy = base / "audit.jsonl"
+    if legacy.exists() and legacy not in files:
+        files.append(legacy)
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 # Cookie session：登录走 Telegram /memory 返回的 token URL。
 # 没有密码逻辑——bot 进程铸 token 是完全的"凭票入场"。
 # token 用 HMAC 签名，密钥在 src/users.py 中由 bot/admin 共享（disk file `data/.webui_secret`）。
@@ -1335,13 +1354,13 @@ def build_app() -> FastAPI:
                     {"u": uid},
                 ).scalar() or 0)
         # audit 计数：按 user_id 过滤的行
+        # 2026-05-25 起 audit 按日切——audit.YYYY-MM-DD.jsonl；兼容老文件 audit.jsonl
         audit_count = 0
-        path = settings().root / "data" / "audit.jsonl"
-        if path.exists():
+        for path in _audit_files():
             try:
                 if uid is None:
                     with path.open("rb") as f:
-                        audit_count = sum(1 for _ in f)
+                        audit_count += sum(1 for _ in f)
                 else:
                     uid_str = str(uid)
                     with path.open("r", encoding="utf-8") as f:
@@ -1367,30 +1386,36 @@ def build_app() -> FastAPI:
         event: str = Query("", max_length=64),
     ) -> list[dict[str, Any]]:
         uid = _resolve_uid(viewer, user_id)
-        path = settings().root / "data" / "audit.jsonl"
-        if not path.exists():
-            return []
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception as e:
-            log.warning("audit read err: %s", e)
+        # 2026-05-25 起按日切：从最新文件向旧读，攒够 limit 行就停（避免读 30 天全量）
+        files = _audit_files()
+        if not files:
             return []
         uid_str = str(uid) if uid is not None else None
         out: list[dict[str, Any]] = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        for path in files:
             try:
-                d = json.loads(line)
-            except Exception:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception as e:
+                log.warning("audit read %s err: %s", path.name, e)
                 continue
-            if event and d.get("event") != event:
-                continue
-            if uid_str is not None and str(d.get("user_id", "")) != uid_str:
-                continue
-            out.append(d)
-        out.reverse()
+            file_out: list[dict[str, Any]] = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if event and d.get("event") != event:
+                    continue
+                if uid_str is not None and str(d.get("user_id", "")) != uid_str:
+                    continue
+                file_out.append(d)
+            file_out.reverse()  # 单文件内：新→旧
+            out.extend(file_out)
+            if len(out) >= limit:
+                break
         return out[:limit]
 
     @app.get("/api/items")
