@@ -327,6 +327,21 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
 
     share_quota_remaining = _share_quota_remaining(user_id)
 
+    # airi `come_up_ideas` 借鉴：拉这位用户 dream 阶段自主形成的 top-3 pending idea
+    # 让 LLM 看到"她凌晨想到过这些事"，自由决定要不要采纳一条作为 opener 角度
+    pending_ideas: list[dict] = []
+    try:
+        from . import agent_ideas
+        for it in agent_ideas.list_pending(user_id, top_n=3):
+            pending_ideas.append({
+                "id": it["id"],
+                "text": it["text"][:200],
+                "kind": it["kind"],
+                "priority": it["priority"],
+            })
+    except Exception as e:
+        log.debug("proactive load pending ideas err uid=%s: %s", user_id, e)
+
     # 把最近 3 条自己发过的 proactive opener 摘出来——让软门 LLM 看到"我反复戳过这些"
     # 单独抽是因为 recent_history 是混杂的对话流，LLM 不容易辨认"哪些是我主动发的没回应的"
     recent_assistant_openers: list[str] = []
@@ -353,6 +368,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "share_quota_remaining": share_quota_remaining,
         "consecutive_asst_no_reply": consecutive_asst,
         "recent_assistant_openers": recent_assistant_openers,
+        "pending_ideas": pending_ideas,
     }
     user_msg = json.dumps(ctx, ensure_ascii=False, indent=2)
 
@@ -385,7 +401,24 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "recent_topics": top,
         "mode": "topic_chat",
         "share_item": None,
+        "consumed_idea_id": None,
     }
+
+    # idea 消费：LLM 输出 consumed_idea_id 表明它采纳了某条 pending idea
+    # 校验：必须在 pending_ideas 列表里（防 LLM 编造 id）
+    consumed = data.get("consumed_idea_id")
+    if consumed is not None:
+        try:
+            consumed_id = int(consumed)
+            valid_ids = {it["id"] for it in pending_ideas}
+            if consumed_id in valid_ids:
+                decision["consumed_idea_id"] = consumed_id
+                # mark used 放到决策末尾——下面 share_discovery 失败降级时不会丢这步
+            else:
+                log.info("proactive uid=%d: consumed_idea_id=%s 不在 pending 里，忽略",
+                         user_id, consumed)
+        except (TypeError, ValueError):
+            pass
 
     # Share-discovery 分支：LLM 输出了 share_intent 且配额够 → 调 search + LLM 挑
     share_intent = data.get("share_intent") if isinstance(data, dict) else None
@@ -401,10 +434,19 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
                 decision["share_item"] = item
             # 选不出来就 silent 降级到 topic_chat（_select_share_item 内部已 audit）
 
+    # 真采纳了 idea → mark used（无论 mode 是 topic_chat 还是 share_discovery）
+    if decision["consumed_idea_id"] is not None:
+        try:
+            from . import agent_ideas
+            agent_ideas.mark_idea_used(decision["consumed_idea_id"])
+        except Exception as e:
+            log.debug("mark_idea_used err: %s", e)
+
     log.info(
-        "proactive GO uid=%d: why=%r doing=%r angle=%r mode=%s",
+        "proactive GO uid=%d: why=%r doing=%r angle=%r mode=%s idea=%s",
         user_id, decision["why"], decision["user_probably_doing"],
         decision["opener_angle"], decision["mode"],
+        decision["consumed_idea_id"],
     )
     audit("proactive_decision", user_id=user_id, should=True, ctx=ctx, **decision)
     return decision

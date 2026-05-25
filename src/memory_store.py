@@ -77,6 +77,36 @@ class Memory(Base):
     )
 
 
+class AgentIdea(Base):
+    """bot 在 dream 阶段自主形成的"想做的事"——proactive 决策时消费当 opener_angle。
+
+    设计（2026-05-25 借鉴 airi `come_up_ideas`）：
+    - 03:13 auto_dream 时 sonnet 拿最近事实自主写 N 条（"想问她那个 PR 跟进咋样了" /
+      "想分享那个跟她口味一致的小红书帖" 等）
+    - kind ∈ {question, share, follow_up, observation}——给 proactive 选 angle 时分类
+    - priority 1-10（LLM 自评 + 衰减）
+    - status ∈ {open, used, expired}：proactive 消费后 mark used；7 天没用自动 expire
+    - source_ids：引用了哪些 memories.id，让 admin UI 能跳到出处
+    """
+    __tablename__ = "agent_ideas"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    kind = Column(String(32), nullable=False, default="follow_up")
+    priority = Column(Integer, nullable=False, default=5)
+    status = Column(String(16), nullable=False, default="open")
+    source_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_agent_ideas_user_status", "user_id", "status"),
+        Index("ix_agent_ideas_user_priority", "user_id", "priority"),
+    )
+
+
 class Episode(Base):
     """一次 flush 的原始对话片段——抽出来的 memory 都 trace 回这里。
 

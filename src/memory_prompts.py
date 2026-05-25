@@ -100,6 +100,34 @@ def render_insight_dream(items: list[dict], existing: list[dict] | None = None) 
     )
 
 
+def render_form_ideas_dream(items: list[dict], existing: list[dict] | None = None) -> str:
+    """items: 同 insight 抽样（profile + event 混合），但用更长窗（30 天足矣，过老的事
+    形成的"想问"已经过期）。
+    existing: 已存在的 open ideas（避免重复）。
+    """
+    lines = []
+    for it in items:
+        ts = it["created_at"].strftime("%Y-%m-%d") if it.get("created_at") else "?"
+        short_id = it["id"][:8] if it.get("id") else "????????"
+        lines.append(f"- id={short_id} [{it['memory_type']}] ({ts}) {it['summary']}")
+    block = "\n".join(lines) if lines else "（空）"
+
+    if existing:
+        ex_lines = []
+        for ex in existing:
+            ts = ex["created_at"].strftime("%Y-%m-%d") if ex.get("created_at") else "?"
+            ex_lines.append(f"- ({ts}) [{ex.get('kind','?')}] {ex['text']}")
+        existing_block = "\n".join(ex_lines)
+    else:
+        existing_block = "（暂无）"
+
+    return (
+        prompt_loader.load("memory_form_ideas_dream")
+        .replace("{items_block}", block)
+        .replace("{existing_ideas_block}", existing_block)
+    )
+
+
 def render_override_dream(overrides: list) -> str:
     """overrides: list of PromptOverride ORM objects（拿 id / text / trigger_kind / created_at）。
     用 str.replace 而非 .format——prompt 里有大量字面花括号。"""

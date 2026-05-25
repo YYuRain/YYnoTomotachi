@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from . import bot as bot_mod
+from . import agent_ideas, bot as bot_mod
 from . import interests, memory, persona, proactive, test_bot, users
 from .agent import generate_opener
 from .rhythm import deliver
@@ -117,13 +117,17 @@ def build() -> AsyncIOScheduler:
         await _fan_out(_one)
 
     async def auto_dream_job() -> None:
-        """PRD v2 / 5.3 + P1-6：搭便车 persona_consolidate 那班车，03:13 跑批量整理。
+        """PRD v2 / 5.3 + P1-6 + airi-borrow：搭便车 03:13 班车，跑批量整理。
 
-        四段：
-        1. memories 三态判定（auto_dream，per-user）
-        2. prompt_overrides 冲突整理（auto_dream_overrides，per-user）
-        3. **insight 生成**（auto_dream_insights，per-user）—— P1-6
-        4. skill 库整理（auto_dream_skills，全局一次）
+        per-user 四段：
+        1. memories 三态判定（auto_dream）
+        2. prompt_overrides 冲突整理（auto_dream_overrides）
+        3. insight 生成（auto_dream_insights）—— P1-6
+        4. **agent_ideas 自主形成**（airi `come_up_ideas` 借鉴）—— bot 凌晨想心事
+
+        全局一段：
+        5. skill 库整理（auto_dream_skills）
+        6. agent_ideas 过期清理（expire_old_ideas）
         """
         async def _one(uid: int):
             try:
@@ -138,12 +142,21 @@ def build() -> AsyncIOScheduler:
                 await memory.auto_dream_insights(uid)
             except Exception as e:
                 log.warning("auto_dream_insights uid=%d err: %s", uid, e)
+            try:
+                await agent_ideas.form_ideas(uid)
+            except Exception as e:
+                log.warning("agent_ideas.form_ideas uid=%d err: %s", uid, e)
         await _fan_out(_one)
         # skill 库不分 user，跑一次即可
         try:
             await memory.auto_dream_skills()
         except Exception as e:
             log.warning("auto_dream_skills err: %s", e)
+        # 全局 idea 过期清理
+        try:
+            agent_ideas.expire_old_ideas()
+        except Exception as e:
+            log.warning("agent_ideas expire err: %s", e)
 
     async def triggered_reach_job() -> None:
         """主动触达 job：每分钟扫所有 active trigger override，cron match 当前时间则跑。
