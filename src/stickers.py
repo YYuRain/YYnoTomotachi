@@ -5,11 +5,14 @@
 - AI 在回复里写 `[sticker:无奈]` 内联标记，rhythm/agent 解析后调 send_sticker 发图。
 - 空库时 system prompt 不会提及 sticker 机制 → AI 也不会输出标记 → 零侵入。
 
-支持格式：jpg / jpeg / png / gif / webp。
-- jpg/png → send_photo
-- gif → send_animation
-- webp → send_sticker（telegram 静态贴图）
+支持格式：webp / webm / jpg / jpeg / png / gif。
+- webp → send_sticker（telegram 静态 sticker，至少一边 512px / ≤512KB）
+- webm → send_sticker（telegram 视频 sticker，VP9 / 至少一边 512px / ≤256KB / ≤3s）
+- gif → send_animation（fallback——历史动图，未转为 webm 的）
+- jpg/jpeg/png → send_photo（fallback——历史静态图，未转为 webp 的）
 - 其他扩展名忽略。
+
+转换工具：`scripts/convert_stickers.py` 把 jpg/png/gif → webp/webm。
 
 匹配策略：
 - 优先精确匹配（大小写不敏感）
@@ -27,7 +30,7 @@ from .config import settings
 log = logging.getLogger(__name__)
 
 _TAG_RE = re.compile(r"\[sticker:([^\]]+)\]")
-_SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+_SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".webm"}
 
 _index: dict[str, Path] | None = None
 

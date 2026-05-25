@@ -30,11 +30,15 @@ _app: Application | None = None
 
 
 def _make_send_sticker(bot, chat_id: int) -> Callable[[Path], Awaitable[None]]:
-    """根据文件扩展名挑合适的 telegram API：webp→sticker、gif→animation、其他→photo。"""
+    """根据文件扩展名挑合适的 telegram API：
+    - webp / webm → send_sticker（webm 是视频 sticker，VP9）
+    - gif → send_animation（fallback——还没转 webm 的历史动图）
+    - 其他 → send_photo（fallback——还没转 webp 的历史静态图）
+    """
     async def send_sticker(path: Path) -> None:
         suffix = path.suffix.lower()
         with open(path, "rb") as f:
-            if suffix == ".webp":
+            if suffix in (".webp", ".webm"):
                 await bot.send_sticker(chat_id=chat_id, sticker=f)
             elif suffix == ".gif":
                 await bot.send_animation(chat_id=chat_id, animation=f)
