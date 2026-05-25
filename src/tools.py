@@ -272,29 +272,111 @@ def _split_kw_fallback(keyword: str) -> str | None:
 
 
 async def search_xhs(keyword: str) -> str:
-    """搜索小红书，返回前 5 条笔记标题和互动数。
+    """搜索小红书，按"权威"+"时效"两条线返回结果。
 
-    用 xiaohongshu-cli (`xhs search KEYWORD --json`)；该 CLI 自带签名实现，cookie 由
-    CLI 自己管理（容器内 `/root/.xiaohongshu-cli/cookies.json`）。
+    用 xiaohongshu-cli (`xhs search KEYWORD --sort {popular,latest} --json`)：
+    - `--sort popular` 拿"热度高"组——置信度更稳的权威信源
+    - `--sort latest` 拿"刚发"组——时效性强的最新动态
+    - 并发跑两份，过滤掉"0赞0评 / 1赞0评"这种低质量噪声
+    - URL 去重后合并：popular 取前 3，latest 取前 2
 
     多关键词 0 结果时自动用最长单 token 重试（xhs 对多关键词是严格 AND，命中率低）。
     """
-    raw = await _run("xhs", "search", keyword, "--json")
-    parsed_lines = _parse_xhs_search(raw)
-    if not parsed_lines:
+    pop_items, lat_items = await _xhs_search_two_modes(keyword)
+    if not pop_items and not lat_items:
         # 多关键词 fallback：拆成单 token 重试一次
         fb = _split_kw_fallback(keyword)
         if fb:
             log.info("xhs search '%s' 0 结果，fallback 重试 '%s'", keyword, fb)
-            raw = await _run("xhs", "search", fb, "--json")
-            parsed_lines = _parse_xhs_search(raw)
-    if parsed_lines:
-        return "小红书搜索结果：\n" + "\n".join(parsed_lines)
-    return ""
+            pop_items, lat_items = await _xhs_search_two_modes(fb)
+
+    if not pop_items and not lat_items:
+        return ""
+
+    seen_urls: set[str] = set()
+    sections: list[str] = []
+    if pop_items:
+        lines = _format_xhs_items(pop_items[:3], seen_urls)
+        if lines:
+            sections.append("【热度高（权威讨论）】\n" + "\n".join(lines))
+    if lat_items:
+        lines = _format_xhs_items(lat_items[:2], seen_urls)
+        if lines:
+            sections.append("【近期发布（时效）】\n" + "\n".join(lines))
+    if not sections:
+        return ""
+    return "小红书搜索结果：\n\n" + "\n\n".join(sections)
 
 
-def _parse_xhs_search(raw: str) -> list[str]:
-    """xhs search --json 的输出 → bot 友好 list[str]。"""
+async def _xhs_search_two_modes(keyword: str) -> tuple[list[dict], list[dict]]:
+    """并发跑 popular + latest 两次，各自解析 + 过滤低质量。"""
+    pop_raw, lat_raw = await asyncio.gather(
+        _run("xhs", "search", keyword, "--sort", "popular", "--json"),
+        _run("xhs", "search", keyword, "--sort", "latest", "--json"),
+        return_exceptions=False,
+    )
+    pop_items = _parse_xhs_search_items(pop_raw)
+    lat_items = _parse_xhs_search_items(lat_raw)
+
+    # popular 阈值：likes >= 5（明显 traction）；过滤 0赞0评
+    pop_items = [it for it in pop_items if _xhs_passes_filter(it, mode="popular")]
+    # latest 阈值：likes + comments >= 2，且至少有 1 个 interaction（防 0 赞 0 评）
+    lat_items = [it for it in lat_items if _xhs_passes_filter(it, mode="latest")]
+
+    return pop_items, lat_items
+
+
+def _parse_count_str(s: str | int | None) -> int:
+    """xhs 数据里 likes/comments 是字符串，可能是 '12' / '1.2万' / '3千'。统一转 int。"""
+    if s is None or s == "":
+        return 0
+    if isinstance(s, int):
+        return max(0, s)
+    s = str(s).strip()
+    try:
+        if "万" in s:
+            return int(float(s.replace("万", "")) * 10000)
+        if "千" in s:
+            return int(float(s.replace("千", "")) * 1000)
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _xhs_passes_filter(item: dict, *, mode: str) -> bool:
+    likes = _parse_count_str(item.get("likes"))
+    comments = _parse_count_str(item.get("comments"))
+    if mode == "popular":
+        # 权威组：要求一定热度——> 5 赞或有评论
+        return likes >= 5 or comments >= 1
+    # latest：刚发可能赞数还没积累，但完全 0 赞 0 评的明显是无人问津
+    return likes + comments >= 2
+
+
+def _format_xhs_items(items: list[dict], seen_urls: set[str]) -> list[str]:
+    out: list[str] = []
+    for it in items:
+        url = it.get("url") or ""
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = it.get("title") or ""
+        likes = it.get("likes") or "0"
+        comments = it.get("comments") or "0"
+        cover_url = it.get("cover_url") or ""
+        # 把 likes / comments 都展示——主 LLM 看得到置信度信号
+        meta = f"{likes}赞"
+        if _parse_count_str(comments) > 0:
+            meta += f" {comments}评"
+        line = f"「{title}」（{meta}）\n  链接：{url}"
+        if cover_url:
+            line += f"\n  封面图：{cover_url}"
+        out.append(line)
+    return out
+
+
+def _parse_xhs_search_items(raw: str) -> list[dict]:
+    """xhs search --json → 结构化 list[dict]，每条 {title, url, likes, comments, cover_url}。"""
     if not raw:
         return []
     try:
@@ -308,14 +390,15 @@ def _parse_xhs_search(raw: str) -> list[str]:
         log.info("xhs search 失败：%s", err_msg[:120])
         return []
     items = (data.get("data") or {}).get("items") or []
-    lines: list[str] = []
-    for item in items[:5]:
+    out: list[dict] = []
+    for item in items[:8]:
         if not isinstance(item, dict):
             continue
         card = item.get("note_card") or {}
         title = card.get("display_title") or card.get("title") or ""
         info = card.get("interact_info") or {}
         likes = info.get("liked_count") or "0"
+        comments = info.get("comment_count") or "0"
         note_id = item.get("id") or ""
         xsec = item.get("xsec_token") or ""
         if note_id:
@@ -334,13 +417,14 @@ def _parse_xhs_search(raw: str) -> list[str]:
             if img_list and isinstance(img_list[0], dict):
                 cover_url = img_list[0].get("url_default") or img_list[0].get("url") or ""
         if title:
-            line = f"「{title}」（{likes}赞）"
-            if url:
-                line += f"\n  链接：{url}"
-            if cover_url:
-                line += f"\n  封面图：{cover_url}"
-            lines.append(line)
-    return lines
+            out.append({
+                "title": title,
+                "url": url,
+                "likes": likes,
+                "comments": comments,
+                "cover_url": cover_url,
+            })
+    return out
 
 
 async def search_web(query: str) -> str:
