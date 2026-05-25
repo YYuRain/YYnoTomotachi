@@ -70,8 +70,9 @@ def render_skill_dream(skills: list) -> str:
     return prompt_loader.load("memory_skill_dream").replace("{skills_block}", block)
 
 
-def render_insight_dream(items: list[dict]) -> str:
+def render_insight_dream(items: list[dict], existing: list[dict] | None = None) -> str:
     """items: list of {id, memory_type, summary, created_at}（已剪枝采样）。
+    existing: list of {summary, created_at} of 已存在的 insight，用于硬性反重复。
 
     P1-6（Generative Agents reflection 借鉴）：插入 prompt 让 LLM 写 1-3 条跨条目 insight。
     """
@@ -81,7 +82,22 @@ def render_insight_dream(items: list[dict]) -> str:
         short_id = it["id"][:8] if it.get("id") else "????????"
         lines.append(f"- id={short_id} [{it['memory_type']}] ({ts}) {it['summary']}")
     block = "\n".join(lines) if lines else "（空）"
-    return prompt_loader.load("memory_insight_dream").replace("{items_block}", block)
+
+    # existing insights：用 - prefix 加日期，让 LLM 看到时间分布也好辨识"哪些已经写过 N 次"
+    if existing:
+        ex_lines = []
+        for ex in existing:
+            ts = ex["created_at"].strftime("%Y-%m-%d") if ex.get("created_at") else "?"
+            ex_lines.append(f"- ({ts}) {ex['summary']}")
+        existing_block = "\n".join(ex_lines)
+    else:
+        existing_block = "（暂无——这是第一次写 insight）"
+
+    return (
+        prompt_loader.load("memory_insight_dream")
+        .replace("{items_block}", block)
+        .replace("{existing_insights_block}", existing_block)
+    )
 
 
 def render_override_dream(overrides: list) -> str:

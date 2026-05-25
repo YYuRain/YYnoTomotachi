@@ -1165,6 +1165,13 @@ INSIGHT_DEFAULT_CONFIDENCE = 0.8  # insight 默认 confidence——比原始 pro
                                   # 三因子 ranker 的 imp 分量也会稍低，避免 insight 压制底层事实
 INSIGHT_MAX_PER_RUN = 3       # 每次 dream 最多生成 N 条（prompt 也会要求）
 
+# 去重：新 insight 与"现存 insight"做 cosine 相似度——超阈值就丢
+# 0.85 是基于 bge-small-zh：实测 "用户晚饭凑合模式" 系列措辞改写互相 sim ≈ 0.92-0.95，
+# 跨 pattern 的 sim ≈ 0.55-0.70。0.85 能拦掉重写、不会误伤合法新 insight
+INSIGHT_DEDUP_COSINE_THRESHOLD = 0.85
+INSIGHT_DEDUP_LOOKBACK_DAYS = 30   # 跟最近 N 天的 insight 做对比——更老的认为已淘汰
+INSIGHT_EXISTING_LIMIT = 30        # 喂给 prompt 的 existing 上限
+
 
 async def auto_dream_insights(user_id: int) -> dict[str, Any]:
     """对该用户最近事实做跨条目反思，生成 0-3 条 memory_type='insight'。
@@ -1210,7 +1217,27 @@ async def auto_dream_insights(user_id: int) -> dict[str, Any]:
         log.info("auto_dream_insights uid=%s: 只有 %d 条样本，跳过", user_id, len(items))
         return {"generated": 0, "samples": len(items), "skipped": "too_few_samples"}
 
-    prompt = memory_prompts.render_insight_dream(items)
+    # 拉最近 INSIGHT_DEDUP_LOOKBACK_DAYS 天的 existing insight——既喂给 prompt 让 LLM
+    # 知道写过啥，又作为下面 cosine 去重的对比基线
+    with eng.connect() as conn:
+        existing_rows = conn.execute(
+            sql_text(
+                "SELECT id::text, summary, created_at, embedding "
+                "FROM memories "
+                "WHERE user_id = :uid AND memory_type = 'insight' "
+                "AND status = 'confirmed' "
+                "AND (valid_to IS NULL OR valid_to > now()) "
+                "AND created_at > now() - (:days || ' days')::interval "
+                "ORDER BY created_at DESC LIMIT :lim"
+            ),
+            {"uid": user_id, "days": INSIGHT_DEDUP_LOOKBACK_DAYS,
+             "lim": INSIGHT_EXISTING_LIMIT},
+        ).fetchall()
+    existing_for_prompt = [
+        {"summary": r[1], "created_at": r[2]} for r in existing_rows
+    ]
+
+    prompt = memory_prompts.render_insight_dream(items, existing=existing_for_prompt)
     try:
         data = await asyncio.wait_for(
             llm.chat_json(
@@ -1263,13 +1290,90 @@ async def auto_dream_insights(user_id: int) -> dict[str, Any]:
               latency_ms=elapsed_ms)
         return {"generated": 0, "samples": len(items), "raw_count": len(insights_raw)}
 
-    # embedding + INSERT
+    # embedding + 去重 + INSERT
     summaries = [v["summary"] for v in valid_insights]
     vecs = await embed_client.embed_many(summaries)
     now = datetime.now(timezone.utc)
 
+    # 解析 existing insight 的 embedding（postgres pgvector 返字符串 "[0.1,0.2,...]"）
+    # 没 embedding（极少数旧条目）就 skip——只能靠 prompt 拦它了
+    import re as _re
+    existing_vecs: list[tuple[str, list[float]]] = []  # [(summary, vec), ...]
+    for r in existing_rows:
+        emb_str = r[3]
+        if emb_str is None:
+            continue
+        try:
+            if isinstance(emb_str, str):
+                # "[0.1,0.2,...]" → list[float]
+                nums = _re.findall(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?", emb_str)
+                ev = [float(x) for x in nums]
+            else:
+                ev = list(emb_str)
+            if ev:
+                existing_vecs.append((r[1], ev))
+        except Exception:
+            continue
+
+    def _cosine(a: list[float], b: list[float]) -> float:
+        import math
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a)) or 1.0
+        nb = math.sqrt(sum(y * y for y in b)) or 1.0
+        return dot / (na * nb)
+
+    accepted: list[tuple[dict, list[float] | None]] = []
+    duplicates: list[dict] = []
+    for v, vec in zip(valid_insights, vecs):
+        if vec and existing_vecs:
+            best_sim = 0.0
+            best_match = ""
+            for ex_sum, ex_vec in existing_vecs:
+                sim = _cosine(vec, ex_vec)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_match = ex_sum
+            if best_sim >= INSIGHT_DEDUP_COSINE_THRESHOLD:
+                duplicates.append({
+                    "rejected_summary": v["summary"][:120],
+                    "matched_existing": best_match[:120],
+                    "cosine": round(best_sim, 3),
+                })
+                continue
+        # 同 batch 内也对比——同 turn LLM 输出两条相似的也只留一条
+        is_dup_in_batch = False
+        for accepted_v, accepted_vec in accepted:
+            if vec and accepted_vec and _cosine(vec, accepted_vec) >= INSIGHT_DEDUP_COSINE_THRESHOLD:
+                duplicates.append({
+                    "rejected_summary": v["summary"][:120],
+                    "matched_existing": accepted_v["summary"][:120],
+                    "cosine": round(_cosine(vec, accepted_vec), 3),
+                    "intra_batch": True,
+                })
+                is_dup_in_batch = True
+                break
+        if is_dup_in_batch:
+            continue
+        accepted.append((v, vec))
+
+    if duplicates:
+        log.info("auto_dream_insights uid=%s: 拦下 %d 条重复 insight (cosine ≥ %.2f)",
+                 user_id, len(duplicates), INSIGHT_DEDUP_COSINE_THRESHOLD)
+
+    if not accepted:
+        elapsed_ms = int((time.time() - started) * 1000)
+        log.info("auto_dream_insights uid=%s: 全部 %d 条都跟现存重复，0 条入库",
+                 user_id, len(valid_insights))
+        audit("memory_dream_insight", user_id=user_id, generated=0,
+              samples=len(items), raw_count=len(insights_raw),
+              dedup_rejected=len(duplicates), duplicates=duplicates,
+              latency_ms=elapsed_ms)
+        return {"generated": 0, "samples": len(items), "dedup_rejected": len(duplicates)}
+
     with eng.begin() as conn:
-        for v, vec in zip(valid_insights, vecs):
+        for v, vec in accepted:
             new_id = str(_uuid.uuid4())
             params = {
                 "id": new_id,
@@ -1304,15 +1408,17 @@ async def auto_dream_insights(user_id: int) -> dict[str, Any]:
                 )
 
     elapsed_ms = int((time.time() - started) * 1000)
-    log.info("auto_dream_insights uid=%s 生成 %d 条 insight (samples=%d, latency=%dms)",
-             user_id, len(valid_insights), len(items), elapsed_ms)
+    log.info("auto_dream_insights uid=%s 生成 %d 条 insight (samples=%d, dedup=%d, latency=%dms)",
+             user_id, len(accepted), len(items), len(duplicates), elapsed_ms)
     audit("memory_dream_insight", user_id=user_id,
-          generated=len(valid_insights), samples=len(items),
+          generated=len(accepted), samples=len(items),
+          dedup_rejected=len(duplicates), duplicates=duplicates,
           insights=[{"summary": v["summary"][:120],
                      "supporting": [s[:8] for s in v["supporting_ids"]]}
-                    for v in valid_insights],
+                    for v, _ in accepted],
           latency_ms=elapsed_ms)
-    return {"generated": len(valid_insights), "samples": len(items),
+    return {"generated": len(accepted), "samples": len(items),
+            "dedup_rejected": len(duplicates),
             "latency_ms": elapsed_ms}
 
 
