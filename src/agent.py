@@ -35,6 +35,28 @@ _SHORT_WINDOW = 12
 _recent_per_user: dict[str, list[dict[str, str]]] = {}
 _recent_loaded = False
 
+# fire-and-forget 任务集——asyncio 的 event loop 只持 weak ref 到 task，
+# 不存引用就可能在 await 完成前被 GC（Python 文档明确警告）。
+# 用 module-level set 持引用，done callback 自清理。
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """fire-and-forget asyncio task；持引用避免 GC + 异常 log。"""
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+
+    def _on_done(task: asyncio.Task) -> None:
+        _BG_TASKS.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning("bg task failed: %r", exc)
+
+    t.add_done_callback(_on_done)
+    return t
+
 # 最近 N 分钟内每个用户的工具调用流水——给主 LLM 看"我刚搜过啥"避免反复搜同内容。
 # 之前 _recent_per_user 只存 user/assistant text，不带 tool_call 元数据；导致跨 turn
 # bot 不知道上轮搜过同 keyword 又重新搜（2026-05-24 测试用户实测翻车）。
@@ -482,7 +504,7 @@ async def handle_user_message(
             except Exception as e:
                 log.exception("send_sticker failed: %s", e)
 
-    asyncio.create_task(_post_turn(user_id, history_user_text, reply))
+    _spawn_bg(_post_turn(user_id, history_user_text, reply))
 
 
 async def _post_turn(user_id: int, user_text: str, reply: str) -> None:

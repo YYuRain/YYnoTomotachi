@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import (
     BigInteger, Column, DateTime, Float, Index, Integer, PrimaryKeyConstraint,
-    String, Text, create_engine,
+    String, Text, create_engine, event,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -165,7 +165,24 @@ _Session = None
 def engine():
     global _engine
     if _engine is None:
-        _engine = create_engine(f"sqlite:///{settings().app_db_path}", future=True)
+        # WAL + busy_timeout：多用户并发写不再 "database is locked"
+        # check_same_thread=False 让 SQLAlchemy pool 跨线程复用 connection（asyncio 多 task 安全）
+        _engine = create_engine(
+            f"sqlite:///{settings().app_db_path}",
+            future=True,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _):
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA busy_timeout=5000")
+                cur.execute("PRAGMA synchronous=NORMAL")  # WAL 下 NORMAL 即足够安全且快
+            finally:
+                cur.close()
+
         Base.metadata.create_all(_engine)
         _ensure_columns(_engine)
         _seed_skill_creator(_engine)

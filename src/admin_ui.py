@@ -44,10 +44,9 @@ def _get_viewer(request: Request) -> int | None:
 
     cookie 不在或失效 → 401。前端 fetch 收到 401 跳 /login（提示去 Telegram 拿链接）。
     """
-    # dev 模式：admin env 都没设 + admin_chat_id 是默认值时，不鉴权
-    admin_user = os.environ.get("ADMIN_UI_USER", "")
-    admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
-    if not admin_user and not admin_pwd:
+    # dev 兜底：必须显式设 ADMIN_UI_DEV_NO_AUTH=1 才放行（之前是"env 没设就免鉴权"，
+    # 生产忘配 ADMIN_UI_USER 会裸奔到公网）。生产 docker-compose 不要设这个。
+    if os.environ.get("ADMIN_UI_DEV_NO_AUTH") == "1":
         return None
     p = _session_from_request(request)
     if p is None:
@@ -1256,9 +1255,8 @@ def build_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
-        admin_user = os.environ.get("ADMIN_UI_USER", "")
-        admin_pwd = os.environ.get("ADMIN_UI_PASSWORD", "")
-        if admin_user or admin_pwd:
+        # 与 _get_viewer 鉴权策略对齐：除非 ADMIN_UI_DEV_NO_AUTH=1，否则必须有 session
+        if os.environ.get("ADMIN_UI_DEV_NO_AUTH") != "1":
             if _session_from_request(request) is None:
                 return RedirectResponse("/login", status_code=302)
         return HTMLResponse(_INDEX_HTML)

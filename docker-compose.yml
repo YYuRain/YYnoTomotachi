@@ -68,9 +68,10 @@ services:
       - ./data:/app/data
     command: ["python", "-m", "scripts.admin"]
     ports:
-      # 公开监听；admin UI 走 HTTP Basic Auth（ADMIN_UI_USER / ADMIN_UI_PASSWORD）
-      # 内网用建议改回 "127.0.0.1:18081:18081" 走 SSH 隧道
-      - "0.0.0.0:18081:18081"
+      # 仅绑 loopback——cloudflared 同 compose 内网走 admin:18081 不受影响。
+      # 之前 0.0.0.0 公开监听 + dev 默认免鉴权兜底 = 生产忘配密码会裸奔。
+      # 真要从外部直连，走 SSH 隧道：ssh -L 18081:127.0.0.1:18081 hk
+      - "127.0.0.1:18081:18081"
 
   cloudflared:
     # 给 admin UI 一个临时的 https://<random>.trycloudflare.com URL（HTTPS、零配置、不开端口）。

@@ -8,9 +8,50 @@ LLM 不知道"现在"是几点。直接喂 ISO 时间会让回复带播报腔（
 """
 from __future__ import annotations
 
-from datetime import datetime
+import os
+from datetime import datetime, timedelta, timezone
 
 _WEEKDAY_ZH = "一二三四五六日"
+
+# TZ helper：HK 容器 TZ=Asia/Shanghai (UTC+8)。
+# 所有数据库时间戳应以 UTC 写入；面向用户的"今日"边界 / 显示需 local。
+# 通过 APP_TZ_OFFSET_HOURS env 覆盖（默认 8 = CST）；不依赖系统 TZ。
+_TZ_OFFSET_HOURS = int(os.environ.get("APP_TZ_OFFSET_HOURS", "8"))
+
+
+def app_tz() -> timezone:
+    return timezone(timedelta(hours=_TZ_OFFSET_HOURS))
+
+
+def utcnow() -> datetime:
+    """naive UTC datetime（兼容现有 SQLAlchemy 表的 naive datetime 列）。"""
+    return datetime.utcnow()
+
+
+def now_local() -> datetime:
+    """naive local datetime（按 APP_TZ_OFFSET_HOURS 计算）。"""
+    return datetime.utcnow() + timedelta(hours=_TZ_OFFSET_HOURS)
+
+
+def today_bounds_utc() -> tuple[datetime, datetime]:
+    """以本地 TZ 计算"今日"零点边界，返回对应 UTC naive datetime。
+
+    用法：查 ProactiveFire.ts (UTC 存) 当日记录 → 以 user 视角的"今天"为准
+    （HK 容器 + 中国用户："今天"是 CST 的 0-24 点）。
+    """
+    local = now_local()
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local - timedelta(hours=_TZ_OFFSET_HOURS),
+        end_local - timedelta(hours=_TZ_OFFSET_HOURS),
+    )
+
+
+def utc_to_local(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt + timedelta(hours=_TZ_OFFSET_HOURS)
 
 
 def _hour_phase(h: int) -> str:
@@ -36,8 +77,10 @@ def now_signal(dt: datetime | None = None) -> str:
 
     设计说明：日期、weekday、工作日/周末、时段四件信息**分开**摆，
     避免被模型打包成一个 chunk 误读（实测 MiniMax-M2.7 会把
-    "周五（工作日午饭点）"里的"周五"弱化成"周末午饭点"语境）。"""
-    dt = dt or datetime.now()
+    "周五（工作日午饭点）"里的"周五"弱化成"周末午饭点"语境）。
+
+    入参 dt 默认是本地时间（按 APP_TZ_OFFSET_HOURS）；不依赖系统 TZ。"""
+    dt = dt or now_local()
     weekday_zh = "周" + _WEEKDAY_ZH[dt.weekday()]
     daytype = "周末" if dt.weekday() >= 5 else "工作日"
     return f"{dt.strftime('%Y-%m-%d')} {weekday_zh}（{daytype}） {dt.strftime('%H:%M')} {_hour_phase(dt.hour)}"

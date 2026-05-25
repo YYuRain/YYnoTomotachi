@@ -32,15 +32,15 @@ from .config import settings
 
 log = logging.getLogger(__name__)
 
-_path: Path | None = None
+def _get_path_for_today() -> Path:
+    """按日切割：data/audit.YYYY-MM-DD.jsonl。
 
-
-def _get_path() -> Path:
-    global _path
-    if _path is None:
-        _path = settings().root / "data" / "audit.jsonl"
-        _path.parent.mkdir(parents=True, exist_ok=True)
-    return _path
+    保留 audit.jsonl 软链/兼容名（如有）但新写入按天滚——避免单文件 GB 级 / admin tail 越来越慢。
+    清理：scheduler 的 daily cleanup job 会删 7 天前的旧 audit。
+    """
+    base = settings().root / "data"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"audit.{datetime.now().strftime('%Y-%m-%d')}.jsonl"
 
 
 def audit(event: str, **fields: Any) -> None:
@@ -51,7 +51,7 @@ def audit(event: str, **fields: Any) -> None:
             "event": event,
         }
         record.update(fields)
-        with _get_path().open("a", encoding="utf-8") as f:
+        with _get_path_for_today().open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception as e:
         log.debug("audit write err: %s", e)

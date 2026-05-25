@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from sqlalchemy import func, select
 
-from . import availability, interests, llm, tools
+from . import availability, clock, interests, llm, tools
 from .audit_log import audit
 from .storage import ProactiveFire, session
 
@@ -58,13 +58,12 @@ def _decide_system() -> str:
 
 
 def _today_range_utc() -> tuple[datetime, datetime]:
-    # 按本地时间算"今天"，但 ProactiveFire.ts 存的是 utcnow；用 local 转 UTC 的粗略近似：
-    # 直接按 local 的今日起止，SQLite 存的时间戳比较能对得上（我们历史上都用 utcnow 存 ts，
-    # 差一个时区，但作为"粗略当日"够用）。
-    now_local = datetime.now()
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    return start_local, end_local
+    """以 user local TZ 计算"今日"边界，返回 UTC naive datetime。
+
+    所有 ProactiveFire.ts 现统一以 UTC 存储（record_fire 用 utcnow），所以
+    查询时把 local "今日 0-24" 转成对应 UTC 区间。
+    """
+    return clock.today_bounds_utc()
 
 
 def _count_today(user_id: int) -> int:
@@ -191,7 +190,7 @@ def record_fire(
         sess.add(
             ProactiveFire(
                 user_id=user_id,
-                ts=datetime.now(),
+                ts=clock.utcnow(),  # UTC 存储，与 column default + last_fire 比较一致
                 why=why[:80],
                 user_probably_doing=user_probably_doing[:80],
                 opener_angle=opener_angle[:80],
@@ -259,17 +258,23 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
 
     门策略（2026-05-21 改）：所有"硬门"软化为概率跳过。违规越严重 skip_prob 越高
     （封顶 0.97），但永远不会 100% 拦死——保证"频率降低但不会完全不主动"。
+
+    时区：内部时间运算（与 last_fire 比较 / 配额查询）统一 UTC；
+    送给 LLM / availability score 的 weekday/hour 用 local（user 视角）。
     """
-    now = now or datetime.now()
+    # `now` 入参——若给了就当 UTC（兼容老调用），否则取当前 UTC
+    now_utc = now or clock.utcnow()
+    now_local = clock.utc_to_local(now_utc) or now_utc
 
     idle_sec = availability.seconds_since_last_interaction(user_id)
     today_count = _count_today(user_id)
     last_fire = _last_fire_ts(user_id)
 
-    # 连续 N 条没回判定：看 _recent_per_user 末尾连续 assistant 数量
+    # 连续 N 条没回判定：看 _recent_per_user 末尾连续 assistant 数量。
+    # snapshot：跨 task 读（scheduler 协程 vs agent 主 turn 异步写），避免迭代中被 mutate。
     try:
         from .agent import _recent_per_user
-        rec_msgs = _recent_per_user.get(str(user_id), [])
+        rec_msgs = list(_recent_per_user.get(str(user_id), []))
     except Exception:
         rec_msgs = []
     consecutive_asst = 0
@@ -280,7 +285,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
             break
 
     skip_prob, violations = _compute_soft_gate_skip(
-        idle_sec=idle_sec, last_fire=last_fire, now=now,
+        idle_sec=idle_sec, last_fire=last_fire, now=now_utc,
         today_count=today_count, consecutive_asst=consecutive_asst,
     )
     if skip_prob > 0:
@@ -296,7 +301,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
               skip_prob=round(skip_prob, 3), roll=round(roll, 3),
               violations=violations[:SOFT_SKIP_REASONS_MAX_AUDIT])
 
-    score = availability.score(user_id, now.weekday(), now.hour)
+    score = availability.score(user_id, now_local.weekday(), now_local.hour)
     top = [t for t, _ in interests.top(user_id, 6)]
 
     # 拉最近对话片段——避免 LLM 选一个已聊过/已回答过的话题作为 opener_angle
@@ -336,8 +341,8 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
                 break
 
     ctx: dict[str, Any] = {
-        "now": now.strftime("%H:%M"),
-        "weekday": _WEEKDAYS[now.weekday()],
+        "now": now_local.strftime("%H:%M"),
+        "weekday": _WEEKDAYS[now_local.weekday()],
         "hours_since_user_last_msg": round(idle_sec / 3600, 1),
         "user_active_score_now": round(score, 2),
         "recent_topics": top,

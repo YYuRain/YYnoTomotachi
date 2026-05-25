@@ -58,6 +58,7 @@ async def _run(*args: str, proxy: bool = False, timeout: float | None = None) ->
         env["HTTPS_PROXY"] = proxy_url
         env["HTTP_PROXY"] = proxy_url
     eff_timeout = timeout if timeout is not None else _TIMEOUT
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -73,9 +74,25 @@ async def _run(*args: str, proxy: bool = False, timeout: float | None = None) ->
         return out
     except asyncio.TimeoutError:
         log.warning("tool timeout (%.1fs): %s", eff_timeout, args[0])
+        # wait_for 超时时只 cancel awaiter——subprocess 仍在跑，不杀会僵尸化堆积
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                # 给 1s 收尸；超了说明真的卡死，让 OS 接手
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            except Exception as e:
+                log.debug("tool kill err: %s", e)
         return ""
     except Exception as e:
         log.warning("tool error: %s args=%s", e, args[:3])
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except Exception:
+                pass
         return ""
 
 

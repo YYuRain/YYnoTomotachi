@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import availability, llm, storage
+from . import availability, clock, llm, storage
 from .audit_log import audit
 
 
@@ -48,13 +48,16 @@ async def tick() -> None:
         return
     if not rows:
         return
-    now = datetime.now()  # local CST（容器 TZ=Asia/Shanghai）
+    # cron 表达式按 user local（CST）语义，所以 _cron_matches_now 用 local；
+    # dedupe 用 UTC（last_fired_at 列存 utcnow）。两个域分开避免 dev/prod TZ 差异导致漂移。
+    now_local = clock.now_local()
+    now_utc = clock.utcnow()
     for ov in rows:
         try:
-            if not _cron_matches_now(ov.cron_schedule or "", now):
+            if not _cron_matches_now(ov.cron_schedule or "", now_local):
                 continue
             # dedupe
-            if ov.last_fired_at and (datetime.utcnow() - ov.last_fired_at).total_seconds() < DEDUPE_WINDOW_SEC:
+            if ov.last_fired_at and (now_utc - ov.last_fired_at).total_seconds() < DEDUPE_WINDOW_SEC:
                 continue
             await _try_fire(ov)
         except Exception as e:
@@ -80,7 +83,7 @@ async def _try_fire(ov) -> None:
     idle = availability.seconds_since_last_interaction(ov.user_id)
     if idle != float("inf") and idle < RECENT_TALK_WINDOW_SEC:
         # 暂存等下一轮融入
-        expected = datetime.utcnow() + timedelta(seconds=PENDING_TIMEOUT_SEC)
+        expected = clock.utcnow() + timedelta(seconds=PENDING_TIMEOUT_SEC)
         reach_id = storage.add_pending_reach(
             user_id=ov.user_id, override_id=ov.id,
             message=message, expected_send_after=expected,
@@ -158,7 +161,8 @@ async def _judge_and_compose(
     if user_id:
         try:
             from .agent import _recent_per_user
-            recent = _recent_per_user.get(str(user_id), [])
+            # snapshot：跨 task 读，防迭代中被 agent._post_turn 异步 mutate
+            recent = list(_recent_per_user.get(str(user_id), []))
         except Exception:
             recent = []
         if recent:

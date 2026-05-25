@@ -180,6 +180,89 @@ def redeem(code: str, chat_id: int) -> Optional[str]:
     return None
 
 
+def _dump_wipe_backup(user_id: int) -> None:
+    """DELETE 前 dump 用户全数据到 data/wipe_backup_<uid>_<ts>/。
+
+    备份范围（best-effort，单点失败不阻塞 wipe）：
+    - SQLite 所有有 user_id 列的表 → JSONL
+    - postgres memories / episodes / 其它 user_id 表 → JSONL
+    - data/recent.json[uid] → recent.json
+    """
+    from datetime import datetime as _dt
+    from pathlib import Path
+    from sqlalchemy import select
+    from .storage import Base
+    from .config import settings as _settings
+
+    ts = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
+    out = _settings().root / "data" / f"wipe_backup_{user_id}_{ts}"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.warning("wipe_backup mkdir err: %s", e)
+        return
+
+    # SQLite tables
+    try:
+        with session() as s:
+            for tbl in Base.metadata.sorted_tables:
+                cols = {c.name for c in tbl.columns}
+                filter_col = None
+                if tbl.name == "users":
+                    filter_col = "chat_id"
+                elif tbl.name == "skills" and "created_by" in cols:
+                    filter_col = "created_by"
+                elif "user_id" in cols:
+                    filter_col = "user_id"
+                if filter_col is None:
+                    continue
+                rows = s.execute(
+                    select(tbl).where(tbl.c[filter_col] == user_id)
+                ).mappings().all()
+                if not rows:
+                    continue
+                fp = out / f"sqlite.{tbl.name}.jsonl"
+                with fp.open("w", encoding="utf-8") as f:
+                    for r in rows:
+                        f.write(_json.dumps(dict(r), ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        log.warning("wipe_backup sqlite err: %s", e)
+
+    # postgres tables
+    try:
+        s = _settings()
+        if s.memu_db_url:
+            import psycopg  # type: ignore
+            dsn = s.memu_db_url.replace("postgresql+psycopg://", "postgresql://")
+            uid_str = str(user_id)
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                rows = conn.execute(
+                    "SELECT table_name FROM information_schema.columns "
+                    "WHERE column_name='user_id' AND table_schema='public'"
+                ).fetchall()
+                for (t,) in rows:
+                    cur = conn.execute(f"SELECT * FROM {t} WHERE user_id=%s", (uid_str,))
+                    cols = [d[0] for d in (cur.description or [])]
+                    fp = out / f"pg.{t}.jsonl"
+                    with fp.open("w", encoding="utf-8") as f:
+                        for row in cur.fetchall():
+                            f.write(_json.dumps(dict(zip(cols, row)), ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        log.warning("wipe_backup pg err: %s", e)
+
+    # recent.json[uid]
+    try:
+        from . import agent  # 延迟避免循环
+        snap = agent._recent_per_user.get(str(user_id))
+        if snap:
+            fp = out / "recent.json"
+            fp.write_text(_json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.debug("wipe_backup recent err: %s", e)
+
+    log.info("wipe_backup uid=%d → %s", user_id, out)
+
+
 def wipe_user(user_id: int) -> dict[str, int]:
     """删除一个用户的全部数据，返回每张表删了多少行。供 test bot /clear 用。
 
@@ -189,22 +272,39 @@ def wipe_user(user_id: int) -> dict[str, int]:
     - memU postgres：所有带 user_id 列的表，DELETE WHERE user_id = str(uid)
     - 进程内存：agent._recent_per_user / memory._buffer_per_user / _last_flush_ts_per_user
     - data/recent.json：重写
+
+    **DELETE 前先 dump backup 到 data/wipe_backup_<uid>_<ts>/**——MEMORY.md 硬规则：
+    任何用户级 DELETE 之前必须备份，保 7 天（scheduler.daily_cleanup_job 自动清）。
     """
-    from datetime import datetime as _dt  # 防与上方 import 冲突
     from sqlalchemy import delete, update as _update
     from .config import settings as _settings
-    from .storage import (
-        Interest, ReplySample, LastInteraction, ProactiveFire,
-        PersonaSnapshot, InviteCode,
-    )
+    from .storage import Base, InviteCode
+
+    # ===== 第 0 步：dump backup =====
+    _dump_wipe_backup(user_id)
+
     counts: dict[str, int] = {}
-    # SQLite
+    # SQLite——反射 Base.metadata 自动找所有有 user_id 列的表，避免漏删。
+    # 老法 hardcode (Interest, ReplySample, ProactiveFire, PersonaSnapshot) 漏了
+    # PromptOverride / Skill / PendingReachMessage（test bot /clear 后 stale row 留）。
     with session() as s:
-        for tbl in (Interest, ReplySample, ProactiveFire, PersonaSnapshot):
-            res = s.execute(delete(tbl).where(tbl.user_id == user_id))
-            counts[tbl.__tablename__] = int(res.rowcount or 0)
-        res = s.execute(delete(LastInteraction).where(LastInteraction.user_id == user_id))
-        counts["last_interaction"] = int(res.rowcount or 0)
+        for tbl in Base.metadata.sorted_tables:
+            cols = {c.name for c in tbl.columns}
+            # User 表自身（chat_id 是 PK，不是 user_id 列名）单独处理；放最后删
+            if tbl.name == "users":
+                continue
+            if tbl.name == "invite_codes":
+                continue  # 单独 update（释放码而非 delete）
+            # Skill 表 created_by=user_id 但仓库性质——admin 创建的不该被普通用户 wipe
+            # 仅当 created_by==user_id（user 自己创建）才删
+            if tbl.name == "skills":
+                if "created_by" in cols:
+                    res = s.execute(delete(tbl).where(tbl.c.created_by == user_id))
+                    counts[tbl.name] = int(res.rowcount or 0)
+                continue
+            if "user_id" in cols:
+                res = s.execute(delete(tbl).where(tbl.c.user_id == user_id))
+                counts[tbl.name] = int(res.rowcount or 0)
         # 释放该用户用过的邀请码（让重新走一次注册流程）
         res = s.execute(
             _update(InviteCode)

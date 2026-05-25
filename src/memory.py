@@ -134,6 +134,64 @@ _buffer_per_user: dict[str, list[dict[str, str]]] = {}
 _last_flush_ts_per_user: dict[str, float] = {}
 _flush_lock = asyncio.Lock()
 
+# fire-and-forget bg task 持引用——event loop 只持 weak ref，不存就可能被 GC
+_BG_TASKS: set[asyncio.Task] = set()
+
+# infra 故障告警限速：同类故障 30 min 内只 push admin 一次（avoid 刷屏）
+_LAST_INFRA_NOTIFY: dict[str, float] = {}
+_INFRA_NOTIFY_COOLDOWN_SEC = 30 * 60
+
+
+def _maybe_notify_infra_failure(component: str, exc: Exception) -> None:
+    """关键 infra 故障（pg 连不上 / embed_server 崩）→ push admin Telegram 告警。
+
+    限速：同 component 30 min 内只发一条，防一连串失败刷屏。
+    """
+    import time as _t
+    now = _t.time()
+    last = _LAST_INFRA_NOTIFY.get(component, 0.0)
+    if now - last < _INFRA_NOTIFY_COOLDOWN_SEC:
+        return
+    _LAST_INFRA_NOTIFY[component] = now
+
+    msg_type = type(exc).__name__
+    msg_text = str(exc)[:200]
+    text = f"⚠️ infra failure: {component}\n{msg_type}: {msg_text}"
+
+    async def _push():
+        try:
+            from . import bot as _bot
+            from .config import settings as _settings
+            admin_id = _settings().admin_chat_id
+            if not admin_id:
+                return
+            send, _ = _bot.make_send_and_typing(admin_id)
+            await send(text)
+        except Exception as e:
+            log.debug("infra notify err: %s", e)
+
+    _spawn_bg(_push())
+
+
+def _spawn_bg(coro) -> None:
+    """fire-and-forget 助手：持引用 + done callback 自清理 + 异常 log。"""
+    try:
+        t = asyncio.create_task(coro)
+    except RuntimeError:
+        # 没 running loop（同步上下文调用）
+        return
+    _BG_TASKS.add(t)
+
+    def _on_done(task: asyncio.Task) -> None:
+        _BG_TASKS.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning("memory bg task failed: %r", exc)
+
+    t.add_done_callback(_on_done)
+
 
 def _uid(chat_id: int | str) -> str:
     return str(chat_id)
@@ -393,7 +451,12 @@ async def recall(user_id: int, user_text: str, *, top_k: int = 3) -> list[str]:
                     **{k: sc[k] for k in ("rel", "imp", "rec", "final", "age_days") if k in sc},
                 })
     except Exception as e:
-        log.debug("recall uid=%s 失败：%s", uid_str, e)
+        # 关键 infra（postgres / pgvector）故障不该静默——升 warning 并 audit
+        # 让 admin 在审计流里能看到"recall 整段崩了"，不会再被 log.debug 吞掉
+        log.warning("recall uid=%s 失败 (postgres/pgvector?): %s", uid_str, e)
+        audit("memory_recall_error", user_id=user_id, error=str(e)[:300],
+              error_type=type(e).__name__)
+        _maybe_notify_infra_failure("recall", e)
         distances = []
         score_breakdown = []
 
@@ -579,11 +642,7 @@ def _fire_persona_update(user_id: int, batch: list[dict[str, str]]) -> None:
         except Exception as e:
             log.debug("persona update post-flush err: %s", e)
 
-    try:
-        asyncio.create_task(_go())
-    except RuntimeError:
-        # 没有 running loop（如脚本同步上下文调用），跳过
-        pass
+    _spawn_bg(_go())
 
 
 def _fire_feedback_check(user_id: int, batch: list[dict[str, str]]) -> None:
@@ -598,10 +657,7 @@ def _fire_feedback_check(user_id: int, batch: list[dict[str, str]]) -> None:
         except Exception as e:
             log.debug("feedback agent post-flush err: %s", e)
 
-    try:
-        asyncio.create_task(_go())
-    except RuntimeError:
-        pass
+    _spawn_bg(_go())
 
 
 def _fire_conflict_check(user_id: int, new_records: list[dict[str, Any]]) -> None:
@@ -628,10 +684,7 @@ def _fire_conflict_check(user_id: int, new_records: list[dict[str, Any]]) -> Non
         except Exception as e:
             log.debug("conflict check post-flush err: %s", e)
 
-    try:
-        asyncio.create_task(_go())
-    except RuntimeError:
-        pass
+    _spawn_bg(_go())
 
 
 CONFLICT_TOPK = 5  # 每条新 profile 召回多少旧 profile 候选做判断

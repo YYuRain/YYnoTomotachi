@@ -167,32 +167,82 @@ def build() -> AsyncIOScheduler:
         except Exception as e:
             log.warning("pending_reach_overdue_job err: %s", e)
 
-    sched.add_job(decay_job, "interval", hours=1, id="decay")
-    sched.add_job(memu_flush_job, "interval", minutes=15, id="memu_flush")
+    async def daily_cleanup_job() -> None:
+        """每日清理：
+        - audit.<date>.jsonl 保留 30 天
+        - data/wipe_backup_<uid>_<ts>/ 保留 7 天（per MEMORY.md 软规则）
+        """
+        import os
+        import shutil
+        import time as _t
+        from .config import settings as _settings
+        root = _settings().root / "data"
+        if not root.exists():
+            return
+        now_ts = _t.time()
+        # audit 30 天
+        audit_cutoff = now_ts - 30 * 86400
+        for p in root.glob("audit.*.jsonl"):
+            try:
+                if p.stat().st_mtime < audit_cutoff:
+                    p.unlink()
+                    log.info("cleanup: removed old audit %s", p.name)
+            except Exception as e:
+                log.debug("cleanup audit %s err: %s", p, e)
+        # wipe_backup 7 天
+        backup_cutoff = now_ts - 7 * 86400
+        for p in root.glob("wipe_backup_*"):
+            try:
+                if p.is_dir() and p.stat().st_mtime < backup_cutoff:
+                    shutil.rmtree(p, ignore_errors=True)
+                    log.info("cleanup: removed old wipe_backup %s", p.name)
+            except Exception as e:
+                log.debug("cleanup wipe_backup %s err: %s", p, e)
+
+    # 防重叠 + misfire 兜底：job 跑超时不要堆积新实例；停机后多个 misfire 合并成一次
+    # max_instances=1 → 上次没跑完不开新实例（避免数据库被 50 用户 × 多 job 并发打爆）
+    # coalesce=True → 一段时间内多次 misfire 合并成一次
+    # misfire_grace_time=600 → 进程暂停 ≤10min 还能补跑（cloudflared 抖动 / 重启窗口够用）
+    _COMMON = {"max_instances": 1, "coalesce": True, "misfire_grace_time": 600}
+    sched.add_job(decay_job, "interval", hours=1, id="decay", **_COMMON)
+    sched.add_job(memu_flush_job, "interval", minutes=15, id="memu_flush", **_COMMON)
     sched.add_job(
         persona_consolidate_job,
         CronTrigger(hour=3, minute=7),
         id="persona_consolidate",
+        **_COMMON,
     )
     sched.add_job(
         auto_dream_job,
         CronTrigger(hour=3, minute=13),
         id="auto_dream",
+        # auto_dream 是重活儿（多用户 × 三段 LLM 整理），跑超 1h 也不怪——给更长 grace
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     jitter_sec = 10 * 60
     sched.add_job(
         proactive_job,
         IntervalTrigger(minutes=25, jitter=jitter_sec),
         id="proactive",
+        **_COMMON,
     )
     sched.add_job(
         triggered_reach_job,
         IntervalTrigger(minutes=1),
         id="triggered_reach",
+        # 这条每分钟跑——misfire grace 取小：超 90s 没跑就别补（错过的分钟也没意义）
+        max_instances=1, coalesce=True, misfire_grace_time=90,
     )
     sched.add_job(
         pending_reach_overdue_job,
         IntervalTrigger(minutes=1, jitter=15),
         id="pending_reach_overdue",
+        max_instances=1, coalesce=True, misfire_grace_time=90,
+    )
+    sched.add_job(
+        daily_cleanup_job,
+        CronTrigger(hour=4, minute=23),  # 03:13 auto_dream 之后；避开整点凑热闹
+        id="daily_cleanup",
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     return sched
