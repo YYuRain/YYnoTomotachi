@@ -471,11 +471,16 @@ async function loadItems() {
   const t = encodeURIComponent($('#type-filter').value || '');
   const st = encodeURIComponent($('#status-filter').value || '');
   const r = await fetch(`/api/items?q=${q}&type=${t}&status=${st}&limit=200&` + withUid()); const j = await r.json();
-  $('#items-hint').textContent = `${j.length} 条`;
+  const validCount = j.filter(it => !it.valid_to).length;
+  const staleCount = j.length - validCount;
+  $('#items-hint').textContent = staleCount > 0
+    ? `${validCount} 有效 / ${j.length} 总（${staleCount} 已失效）`
+    : `${j.length} 条`;
   const tb = $('#items-tbody'); tb.innerHTML = '';
   if (!j.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">没命中</td></tr>'; return; }
   for (const it of j) {
-    const tr = el('tr');
+    const isStale = !!it.valid_to;
+    const tr = el('tr', isStale ? { style: 'opacity:0.45;background:#fafafa' } : {});
     const pill = el('span', { class: 'pill' }, it.memory_type || '');
     const tdT = el('td', { 'data-label': '类型' }); tdT.appendChild(pill); tr.appendChild(tdT);
     const stPill = el('span', { class: 'st ' + (it.status || 'confirmed') }, it.status || 'confirmed');
@@ -492,7 +497,10 @@ async function loadItems() {
     tr.appendChild(tdSt);
 
     const tdSummary = el('td', { class: 'summary', 'data-label': '内容' });
-    tdSummary.appendChild(document.createTextNode(it.summary || ''));
+    const summaryNode = el('span',
+      isStale ? { style: 'text-decoration:line-through;text-decoration-color:#aaa' } : {},
+      it.summary || '');
+    tdSummary.appendChild(summaryNode);
 
     // 元信息行：id · 依赖 · 来源 · 反验证 · 更新
     const metaRow = el('div', { style: 'margin-top:6px;font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;display:flex;flex-wrap:wrap;gap:8px;align-items:center' });
