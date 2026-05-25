@@ -75,7 +75,7 @@ def list_pending(user_id: int, top_n: int = 3) -> list[dict]:
     with eng.connect() as conn:
         rows = conn.execute(
             sql_text(
-                "SELECT id, text, kind, priority, source_ids, created_at "
+                "SELECT id, text, kind, priority, source_ids, suggested_query, created_at "
                 "FROM agent_ideas "
                 "WHERE user_id = :uid AND status = 'open' "
                 "AND expires_at > now() "
@@ -90,7 +90,8 @@ def list_pending(user_id: int, top_n: int = 3) -> list[dict]:
             "kind": r[2],
             "priority": r[3],
             "source_ids": [str(x) for x in (r[4] or [])],
-            "created_at": r[5],
+            "suggested_query": r[5],
+            "created_at": r[6],
         }
         for r in rows
     ]
@@ -240,9 +241,23 @@ async def form_ideas(user_id: int) -> dict[str, Any]:
         if isinstance(sup_short, list):
             sup_full = [id_lookup[s] for s in sup_short
                         if isinstance(s, str) and s in id_lookup]
+
+        # share kind 必须带 suggested_query；其他 kind 不接受这字段
+        suggested_query: Optional[str] = None
+        if kind == "share":
+            sq = (ins.get("suggested_query") or "").strip()
+            if not sq or len(sq) > 200:
+                # 空 / 太长 → 降级成 follow_up（或干脆丢？这里降级，让 LLM 文本仍能用）
+                log.info("form_ideas: share kind 缺 suggested_query 或过长，降为 follow_up: %s",
+                         text_v[:60])
+                kind = "follow_up"
+            else:
+                suggested_query = sq
+
         valid_ideas.append({
             "text": text_v, "kind": kind, "priority": priority,
             "source_ids": sup_full,
+            "suggested_query": suggested_query,
         })
 
     if not valid_ideas:
@@ -318,15 +333,16 @@ async def form_ideas(user_id: int) -> dict[str, Any]:
                 "kind": v["kind"],
                 "priority": v["priority"],
                 "source_ids": v["source_ids"] or None,
+                "suggested_query": v.get("suggested_query"),
                 "now": now,
                 "expires": expires,
             }
             row = conn.execute(
                 sql_text(
                     "INSERT INTO agent_ideas (user_id, text, kind, priority, "
-                    "source_ids, status, created_at, expires_at) "
+                    "source_ids, suggested_query, status, created_at, expires_at) "
                     "VALUES (:user_id, :text, :kind, :priority, "
-                    "CAST(:source_ids AS uuid[]), 'open', :now, :expires) "
+                    "CAST(:source_ids AS uuid[]), :suggested_query, 'open', :now, :expires) "
                     "RETURNING id"
                 ),
                 params,
@@ -341,7 +357,8 @@ async def form_ideas(user_id: int) -> dict[str, Any]:
           generated=len(accepted), samples=len(items),
           dedup_rejected=len(duplicates), duplicates=duplicates,
           ideas=[{"id": _id, "text": v["text"][:120],
-                  "kind": v["kind"], "priority": v["priority"]}
+                  "kind": v["kind"], "priority": v["priority"],
+                  "suggested_query": v.get("suggested_query")}
                  for _id, (v, _) in zip(inserted_ids, accepted)],
           latency_ms=elapsed_ms)
     return {

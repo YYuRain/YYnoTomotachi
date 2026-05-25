@@ -402,27 +402,63 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "mode": "topic_chat",
         "share_item": None,
         "consumed_idea_id": None,
+        "source_idea": None,  # 采纳了 idea 时填 {text, kind}——opener prompt 用它走 idea-driven 叙事
     }
 
     # idea 消费：LLM 输出 consumed_idea_id 表明它采纳了某条 pending idea
     # 校验：必须在 pending_ideas 列表里（防 LLM 编造 id）
+    consumed_idea_obj: Optional[dict] = None
     consumed = data.get("consumed_idea_id")
     if consumed is not None:
         try:
             consumed_id = int(consumed)
-            valid_ids = {it["id"] for it in pending_ideas}
-            if consumed_id in valid_ids:
+            ideas_by_id = {it["id"]: it for it in pending_ideas}
+            if consumed_id in ideas_by_id:
                 decision["consumed_idea_id"] = consumed_id
-                # mark used 放到决策末尾——下面 share_discovery 失败降级时不会丢这步
+                consumed_idea_obj = ideas_by_id[consumed_id]
+                decision["source_idea"] = {
+                    "text": consumed_idea_obj["text"],
+                    "kind": consumed_idea_obj["kind"],
+                }
             else:
                 log.info("proactive uid=%d: consumed_idea_id=%s 不在 pending 里，忽略",
                          user_id, consumed)
         except (TypeError, ValueError):
             pass
 
-    # Share-discovery 分支：LLM 输出了 share_intent 且配额够 → 调 search + LLM 挑
+    # === Share 分支三路并行 ===
+    # 路径 A：share kind idea + suggested_query → idea-driven share（"看了帖子引发的"）
+    # 路径 B：LLM 输出独立 share_intent → topic-driven share（"单纯想分享"）
+    # 路径 C：以上都没 → topic_chat
     share_intent = data.get("share_intent") if isinstance(data, dict) else None
-    if isinstance(share_intent, dict):
+
+    # A: idea-driven share 优先级最高——避免 LLM 同时 share_intent 又消费 share idea 时撞车
+    if (consumed_idea_obj is not None
+            and consumed_idea_obj.get("kind") == "share"
+            and consumed_idea_obj.get("suggested_query")):
+        # 平台决策：LLM 没指定平台时按 share_intent 走，没 share_intent 就默认 web
+        # （share kind idea 的 query 通常是中文话题，xhs/web 都能搜——交给 LLM 在 share_intent.platform 里指定）
+        platform = "web"
+        if isinstance(share_intent, dict):
+            p_hint = str(share_intent.get("platform") or "").strip()
+            if p_hint in SHARE_PLATFORMS and p_hint in share_quota_remaining:
+                platform = p_hint
+        if platform not in share_quota_remaining and "web" in share_quota_remaining:
+            platform = "web"
+        if platform in share_quota_remaining:
+            query = consumed_idea_obj["suggested_query"]
+            item = await _select_share_item(
+                user_id, platform, query, recent_topics=top,
+            )
+            if item:
+                decision["mode"] = "share_discovery"
+                decision["share_item"] = item
+            # 找不到就降级 topic_chat——idea text 仍可作 opener_angle
+        share_intent = None  # 已用 idea 路径，跳过 B
+
+    # B: 独立 share_intent（LLM 没消费 share idea，但临时想分享）
+    if (decision["mode"] == "topic_chat"
+            and isinstance(share_intent, dict)):
         platform = str(share_intent.get("platform") or "").strip()
         query = str(share_intent.get("query") or "").strip()
         if platform in SHARE_PLATFORMS and query and platform in share_quota_remaining:
@@ -432,7 +468,6 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
             if item:
                 decision["mode"] = "share_discovery"
                 decision["share_item"] = item
-            # 选不出来就 silent 降级到 topic_chat（_select_share_item 内部已 audit）
 
     # 真采纳了 idea → mark used（无论 mode 是 topic_chat 还是 share_discovery）
     if decision["consumed_idea_id"] is not None:

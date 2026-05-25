@@ -144,18 +144,46 @@ def __getattr__(name: str) -> str:
 
 
 def render_proactive_opener(ctx: dict) -> str:
-    """结合 proactive.decide 的判断，定制主动开场的指令块。"""
+    """结合 proactive.decide 的判断，定制主动开场的指令块。
+
+    如果 ctx 里有 source_idea（来自 agent_ideas 非 share kind），叙事提示是"凌晨自己想到的"。
+    """
     user_doing = ctx.get("user_probably_doing") or "不确定对方在做什么"
     angle = ctx.get("opener_angle") or "随口一说"
     topics = ctx.get("recent_topics") or []
     topic_line = "、".join(topics[:5]) if topics else "（没有特别热的话题）"
+
+    source_idea = ctx.get("source_idea") or {}
+    if source_idea.get("text"):
+        kind = source_idea.get("kind", "follow_up")
+        kind_label = {
+            "question": "想问她一件事",
+            "follow_up": "跟进一个之前没聊完的话题",
+            "observation": "一个跨条事实的观察",
+            "share": "想分享的事",
+        }.get(kind, "想到的事")
+        idea_hint = (
+            '## 这次开口背后有一条「想起来的事」\n\n'
+            f'你之前自己琢磨过：「{source_idea["text"]}」（{kind_label}）。\n'
+            '现在就着这个想法开口——不是凭空起话头，是真的「想起来」。\n'
+            '可以**不必**直接复述这条原话，挑核心点用自己的口气问出来即可。但**不要**\n'
+            '复述对方的画像（「你之前说你喜欢 X」），那种像教育对方关于 ta 自己。'
+        )
+    else:
+        idea_hint = ""
+
     return prompt_loader.load("chat_proactive_opener_with_ctx").format(
         user_doing=user_doing, angle=angle, topic_line=topic_line,
+        idea_hint_block=idea_hint,
     )
 
 
 def render_proactive_opener_share(ctx: dict) -> str:
-    """share_discovery 模式开场白：bot 真搜了一条想分享，prompt 覆盖"不要假装刚刷到"禁令。"""
+    """share_discovery 模式开场白：bot 真搜了一条想分享，prompt 覆盖"不要假装刚刷到"禁令。
+
+    如果 ctx 里有 source_idea（来自 agent_ideas 的 share kind），叙事走"想到这事 →
+    顺手搜了下"双层；否则纯"刚搜到一条"。
+    """
     user_doing = ctx.get("user_probably_doing") or "不确定对方在做什么"
     item = ctx.get("share_item") or {}
     platform = item.get("platform") or "网上"
@@ -163,7 +191,26 @@ def render_proactive_opener_share(ctx: dict) -> str:
     url = item.get("url") or ""
     blurb = item.get("blurb") or ""
     platform_label = {"xhs": "小红书", "bili": "B 站", "web": "网上"}.get(platform, platform)
+
+    source_idea = ctx.get("source_idea") or {}
+    if source_idea.get("text"):
+        idea_hint = (
+            '## 这次的分享是基于你之前自己想到的事\n\n'
+            f'你之前在脑子里想过：「{source_idea["text"]}」——'
+            '你刚才就着这个想法去搜了下，找到了上面这条。\n\n'
+            '所以叙事可以是「想到 X → 顺手搜了下，看到这个」的双层感觉，不是凭空冒出来一条分享。\n'
+            '示例口气：\n'
+            '✅ 「突然想到 X，搜了下还真有，[链接]」\n'
+            '✅ 「想到她可能感兴趣 X，[链接] 这个挺戳的」\n'
+            '✅ 「X 这事我前几天还想着——刚搜到这条 [链接]」\n'
+            '但**不要**复述对方的画像（「你之前说过你喜欢 X」/「你那个 AI 项目」），'
+            '那是教育对方关于 ta 自己。'
+        )
+    else:
+        idea_hint = '## 没有预设想法，纯粹是「刚翻到一条想分享」。'
+
     return prompt_loader.load("chat_proactive_opener_share_ctx").format(
         user_doing=user_doing, platform=platform_label,
         title=title, url=url, blurb=blurb,
+        idea_hint_block=idea_hint,
     )

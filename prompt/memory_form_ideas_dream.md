@@ -27,6 +27,10 @@
   矛盾解决了没"）
 - `share`：想分享一个对方可能会喜欢的内容（"她最近聊很多 AI 陪伴 → 想找篇 anthropic
   的文章 / 上次聊到她爱吃辣 → 想找一家她家附近评价好的川菜"）
+  - **`share` kind 必须带 `suggested_query` 字段** —— 一个具体的搜索关键词，等到要分享
+    时系统会用它现搜小红书 / B 站 / 全网，挑一条最 fit 的发出去
+  - query 要具体不要空泛："Character.AI 角色边界 情感设计" 而不是 "AI 陪伴文章"；
+    "海淀区 川菜 评价高" 而不是 "好吃的"
 - `observation`：基于跨条事实的观察想跟她聊（"我注意到她每周日晚情绪低 / 她聊到妈妈
   时常常和食物有关——想问问"）
 
@@ -67,8 +71,15 @@
   {{"text": "她下周一有 review meeting——可以周日晚问要不要先聊聊要点",
     "kind": "follow_up",
     "priority": 8,
-    "supporting_ids": ["e5f6a7b8", "9c0d1e2f"]}}
+    "supporting_ids": ["e5f6a7b8", "9c0d1e2f"]}},
+  {{"text": "她对 AI 陪伴技术好奇——想找一篇 Character.AI 设计边界的文章分享给她",
+    "kind": "share",
+    "priority": 6,
+    "suggested_query": "Character.AI 设计边界 情感依附 反思",
+    "supporting_ids": ["5e290632"]}}
 ]}}
 ```
 
 如果没找到值得写的 idea，输出 `{{"ideas": []}}`——比写空话强。
+
+注意：`share` kind 必须带 `suggested_query`，否则会被过滤；其他 kind 不要带这字段。

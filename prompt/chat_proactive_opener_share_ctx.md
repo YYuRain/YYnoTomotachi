@@ -6,6 +6,8 @@
 - 链接：{url}
 - 你为什么觉得对方会喜欢：{blurb}
 
+{idea_hint_block}
+
 ## 这次跟普通 proactive 不同——可以说"刚搜到 / 看到一条"
 
 平时 proactive opener 禁止假装"刚刷到 / 刚看到"——因为以前会编造。**但这次不是编**：

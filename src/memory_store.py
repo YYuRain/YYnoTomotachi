@@ -97,6 +97,10 @@ class AgentIdea(Base):
     priority = Column(Integer, nullable=False, default=5)
     status = Column(String(16), nullable=False, default="open")
     source_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=True)
+    # share kind idea 带：proactive 消费时把这个当 search query 现搜现分享
+    # 营造"想到这件事 → 看了眼帖子 → 想到分享给她"的双重叙事
+    # null = 纯凭空想，proactive 走 topic_chat（不搜帖子）
+    suggested_query = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     used_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=False)
@@ -188,6 +192,8 @@ def _ensure_v2_columns() -> None:
         # 索引：admin UI 列 stale 条目按 valid_to 排序时用
         "CREATE INDEX IF NOT EXISTS ix_memories_valid_to "
         "ON memories (user_id, valid_to) WHERE valid_to IS NOT NULL",
+        # agent_ideas 表新加 suggested_query 列（2026-05-25 share/idea 融合）
+        "ALTER TABLE agent_ideas ADD COLUMN IF NOT EXISTS suggested_query TEXT NULL",
     ]
     try:
         with _engine.begin() as conn:  # type: ignore[union-attr]
