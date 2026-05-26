@@ -77,7 +77,7 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
         return
 
     # ---- Phase 1: aux 粗筛 ----
-    screen = await _quick_screen(resource)
+    screen = await _quick_screen(resource, user_id=user_id)
     audit(
         "feedback_screen",
         user_id=user_id,
@@ -97,7 +97,7 @@ async def _process_inner(user_id: int, batch: list[dict[str, str]]) -> None:
 
     # ---- Phase 3: sonnet 精判 ----
     existing = _load_existing_overrides(user_id)
-    decision = await _sonnet_judge(resource, existing, candidates)
+    decision = await _sonnet_judge(resource, existing, candidates, user_id=user_id)
     if decision is None:
         audit(
             "feedback_decision", user_id=user_id, verdict="parse_fail",
@@ -276,9 +276,9 @@ def _load_existing_overrides(user_id: int) -> list[str]:
     return [r.text for r in rows]
 
 
-async def _quick_screen(resource: str) -> dict[str, Any]:
+async def _quick_screen(resource: str, user_id: int | None = None) -> dict[str, Any]:
     """aux LLM 粗筛。返回 dict {signal: bool, brief: str}。失败返 {"signal": False}。"""
-    prompt = feedback_prompts.render_screen(resource)
+    prompt = feedback_prompts.render_screen(resource, user_id=user_id)
     try:
         d = await asyncio.wait_for(
             llm.chat_json(
@@ -372,9 +372,10 @@ async def _sonnet_judge(
     resource: str,
     existing_overrides: list[str],
     candidate_skills: list[dict[str, Any]],
+    user_id: int | None = None,
 ) -> dict[str, Any] | None:
     """sonnet 精判。返回 decision dict 或 None（解析失败/超时）。"""
-    prompt = feedback_prompts.render_judge(resource, existing_overrides, candidate_skills)
+    prompt = feedback_prompts.render_judge(resource, existing_overrides, candidate_skills, user_id=user_id)
     try:
         d = await asyncio.wait_for(
             llm.chat_json(

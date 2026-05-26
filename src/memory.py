@@ -582,7 +582,7 @@ async def _flush_one(uid: str, *, force: bool = False) -> bool:
 
     # 抽取
     try:
-        items = await _extract_items(batch)
+        items = await _extract_items(batch, user_id=user_id_int or None)
     except Exception as e:
         log.exception("extract failed uid=%s: %s", uid, e)
         audit("memory_flush", user_id=audit_uid, msgs=len(batch), file=path.name,
@@ -733,7 +733,7 @@ async def _check_conflicts_for_one(
     model = s.memu_chat_model or s.openrouter_model
     if not model:
         return
-    prompt = memory_prompts.render_conflict_check(new_summary, candidates)
+    prompt = memory_prompts.render_conflict_check(new_summary, candidates, user_id=user_id)
     try:
         from . import openrouter
         res = await openrouter.chat(
@@ -853,7 +853,7 @@ async def _reverify_one(
     model = s.memu_chat_model or s.openrouter_model
     if not model:
         return None
-    prompt = memory_prompts.render_reverify(fact, upstream, query)
+    prompt = memory_prompts.render_reverify(fact, upstream, query, user_id=user_id)
 
     started = time.time()
     try:
@@ -1020,7 +1020,7 @@ async def _dream_one(
     model = s.memu_chat_model or s.openrouter_model
     if not model:
         return None
-    prompt = memory_prompts.render_dream(fact, upstream, neighbors)
+    prompt = memory_prompts.render_dream(fact, upstream, neighbors, user_id=user_id)
 
     started = time.time()
     try:
@@ -1237,7 +1237,7 @@ async def auto_dream_insights(user_id: int) -> dict[str, Any]:
         {"summary": r[1], "created_at": r[2]} for r in existing_rows
     ]
 
-    prompt = memory_prompts.render_insight_dream(items, existing=existing_for_prompt)
+    prompt = memory_prompts.render_insight_dream(items, existing=existing_for_prompt, user_id=user_id)
     try:
         data = await asyncio.wait_for(
             llm.chat_json(
@@ -1449,7 +1449,7 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
     valid_ids = {o.id for o in overrides}
     triggered_ids = {o.id for o in overrides if (o.trigger_kind or "passive") == "active"}
 
-    prompt = memory_prompts.render_override_dream(overrides)
+    prompt = memory_prompts.render_override_dream(overrides, user_id=user_id)
     try:
         d = await asyncio.wait_for(
             llm.chat_json(
@@ -1796,7 +1796,9 @@ def _parse_items_loose(raw: str) -> list[tuple[str, str, list[str]]]:
     return out
 
 
-async def _extract_items(batch: list[dict[str, str]]) -> list[tuple[str, str, list[str]]]:
+async def _extract_items(
+    batch: list[dict[str, str]], user_id: int | None = None,
+) -> list[tuple[str, str, list[str]]]:
     """跑 LLM 抽取，返回 [(type, content), ...]。"""
     if not batch:
         return []
@@ -1806,7 +1808,7 @@ async def _extract_items(batch: list[dict[str, str]]) -> list[tuple[str, str, li
         log.warning("memory extract: 没设 MEMU_CHAT_MODEL/OPENROUTER_MODEL，跳过")
         return []
     resource = _format_resource(batch)
-    user_prompt = memory_prompts.render(resource)
+    user_prompt = memory_prompts.render(resource, user_id=user_id)
 
     try:
         # 用 openrouter.chat 直接调，不走 :18082 shim

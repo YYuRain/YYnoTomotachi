@@ -143,6 +143,25 @@ class PendingReachMessage(Base):
     __table_args__ = (Index("ix_pending_reach_user_status", "user_id", "status"),)
 
 
+class UserPromptOverride(Base):
+    """每用户对 `prompt/*.md` 的整份覆写。
+
+    与 PromptOverride 区分：
+    - PromptOverride 是 feedback agent 沉淀的"system prompt 末尾追加片段"
+    - UserPromptOverride 是 admin/user 手动改的"某个 prompt 文件的整份替换内容"
+
+    `name` 是 prompt_loader 用的 stem（不带 .md），如 'system_baseline'、'chat_role_discipline'。
+    一个 user 同名只一条；删除该行 = 恢复默认（loader 走文件）。
+    """
+    __tablename__ = "user_prompt_overrides"
+    user_id = Column(BigInteger, nullable=False)
+    name = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(BigInteger, nullable=True)  # admin chat_id（admin 改他人时记录）
+    __table_args__ = (PrimaryKeyConstraint("user_id", "name"),)
+
+
 class Skill(Base):
     """通用化的 prompt 片段，跨用户复用。embedding 存 JSON list[float]。"""
     __tablename__ = "skills"
@@ -501,6 +520,65 @@ def set_skill_status(skill_id: int, status: str) -> bool:
         sk.status = status
         s.commit()
         return True
+
+
+# ----- user_prompt_overrides -----
+
+def get_user_prompt_override(user_id: int, name: str) -> str | None:
+    """返该用户对该 prompt 名的整份覆写内容；没改过返 None。"""
+    with session() as s:
+        row = s.query(UserPromptOverride).filter(
+            UserPromptOverride.user_id == user_id,
+            UserPromptOverride.name == name,
+        ).first()
+        return row.content if row else None
+
+
+def set_user_prompt_override(
+    user_id: int, name: str, content: str, *, updated_by: int | None = None,
+) -> None:
+    """upsert（user_id, name）→ content。content 可以是空串（视为"故意覆写为空"）。"""
+    now = datetime.utcnow()
+    with session() as s:
+        row = s.query(UserPromptOverride).filter(
+            UserPromptOverride.user_id == user_id,
+            UserPromptOverride.name == name,
+        ).first()
+        if row is None:
+            s.add(UserPromptOverride(
+                user_id=user_id, name=name, content=content,
+                updated_at=now, updated_by=updated_by,
+            ))
+        else:
+            row.content = content
+            row.updated_at = now
+            row.updated_by = updated_by
+        s.commit()
+
+
+def delete_user_prompt_override(user_id: int, name: str) -> bool:
+    """删该用户对该 prompt 名的覆写。返回是否真删了（False=本来就没这行）。"""
+    with session() as s:
+        row = s.query(UserPromptOverride).filter(
+            UserPromptOverride.user_id == user_id,
+            UserPromptOverride.name == name,
+        ).first()
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
+
+
+def list_user_prompt_overrides(user_id: int) -> list[UserPromptOverride]:
+    """该用户所有覆写过的 prompt 行。admin UI 列表用。"""
+    with session() as s:
+        return list(
+            s.query(UserPromptOverride)
+            .filter(UserPromptOverride.user_id == user_id)
+            .order_by(UserPromptOverride.name.asc())
+            .all()
+        )
 
 
 def top_skills_by_embedding(query_vec: list[float], k: int = 3) -> list[tuple[Skill, float]]:

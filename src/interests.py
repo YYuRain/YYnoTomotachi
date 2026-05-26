@@ -19,20 +19,20 @@ from .storage import Interest, session
 
 log = logging.getLogger(__name__)
 
-def _extract_prompt() -> str:
-    """从 prompt/interests_extract.md 加载（2026-05-21 抽出）。"""
+def _extract_prompt(user_id: int | None = None) -> str:
+    """从 prompt/interests_extract.md 加载（2026-05-21 抽出）；user_id 走 per-user 覆写。"""
     from . import prompt_loader
-    return prompt_loader.load("interests_extract")
+    return prompt_loader.load("interests_extract", user_id=user_id)
 
 
-async def extract_topics(text: str) -> list[str]:
+async def extract_topics(text: str, user_id: int | None = None) -> list[str]:
     if len(text.strip()) < 2:
         return []
     try:
         # 按当前 provider 走 llm.chat_json。
         data = await llm.chat_json(
             [
-                {"role": "system", "content": _extract_prompt()},
+                {"role": "system", "content": _extract_prompt(user_id=user_id)},
                 {"role": "user", "content": text},
             ],
             max_tokens=2048,

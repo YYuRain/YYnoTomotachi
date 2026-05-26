@@ -18,7 +18,7 @@ import logging
 import os
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -381,6 +381,14 @@ _INDEX_HTML = """<!doctype html>
           <tbody id="tune-interests-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
         </table>
       </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">📝 Prompt 文件（per-user 整份覆写）</h3>
+        <div class="muted" style="font-size:11px;margin-bottom:6px" id="tune-prompts-hint">改完立刻生效（不需重启）。删除覆写 = 恢复默认文件。</div>
+        <table>
+          <thead><tr><th style="width:280px">name</th><th style="width:90px">状态</th><th style="width:150px" class="mono">改于</th><th></th></tr></thead>
+          <tbody id="tune-prompts-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -440,6 +448,32 @@ _INDEX_HTML = """<!doctype html>
     <div class="actions">
       <button onclick="closeModal()">取消</button>
       <button class="primary" id="modal-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Prompt edit modal（更大，左 default 只读 + 右 user 可编辑） -->
+<div class="modal-bg" id="prompt-modal">
+  <div class="modal" style="width: min(1100px, 96vw)">
+    <h2 style="display:flex;justify-content:space-between;align-items:center">
+      <span id="prompt-modal-title">编辑 prompt</span>
+      <span id="prompt-modal-state" class="muted" style="font-size:11px;font-weight:normal"></span>
+    </h2>
+    <div id="prompt-modal-placeholders" class="muted" style="font-size:11px;margin-bottom:8px"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <label class="muted" style="font-size:11px">默认（只读，参考）</label>
+        <textarea id="prompt-modal-default" readonly style="background:#f6f6f6;color:#666;min-height:420px;font-family:ui-monospace,Menlo,monospace;font-size:12px"></textarea>
+      </div>
+      <div>
+        <label class="muted" style="font-size:11px">user 覆写（可编辑——空就是用默认）</label>
+        <textarea id="prompt-modal-override" placeholder="留空且点保存 = 写一条空覆写（一般想恢复默认请用「恢复默认」按钮）" style="min-height:420px;font-family:ui-monospace,Menlo,monospace;font-size:12px"></textarea>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="closePromptModal()">取消</button>
+      <button class="op danger" id="prompt-modal-restore">↺ 恢复默认</button>
+      <button class="primary" id="prompt-modal-save">保存覆写</button>
     </div>
   </div>
 </div>
@@ -789,8 +823,90 @@ $('#graph-only-deps').addEventListener('change', loadGraph);
 
 // ============ tune tab ============
 async function loadTune() {
-  await Promise.all([loadTunePending(), loadTuneActive(), loadTuneSkills(), loadTuneInterests()]);
+  await Promise.all([loadTunePending(), loadTuneActive(), loadTuneSkills(), loadTuneInterests(), loadTunePrompts()]);
 }
+
+// ============ tune: prompt 文件 per-user 覆写 ============
+async function loadTunePrompts() {
+  const tb = $('#tune-prompts-tbody');
+  const hint = $('#tune-prompts-hint');
+  if (!_currentUid) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">admin 视图全部用户时不显示——请先在顶部下拉选某个 user</td></tr>';
+    hint.textContent = '改完立刻生效（不需重启）。选了具体 user 才显示。';
+    return;
+  }
+  hint.textContent = `当前 user_id=${_currentUid}（改完立刻生效，删除覆写 = 恢复默认）`;
+  const r = await fetch('/api/prompts?' + withUid());
+  if (!r.ok) { tb.innerHTML = `<tr><td colspan="4" class="empty">加载失败：${r.status}</td></tr>`; return; }
+  const j = await r.json();
+  tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">prompt 目录为空</td></tr>'; return; }
+  for (const p of j) {
+    const tr = el('tr');
+    const stateChip = p.has_override
+      ? '<span style="color:#b56500;font-family:ui-monospace,Menlo,monospace;font-size:11px">⚙ 自定义</span>'
+      : '<span class="muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px">默认</span>';
+    tr.innerHTML = `
+      <td class="mono" data-label="name">${escapeHtml(p.name)}</td>
+      <td data-label="状态">${stateChip}</td>
+      <td class="mono" data-label="改于">${fmt(p.updated_at)}</td>
+      <td class="ops"></td>
+    `;
+    const ops = tr.querySelector('.ops');
+    const bEdit = el('button', { class: 'op' }, '编辑');
+    bEdit.onclick = () => openPromptModal(p.name, p.has_override);
+    ops.appendChild(bEdit);
+    if (p.has_override) {
+      const bRestore = el('button', { class: 'op danger' }, '↺ 恢复默认');
+      bRestore.onclick = async () => {
+        if (!confirm(`恢复 ${p.name} 到默认（删除当前覆写，立刻生效）？`)) return;
+        const r = await fetch(`/api/prompts/${encodeURIComponent(p.name)}?` + withUid(), { method: 'DELETE' });
+        if (r.ok) { toast('已恢复默认'); loadTunePrompts(); }
+        else toast('失败：' + r.status);
+      };
+      ops.appendChild(bRestore);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+let _promptModalCtx = null;
+async function openPromptModal(name, hasOverride) {
+  const r = await fetch(`/api/prompts/${encodeURIComponent(name)}?` + withUid());
+  if (!r.ok) { toast('加载失败：' + r.status); return; }
+  const j = await r.json();
+  _promptModalCtx = { name };
+  $('#prompt-modal-title').textContent = name;
+  $('#prompt-modal-state').textContent = hasOverride ? '当前：自定义' : '当前：默认（保存后变自定义）';
+  $('#prompt-modal-default').value = j.default || '';
+  $('#prompt-modal-override').value = (j.override !== null && j.override !== undefined) ? j.override : (j.default || '');
+  const phs = j.placeholders || [];
+  $('#prompt-modal-placeholders').textContent = phs.length
+    ? `⚠ 默认含占位符（保存时不能漏，否则 .format 会 KeyError）：${phs.map(s => '{' + s + '}').join('、')}`
+    : '（默认无 .format 占位符）';
+  $('#prompt-modal').classList.add('on');
+}
+function closePromptModal() {
+  $('#prompt-modal').classList.remove('on');
+  _promptModalCtx = null;
+}
+$('#prompt-modal-save').onclick = async () => {
+  if (!_promptModalCtx) return;
+  const content = $('#prompt-modal-override').value;
+  const r = await fetch(`/api/prompts/${encodeURIComponent(_promptModalCtx.name)}?` + withUid(), {
+    method: 'PUT', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({ content }),
+  });
+  if (r.ok) { toast('已保存'); closePromptModal(); loadTunePrompts(); }
+  else { const t = await r.text(); toast('失败：' + r.status + ' ' + t.slice(0, 80)); }
+};
+$('#prompt-modal-restore').onclick = async () => {
+  if (!_promptModalCtx) return;
+  if (!confirm(`恢复 ${_promptModalCtx.name} 到默认（删除当前覆写，立刻生效）？`)) return;
+  const r = await fetch(`/api/prompts/${encodeURIComponent(_promptModalCtx.name)}?` + withUid(), { method: 'DELETE' });
+  if (r.ok) { toast('已恢复默认'); closePromptModal(); loadTunePrompts(); }
+  else toast('失败：' + r.status);
+};
 
 const riskChip = (risk) => {
   const c = risk === 'high' ? '#b56500' : '#1a8a3a';
@@ -1266,6 +1382,12 @@ initViewer().then(() => { loadStats(); loadItems(); });
 """
 
 
+class PromptPutBody(BaseModel):
+    """PUT /api/prompts/{name} 的 body schema。模块级定义——FastAPI/pydantic v2 不接受
+    在 build_app() 函数内定义的 BaseModel（ForwardRef 解析失败）。"""
+    content: str = Field(..., max_length=200_000)
+
+
 def _resolve_uid(viewer: int | None, q_uid: int | None) -> int | None:
     """决定查询的 user_id 过滤值（新 schema 是 BIGINT）。
     - viewer is None（admin）：用 q_uid；q_uid 也 None → None（不过滤，看全部）
@@ -1723,5 +1845,111 @@ def build_app() -> FastAPI:
             sess.delete(row)
             sess.commit()
         return {"ok": True}
+
+    # ============ Prompt 文件 per-user 覆写（user_prompt_overrides）============
+
+    @app.get("/api/prompts")
+    async def prompts_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> list[dict[str, Any]]:
+        """列出全部 prompt 名 + 该 uid 是否有覆写。
+
+        admin 不传 user_id 时拒绝（per-user 数据，必须指定看谁的）；
+        普通用户强制看自己。
+        """
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import prompt_loader as _pl
+        names = _pl.list_default_prompt_names()
+        rows = storage.list_user_prompt_overrides(uid)
+        ov_by_name = {r.name: r for r in rows}
+        out: list[dict[str, Any]] = []
+        for n in names:
+            r = ov_by_name.get(n)
+            out.append({
+                "name": n,
+                "has_override": r is not None,
+                "updated_at": r.updated_at.isoformat() if r and r.updated_at else None,
+                "updated_by": r.updated_by if r else None,
+            })
+        return out
+
+    @app.get("/api/prompts/{name}")
+    async def prompt_get(
+        name: str,
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        """返默认文件内容 + 该 uid 当前覆写（None=未改过）。"""
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import prompt_loader as _pl
+        try:
+            default = _pl._load_default(name)
+        except FileNotFoundError:
+            raise HTTPException(404, f"prompt {name} not found")
+        override = storage.get_user_prompt_override(uid, name)
+        # 解析 .format 占位符列表（admin 编辑时不能漏）
+        import re as _re
+        placeholders = sorted(set(_re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", default)))
+        return {
+            "name": name,
+            "default": default,
+            "override": override,
+            "placeholders": placeholders,
+        }
+
+    @app.put("/api/prompts/{name}")
+    async def prompt_put(
+        name: str,
+        body: PromptPutBody = Body(...),
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        """写 user override + invalidate cache + audit。"""
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import prompt_loader as _pl
+        # 校验 prompt 名合法（必须是已有的默认文件名之一，避免乱写名字塞数据库）
+        if name not in _pl.list_default_prompt_names():
+            raise HTTPException(404, f"unknown prompt name: {name}")
+        editor = viewer if viewer is not None else 0  # 0 = admin（_get_viewer 给 admin 返 None）
+        storage.set_user_prompt_override(uid, name, body.content, updated_by=editor)
+        _pl.invalidate_user(uid, name)
+        from .audit_log import audit
+        audit("prompt_override_set", user_id=uid, name=name,
+              editor=editor, content_len=len(body.content))
+        return {"ok": True}
+
+    @app.delete("/api/prompts/{name}")
+    async def prompt_delete(
+        name: str,
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        """删 user override = 恢复默认。"""
+        uid = _resolve_uid(viewer, user_id)
+        if uid is None:
+            raise HTTPException(400, "user_id required")
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        from . import prompt_loader as _pl
+        deleted = storage.delete_user_prompt_override(uid, name)
+        _pl.invalidate_user(uid, name)
+        editor = viewer if viewer is not None else 0
+        from .audit_log import audit
+        audit("prompt_override_deleted", user_id=uid, name=name,
+              editor=editor, was_present=deleted)
+        return {"ok": True, "deleted": deleted}
 
     return app

@@ -31,8 +31,8 @@ def __getattr__(name: str) -> str:
     raise AttributeError(name)
 
 
-def render_screen(resource: str) -> str:
-    return prompt_loader.load("feedback_screen").format(resource=resource.strip())
+def render_screen(resource: str, user_id: int | None = None) -> str:
+    return prompt_loader.load("feedback_screen", user_id=user_id).format(resource=resource.strip())
 
 
 def render_skill_creator(user_request: str, resource: str, body_template: str) -> str:
@@ -53,6 +53,7 @@ def render_judge(
     resource: str,
     existing_overrides: list[str],
     candidate_skills: list[dict],
+    user_id: int | None = None,
 ) -> str:
     """existing_overrides: list of override.text；candidate_skills: list of {id, name, summary, body, similarity}."""
     if existing_overrides:
@@ -72,9 +73,9 @@ def render_judge(
     else:
         cs = "（无候选 skill）"
 
-    return prompt_loader.load("feedback_judge").format(
+    return prompt_loader.load("feedback_judge", user_id=user_id).format(
         resource=resource.strip(),
         existing_overrides=eo,
         candidate_skills=cs,
-        hard_guardrails=prompt_loader.load("feedback_hard_guardrails"),
+        hard_guardrails=prompt_loader.load("feedback_hard_guardrails", user_id=user_id),
     )

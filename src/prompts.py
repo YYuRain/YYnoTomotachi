@@ -49,16 +49,16 @@ def _render_interests(top: list[tuple[str, float]], cold_: list[tuple[str, float
     return "\n".join(lines) if lines else "（还没什么明显偏好）"
 
 
-def _render_emotion(em: Optional[EmotionSignal]) -> str:
+def _render_emotion(em: Optional[EmotionSignal], user_id: Optional[int] = None) -> str:
     if em is None or em.mode == "casual":
         return ""
     hint_block = f"对方这会儿真正想说的大概是：『{em.hint}』。" if em.hint else ""
     if em.mode == "empathy":
-        return "\n" + prompt_loader.load("chat_empathy_directive").format(hint_block=hint_block)
+        return "\n" + prompt_loader.load("chat_empathy_directive", user_id=user_id).format(hint_block=hint_block)
     if em.mode == "depth":
-        return "\n" + prompt_loader.load("chat_depth_directive").format(hint_block=hint_block)
+        return "\n" + prompt_loader.load("chat_depth_directive", user_id=user_id).format(hint_block=hint_block)
     if em.mode == "interest":
-        return "\n" + prompt_loader.load("chat_interest_directive").format(hint_block=hint_block)
+        return "\n" + prompt_loader.load("chat_interest_directive", user_id=user_id).format(hint_block=hint_block)
     return ""
 
 
@@ -95,9 +95,9 @@ def build_system_prompt(
         body = body + "\n\n# 你记得的事\n" + mem_block
 
     interest_block = "\n# 你最近在意的事\n" + _render_interests(interests_top, interests_cold)
-    emotion_block = _render_emotion(emotion)
+    emotion_block = _render_emotion(emotion, user_id=user_id)
     sticker_block = _render_stickers(sticker_tags or [])
-    role_block = "\n\n" + prompt_loader.load("chat_role_discipline")
+    role_block = "\n\n" + prompt_loader.load("chat_role_discipline", user_id=user_id)
 
     tool_block = ""
     if tool_context:
@@ -135,6 +135,8 @@ def _render_user_overrides(user_id: int) -> str:
 
 
 # 兼容旧引用——agent.py 还在用 prompts.WELCOME_OPENER_INSTRUCTIONS / PROACTIVE_OPENER_INSTRUCTIONS
+# 注意：这里走默认（没法从模块属性动态拿 user_id）；若要 per-user，caller 改用
+# render_welcome_opener / render_proactive_opener 函数（带 user_id 参数）
 def __getattr__(name: str) -> str:
     if name == "WELCOME_OPENER_INSTRUCTIONS":
         return prompt_loader.load("chat_welcome_opener")
@@ -143,7 +145,11 @@ def __getattr__(name: str) -> str:
     raise AttributeError(name)
 
 
-def render_proactive_opener(ctx: dict) -> str:
+def render_welcome_opener(user_id: Optional[int] = None) -> str:
+    return prompt_loader.load("chat_welcome_opener", user_id=user_id)
+
+
+def render_proactive_opener(ctx: dict, user_id: Optional[int] = None) -> str:
     """结合 proactive.decide 的判断，定制主动开场的指令块。
 
     如果 ctx 里有 source_idea（来自 agent_ideas 非 share kind），叙事提示是"凌晨自己想到的"。
@@ -172,13 +178,13 @@ def render_proactive_opener(ctx: dict) -> str:
     else:
         idea_hint = ""
 
-    return prompt_loader.load("chat_proactive_opener_with_ctx").format(
+    return prompt_loader.load("chat_proactive_opener_with_ctx", user_id=user_id).format(
         user_doing=user_doing, angle=angle, topic_line=topic_line,
         idea_hint_block=idea_hint,
     )
 
 
-def render_proactive_opener_share(ctx: dict) -> str:
+def render_proactive_opener_share(ctx: dict, user_id: Optional[int] = None) -> str:
     """share_discovery 模式开场白：bot 真搜了一条想分享，prompt 覆盖"不要假装刚刷到"禁令。
 
     如果 ctx 里有 source_idea（来自 agent_ideas 的 share kind），叙事走"想到这事 →
@@ -209,7 +215,7 @@ def render_proactive_opener_share(ctx: dict) -> str:
     else:
         idea_hint = '## 没有预设想法，纯粹是「刚翻到一条想分享」。'
 
-    return prompt_loader.load("chat_proactive_opener_share_ctx").format(
+    return prompt_loader.load("chat_proactive_opener_share_ctx", user_id=user_id).format(
         user_doing=user_doing, platform=platform_label,
         title=title, url=url, blurb=blurb,
         idea_hint_block=idea_hint,

@@ -32,10 +32,10 @@ class EmotionSignal:
     hint: str = ""         # 一句话总结"对方这会儿真的想说什么"
 
 
-def _detect_system() -> str:
-    """从 prompt/emotion_detect.md 加载（2026-05-21 抽出）。"""
+def _detect_system(user_id: int | None = None) -> str:
+    """从 prompt/emotion_detect.md 加载（2026-05-21 抽出）；user_id 走 per-user 覆写。"""
     from . import prompt_loader
-    return prompt_loader.load("emotion_detect")
+    return prompt_loader.load("emotion_detect", user_id=user_id)
 
 
 _FALLBACK = EmotionSignal(mode="casual")
@@ -44,6 +44,7 @@ _FALLBACK = EmotionSignal(mode="casual")
 async def detect(
     user_text: str,
     recent: Optional[list[dict]] = None,
+    user_id: int | None = None,
 ) -> Optional[EmotionSignal]:
     """失败/超时/不确定 → 返回 None（= casual），下游 bypass。"""
     if not user_text or not user_text.strip():
@@ -66,7 +67,7 @@ async def detect(
     try:
         data = await llm.chat_json(
             [
-                {"role": "system", "content": _detect_system()},
+                {"role": "system", "content": _detect_system(user_id=user_id)},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2048,

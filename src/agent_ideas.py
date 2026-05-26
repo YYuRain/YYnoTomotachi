@@ -194,7 +194,7 @@ async def form_ideas(user_id: int) -> dict[str, Any]:
     ]
     existing_texts = [r[1] for r in existing_rows]
 
-    prompt = memory_prompts.render_form_ideas_dream(items, existing=existing_for_prompt)
+    prompt = memory_prompts.render_form_ideas_dream(items, existing=existing_for_prompt, user_id=user_id)
     try:
         data = await asyncio.wait_for(
             llm.chat_json(

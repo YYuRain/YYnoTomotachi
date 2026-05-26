@@ -194,9 +194,9 @@ async def _build_turn(
 
     # 1-4 并行：情绪判档 / 记忆召回 / 话题抽取 / 工具查询
     recent_snapshot = list(recent[-_SHORT_WINDOW * 2 :])
-    emotion_task = asyncio.create_task(emotion.detect(text_for_aux, recent=recent_snapshot))
+    emotion_task = asyncio.create_task(emotion.detect(text_for_aux, recent=recent_snapshot, user_id=user_id))
     memories_task = asyncio.create_task(_safe_recall(user_id, text_for_aux))
-    topics_task = asyncio.create_task(interests.extract_topics(text_for_aux))
+    topics_task = asyncio.create_task(interests.extract_topics(text_for_aux, user_id=user_id))
     # 2026-05-21：aux detect 路径退役——主 LLM 走 native tool_use 自己决定调工具。
     # 这里只保留 URL 自动路由（确定性，不需要 LLM 判断）。
     if user_text and tools._URL_RE.search(user_text):
@@ -532,9 +532,10 @@ async def generate_welcome(user_id: int) -> str:
         memories=[],
         interests_top=[],
         interests_cold=[],
+        user_id=user_id,
     )
     bits = [f"现在 {clock.now_signal()}"]
-    hint = "[" + "｜".join(bits) + "]\n\n" + prompts.WELCOME_OPENER_INSTRUCTIONS
+    hint = "[" + "｜".join(bits) + "]\n\n" + prompts.render_welcome_opener(user_id=user_id)
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": hint},
@@ -565,11 +566,12 @@ async def generate_opener(user_id: int, context: dict | None = None) -> str:
         user_id=user_id,
     )
     if context and context.get("mode") == "share_discovery" and context.get("share_item"):
-        hint = prompts.render_proactive_opener_share(context)
+        hint = prompts.render_proactive_opener_share(context, user_id=user_id)
     elif context:
-        hint = prompts.render_proactive_opener(context)
+        hint = prompts.render_proactive_opener(context, user_id=user_id)
     else:
-        hint = prompts.PROACTIVE_OPENER_INSTRUCTIONS
+        from . import prompt_loader as _pl
+        hint = _pl.load("chat_proactive_opener", user_id=user_id)
     bits = [f"现在 {clock.now_signal()}"]
     idle_sec = availability.seconds_since_last_interaction(user_id)
     if idle_sec != float("inf") and idle_sec > 30:

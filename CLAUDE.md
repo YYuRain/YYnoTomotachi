@@ -92,14 +92,15 @@ docker compose logs -f bot   # 看 ready
 | `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit 30 天 + wipe_backup 7 天)。所有 job 配 `max_instances=1 + coalesce + misfire_grace_time` 防重叠堆积 |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库）」「审计」 |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库 + 兴趣热度 + **Prompt 文件 per-user 整份覆写**）」「审计」 |
+| `src/prompt_loader.py` | 统一 prompt 入口：`load(name, user_id=None)` —— user_id 给定时优先返 `user_prompt_overrides` 表里的整份覆写；进程内 `(uid, name)` cache + `invalidate_user(uid, name)`，admin UI 改完立刻生效不重启 |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
 | `src/openrouter.py` | OpenAI 兼容客户端，主聊天（LLM_PROVIDER=openrouter）+ `scripts/eval_*`；走 Clash 代理 |
 
 ## 数据存储
 
-- **SQLite** `data/app.sqlite`（启动时启 WAL + busy_timeout=5000，多用户并发写不再 `database is locked`）：interests / reply_samples / last_interaction / `proactive_fires`（含 `mode`/`platform` 列，2026-05-21 加）/ persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀，含 active trigger 字段）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）。`storage._ensure_columns` 启动时自动 ALTER 兜底兼容旧 db
+- **SQLite** `data/app.sqlite`（启动时启 WAL + busy_timeout=5000，多用户并发写不再 `database is locked`）：interests / reply_samples / last_interaction / `proactive_fires`（含 `mode`/`platform` 列，2026-05-21 加）/ persona_snapshots（都带 `user_id`）+ `users` / `invite_codes` + **procedural memory**（LangMem 命名）：`prompt_overrides`（per-user 偏好沉淀**追加片段**，含 active trigger 字段）/ `user_prompt_overrides`（per-user 对 `prompt/*.md` 的**整份覆写**，2026-05-26 加，admin UI 调教 tab 编辑）/ `skills`（跨用户仓库 + `skill_creator` meta-skill）/ `pending_reach_messages`（active trigger 暂存）。`storage._ensure_columns` 启动时自动 ALTER 兜底兼容旧 db
 - **记忆栈** via **Postgres + pgvector + pg_trgm**：本地 `localhost:5432/memu`（容器 `memu-postgres`，名字沿用旧名以免 compose 改动）；compose 内是服务名 `postgres:5432`。表 `memories`（带 `entities TEXT[]` / `source_episode_id UUID` / `valid_to`）+ `episodes`（P0-4 raw turns provenance）+ `agent_ideas`（airi `come_up_ideas` pool，2026-05-25 加，含 `suggested_query` 给 share kind 用）
 - **HuggingFace 模型缓存**：本地 `~/.cache/huggingface/hub/models--BAAI--bge-small-zh-v1.5/`；镜像内烤进 `/opt/hf/bge-small-zh-v1.5/`（`EMBED_MODEL_NAME` 容器内绝对路径）
 - **本地状态文件**：`data/recent.json`（dict[uid, [12 轮]]）；`data/audit.YYYY-MM-DD.jsonl`（按日切，2026-05-25 起；admin UI 审计 tab 自动合并读所有 `audit.*.jsonl`；老 `audit.jsonl` 作历史保留；`daily_cleanup_job` 04:23 清 30 天前的）；`data/.webui_secret`（HMAC 共享密钥）；`data/wipe_backup_<uid>_<ts>/`（wipe_user 前 dump，保 7 天）
@@ -143,7 +144,7 @@ recall 返回时 `stale` 完全过滤、`to_verify` 带 `[待确认]` 前缀让�
 - **Hot path**（同步阻塞 turn）：`recall` 三路 RRF 融合 + 5.2 反验证。要求 < 200ms。
 - **Background**（异步 / cron）：flush 后的抽取入库、5.1 冲突检测、persona 演化、feedback agent、5.3 Auto Dream、active trigger 扫描。允许慢。
 
-**Procedural memory** = `prompt_overrides` + `skills` + `skill_creator` meta-skill —— 跟 `memories`（semantic/episodic）平级的一类记忆，admin UI 走「调教」tab。
+**Procedural memory** = `prompt_overrides`（追加片段）+ `user_prompt_overrides`（整份覆写 prompt/*.md，2026-05-26 加）+ `skills` + `skill_creator` meta-skill —— 跟 `memories`（semantic/episodic）平级的一类记忆，admin UI 走「调教」tab。整份覆写改完立刻生效（`prompt_loader.invalidate_user` 清进程 cache，无需重启）。
 
 ## Agent Reach 工具（2026-05-21 起，借 [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) 选型）
 

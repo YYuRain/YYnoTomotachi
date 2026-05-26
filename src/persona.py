@@ -152,8 +152,12 @@ def _render_dynamic_block(payload: dict[str, Any]) -> str:
 
 
 def load_persona_state(user_id: int) -> PersonaState:
-    """读 baseline body + 该用户最新动态段，合成完整 PersonaState。"""
-    base_body = settings().system_prompt_path.read_text(encoding="utf-8")
+    """读 baseline body + 该用户最新动态段，合成完整 PersonaState。
+
+    baseline 走 prompt_loader（支持 per-user 整份覆写 system_baseline.md）。
+    """
+    from . import prompt_loader
+    base_body = prompt_loader.load("system_baseline", user_id=user_id)
     payload = _load_latest_payload(user_id)
     dynamic = _render_dynamic_block(payload)
     body = base_body + ("\n\n" + dynamic if dynamic else "")
@@ -162,10 +166,13 @@ def load_persona_state(user_id: int) -> PersonaState:
 
 # ============ 增量更新（挂 memory.maybe_flush）============
 
-def _update_system_template() -> str:
-    """从 prompt/persona_update.md 加载（2026-05-21 抽出）。"""
+def _update_system_template(user_id: int | None = None) -> str:
+    """从 prompt/persona_update.md 加载（2026-05-21 抽出）。
+
+    user_id 可传——支持 per-user 覆写 persona_update.md（虽然较少这么干）。
+    """
     from . import prompt_loader
-    return prompt_loader.load("persona_update")
+    return prompt_loader.load("persona_update", user_id=user_id)
 
 
 def _format_messages(messages: list[dict[str, str]]) -> str:
@@ -193,7 +200,7 @@ async def update_state(user_id: int, messages_batch: list[dict[str, str]]) -> bo
         cur = _load_latest_payload(user_id)
         traits = cur.get("traits", {})
         recent_obs = [o.get("text", "") for o in (cur.get("observations") or [])[-MAX_OBSERVATIONS_KEEP:]]
-        sys_prompt = _update_system_template().format(
+        sys_prompt = _update_system_template(user_id=user_id).format(
             sarcasm=traits.get("sarcasm", 0.0),
             warmth=traits.get("warmth", 0.0),
             verbosity=traits.get("verbosity", 0.0),

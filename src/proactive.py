@@ -51,10 +51,10 @@ SHARE_DAILY_CAP_PER_PLATFORM = {           # 每日单平台上限
 
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 
-def _decide_system() -> str:
-    """从 prompt/proactive_decide.md 加载（2026-05-21 抽出）。"""
+def _decide_system(user_id: int | None = None) -> str:
+    """从 prompt/proactive_decide.md 加载（2026-05-21 抽出）；user_id 走 per-user 覆写。"""
     from . import prompt_loader
-    return prompt_loader.load("proactive_decide")
+    return prompt_loader.load("proactive_decide", user_id=user_id)
 
 
 def _today_range_utc() -> tuple[datetime, datetime]:
@@ -143,7 +143,7 @@ async def _select_share_item(
 
     # LLM 挑一条（aux tier 便宜 model 即可）
     from . import prompt_loader
-    sys_prompt = prompt_loader.load("proactive_share_select")
+    sys_prompt = prompt_loader.load("proactive_share_select", user_id=user_id)
     user_msg = json.dumps({
         "platform": platform,
         "query": query,
@@ -375,7 +375,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
     try:
         data = await llm.chat_json(
             [
-                {"role": "system", "content": _decide_system()},
+                {"role": "system", "content": _decide_system(user_id=user_id)},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=800,
