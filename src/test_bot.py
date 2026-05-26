@@ -294,11 +294,17 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     async def typing() -> None:
         await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 
+    # 把 telegram 的 reply（长按引用某条消息）翻译成 [对方在引用：xxx] 前缀
+    # 跟 prod bot 一致——之前 test_bot 漏处理，bot 看不到 user 引用了哪条消息
+    from .bot import _format_reply_quote
+    quote = _format_reply_quote(msg.reply_to_message)
+    user_text = f"{quote}\n{msg.text}" if quote else msg.text
+
     send_sticker = _make_send_sticker(ctx.bot, chat.id)
-    log.info("test_bot: real_chat=%d virtual_uid=%d msg=%r",
-             chat.id, uid, msg.text[:40])
+    log.info("test_bot: real_chat=%d virtual_uid=%d msg=%r has_quote=%s",
+             chat.id, uid, msg.text[:40], bool(quote))
     await agent.handle_user_message(
-        uid, msg.text,
+        uid, user_text,
         send=send, typing_action=typing, send_sticker=send_sticker,
     )
 
@@ -337,9 +343,14 @@ async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     async def typing() -> None:
         await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 
+    # 同上——图片也可能带 reply 引用
+    from .bot import _format_reply_quote
+    quote = _format_reply_quote(msg.reply_to_message)
+    user_text = f"{quote}\n{caption}".strip() if quote else caption
+
     send_sticker = _make_send_sticker(ctx.bot, chat.id)
     await agent.handle_user_message(
-        uid, caption,
+        uid, user_text,
         send=send, typing_action=typing,
         image_b64=img_b64, image_media_type=media_type,
         send_sticker=send_sticker,
