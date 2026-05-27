@@ -62,6 +62,50 @@ def _render_emotion(em: Optional[EmotionSignal], user_id: Optional[int] = None) 
     return ""
 
 
+def _render_pending_ideas(ideas: list[dict]) -> str:
+    """把 agent_ideas.list_pending 的结果渲染成"脑子里转过的几件事"。
+
+    注入位置：system prompt 末尾。意图是让 bot **不只是被 user 推着走**——
+    它有自己想说/想问/想分享的事，user 一开口就能从这里自然引出。
+
+    强护栏：
+    - 标明只是脑包内容，**不主动硬提**（避免 bot 每次都把 idea 念出来）
+    - 仅在自然切点出现：user 提到相关话题、user 来了个短开聊信号需要抛料
+    - 用完一条会被 mark used（这里只是 hint，真消费在 proactive_decide 路径）
+    """
+    if not ideas:
+        return ""
+    lines: list[str] = []
+    for it in ideas[:3]:
+        text = (it.get("text") or "").strip()
+        if not text:
+            continue
+        kind = (it.get("kind") or "").strip()
+        kind_label = {
+            "question": "想问",
+            "follow_up": "想跟进",
+            "observation": "观察",
+            "share": "想分享",
+        }.get(kind, "想到的")
+        lines.append(f"- [{kind_label}] {text}")
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        '\n\n# 你最近脑子里转过这几件事（脑包，不是 todo）\n'
+        '这些是你**自己**最近想到的、想跟对方聊的事——可能是想问 ta 的、想跟进的、'
+        '突然冒出的观察、想顺手分享的。这是给你看的脑包，**不是必须执行的任务**。\n\n'
+        f'{body}\n\n'
+        '**怎么用**：\n'
+        '- 对方聊到相关话题 → 自然带出来（「哦想起来」「我前几天还在想…」）\n'
+        '- 对方发短开聊信号（「嗨」「在吗」「好」）需要你抛料时 → 这里挑一条最自然的出口\n'
+        '- 对方在聊别的且没相关切点 → **别硬提**，留着下次\n'
+        '- 复述时**不要原话照搬**，用自己的口气抛出来，挑核心点说\n'
+        '- **不要复述对方的画像**（「你之前说你喜欢 X」）——那像在教育对方关于 ta 自己\n'
+        '- 同一条只抛一次，对方接了/绕开了就翻篇，**别反复刨**'
+    )
+
+
 def _render_stickers(tags: list[str]) -> str:
     if not tags:
         return ""
@@ -86,6 +130,7 @@ def build_system_prompt(
     tool_context: str = "",
     sticker_tags: Optional[list[str]] = None,
     user_id: Optional[int] = None,
+    pending_ideas: Optional[list[dict]] = None,
 ) -> str:
     body = persona.body
     mem_block = _render_memory(memories)
@@ -107,11 +152,14 @@ def build_system_prompt(
             + '\n（用自己的话自然提到就好，不要说"根据搜索结果"，只取对话里有用的部分。）'
         )
 
+    # 2026-05-27：注入 bot 自己脑包里"想说的事"——避免 user 短开聊信号时 bot 套嘘寒问暖
+    ideas_block = _render_pending_ideas(pending_ideas or [])
+
     # PRD：用户独立 prompt overrides——追加到末尾，不改 baseline
     user_overrides_block = _render_user_overrides(user_id) if user_id else ""
 
     return (body + interest_block + emotion_block + sticker_block
-            + role_block + tool_block + user_overrides_block)
+            + role_block + tool_block + ideas_block + user_overrides_block)
 
 
 def _render_user_overrides(user_id: int) -> str:

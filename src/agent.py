@@ -215,6 +215,14 @@ async def _build_turn(
 
     # 5. 拼 system prompt
     persona = load_persona_state(user_id)
+    # 把 bot 凌晨自己想到的"想说的事" pool 喂给 turn 里——避免 user 短开聊信号
+    # 时 bot 脑子空、套嘘寒问暖。失败/没数据返空，不阻塞主流。
+    try:
+        from . import agent_ideas
+        _pending_ideas = agent_ideas.list_pending(user_id, top_n=3)
+    except Exception as _e:
+        log.debug("list_pending err uid=%s: %s", user_id, _e)
+        _pending_ideas = []
     sys_prompt = prompts.build_system_prompt(
         persona=persona,
         memories=ctx["memories"],
@@ -223,6 +231,7 @@ async def _build_turn(
         emotion=ctx["emotion"],
         sticker_tags=stickers.available_tags(),
         user_id=user_id,
+        pending_ideas=_pending_ideas,
     )
 
     messages = [{"role": "system", "content": sys_prompt}]
