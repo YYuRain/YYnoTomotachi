@@ -495,6 +495,56 @@ def _gather_audit_excerpts(user_id: int, *, days: int = 7, max_chars: int = 12_0
     return out
 
 
+def _gather_prompt_changelog(days: int = 14) -> list[dict]:
+    """跑 git log 拉最近 N 天 prompt/*.md 的提交时间线。
+
+    返回 [{"ts", "hash", "message", "files": [...]}, ...] 新→旧。
+    给 reflection LLM 看用——它能据此对齐 audit 事件 vs prompt 修复时间，
+    避免把"修复前的翻车"当成"现在的 bug"重复写 issue。
+
+    git 不可用时返空 list（不挂）。
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [
+                "git", "log", f"--since={days} days ago",
+                "--pretty=format:%h|%ai|%s", "--name-only",
+                "--", "prompt/",
+            ],
+            cwd=str(settings().root),
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        log.debug("git log err: %s", e)
+        return []
+    if proc.returncode != 0:
+        log.debug("git log non-zero: %s", proc.stderr[:200])
+        return []
+    out: list[dict] = []
+    cur: dict | None = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            if cur:
+                out.append(cur)
+                cur = None
+            continue
+        if "|" in line and not line.startswith("prompt/"):
+            # commit header: hash|iso_ts|subject
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                if cur:
+                    out.append(cur)
+                cur = {"hash": parts[0], "ts": parts[1][:19], "message": parts[2], "files": []}
+                continue
+        if cur is not None and line.startswith("prompt/"):
+            cur["files"].append(line)
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _gather_persona_traits(user_id: int) -> dict[str, Any]:
     try:
         from . import persona
@@ -521,6 +571,7 @@ async def auto_dream_self_iterate(user_id: int) -> dict[str, Any]:
     # 1. 收集上下文
     try:
         excerpts = _gather_audit_excerpts(user_id, days=7, max_chars=12_000)
+        prompt_changelog = _gather_prompt_changelog(days=14)  # prompt 修改时间轴，对齐 audit 用
         active_overrides = [
             {"id": o.id, "text": o.text, "risk": o.risk_level, "trigger_kind": o.trigger_kind}
             for o in storage.list_active_overrides(user_id)
@@ -535,6 +586,17 @@ async def auto_dream_self_iterate(user_id: int) -> dict[str, Any]:
             {"id": sk.id, "name": sk.name, "summary": sk.summary, "usage_count": sk.usage_count}
             for sk in storage.list_skills(status="active", limit=200)
         ]
+        # 自治自身的修改时间线（自上次 dream 以来）——避免对自己刚改过的 prompt 反复重写
+        recent_self_edits = [
+            {
+                "ts": e.ts.isoformat() if e.ts else None,
+                "target_type": e.target_type,
+                "target_id": e.target_id,
+                "reason": e.reason[:120] if e.reason else None,
+                "rolled_back": bool(e.rolled_back),
+            }
+            for e in storage.list_self_edits(user_id=user_id, limit=20)
+        ]
     except Exception as e:
         log.exception("self_iterate ctx gather err uid=%s: %s", user_id, e)
         audit("agent_self_iterate_done", user_id=user_id, error=f"ctx_gather:{type(e).__name__}",
@@ -545,6 +607,8 @@ async def auto_dream_self_iterate(user_id: int) -> dict[str, Any]:
         "user_id": user_id,
         "now": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "audit_excerpts": excerpts,
+        "prompt_changelog": prompt_changelog,  # 14 天 prompt 修改时间线，对齐 audit 用
+        "recent_self_edits": recent_self_edits,  # 你自己最近做过的自改，避免重复改
         "active_overrides": active_overrides,
         "user_prompt_overrides": user_overrides,
         "persona_traits": persona_traits,
