@@ -505,14 +505,17 @@ def _gather_prompt_changelog(days: int = 14) -> list[dict]:
     git 不可用时返空 list（不挂）。
     """
     import subprocess
+    root = str(settings().root)
     try:
+        # `-c safe.directory=*` 处理容器内 .git 是 host 用户拥有的"dubious ownership"
         proc = subprocess.run(
             [
-                "git", "log", f"--since={days} days ago",
+                "git", "-c", f"safe.directory={root}",
+                "log", f"--since={days} days ago",
                 "--pretty=format:%h|%ai|%s", "--name-only",
                 "--", "prompt/",
             ],
-            cwd=str(settings().root),
+            cwd=root,
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:

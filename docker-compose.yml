@@ -51,6 +51,9 @@ services:
       # 2026-05-21 起 prompt/system_baseline.md 已在镜像里（COPY . .）；删了 stale mount
       - ./data/.xhs-cookie:/root/.xiaohongshu-cli   # xhs CLI (jackwener) cookie 持久化；rebuild 不丢
       - cf-shared:/shared:ro   # 读 cloudflared 写的 admin URL（/admin 命令用）
+      # 2026-05-28：agent_self.py L4 自治需要跑 git log 看 prompt 时间线（对齐 audit 事件）。
+      # .git 在 .dockerignore 里没烤进镜像；只读 mount 解决，给 reflection LLM 看 prompt 改了啥
+      - ./.git:/app/.git:ro
     # 不暴露端口；bot 是出站连接
 
   admin:

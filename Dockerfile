@@ -2,9 +2,9 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# 系统依赖：psycopg 编译 + curl + tzdata（设中国时区）
+# 系统依赖：psycopg 编译 + curl + tzdata（设中国时区）+ git（agent_self 拉 prompt 时间线用，2026-05-28 加）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev gcc curl ca-certificates tzdata \
+    libpq-dev gcc curl ca-certificates tzdata git \
     && rm -rf /var/lib/apt/lists/*
 
 # 注：之前考虑过装 gh CLI，但 v2.x 之后强制 auth（公开仓库 anon API 也要 GH_TOKEN）；
