@@ -199,7 +199,7 @@ async def form_ideas(user_id: int) -> dict[str, Any]:
         data = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main",
+                tier="reflection",  # opus：bot 自己想"想做的事"——判断质量直接影响后续 N 天 opener
                 max_tokens=2000,
             ),
             timeout=FORM_IDEAS_TIMEOUT_SEC,

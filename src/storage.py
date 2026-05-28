@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from sqlalchemy import (
-    BigInteger, Column, DateTime, Float, Index, Integer, PrimaryKeyConstraint,
+    BigInteger, Boolean, Column, DateTime, Float, Index, Integer, PrimaryKeyConstraint,
     String, Text, create_engine, event,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -160,6 +160,39 @@ class UserPromptOverride(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = Column(BigInteger, nullable=True)  # admin chat_id（admin 改他人时记录）
     __table_args__ = (PrimaryKeyConstraint("user_id", "name"),)
+
+
+class AgentSelfEdit(Base):
+    """L4 自治：bot 在 dream cron 自主修改的全部记录——admin 可 rollback。
+
+    target_type ∈ {prompt | skill_add | skill_edit | skill_disable | issue}
+    target_id：
+      - prompt: prompt name（不带 .md），user_id 必填，决定改的是谁的 user_prompt_overrides
+      - skill_*: skills.id（str）；user_id null（跨用户）
+      - issue: 在 me/agent_issues.md 的 anchor id；user_id 可选（issue 关联 user）
+    before_content / after_content：
+      - prompt: user_prompt_overrides.content 的 before/after
+      - skill_add: before=null / after=body
+      - skill_edit: before/after = body
+      - skill_disable: before=status='active' / after=status='disabled'
+      - issue: before=null / after=markdown body
+    """
+    __tablename__ = "agent_self_edits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    user_id = Column(BigInteger, nullable=True, index=True)
+    target_type = Column(String, nullable=False)
+    target_id = Column(String, nullable=True)
+    before_content = Column(Text, nullable=True)
+    after_content = Column(Text, nullable=True)
+    reason = Column(Text, nullable=False)
+    rolled_back = Column(Boolean, nullable=False, default=False)
+    rolled_back_at = Column(DateTime, nullable=True)
+    rolled_back_by = Column(BigInteger, nullable=True)
+    __table_args__ = (
+        Index("ix_agent_self_edits_user_ts", "user_id", "ts"),
+        Index("ix_agent_self_edits_type_ts", "target_type", "ts"),
+    )
 
 
 class Skill(Base):
@@ -520,6 +553,103 @@ def set_skill_status(skill_id: int, status: str) -> bool:
         sk.status = status
         s.commit()
         return True
+
+
+def update_skill(skill_id: int, *, summary: str | None = None, body: str | None = None) -> bool:
+    """edit 现存 skill 的 summary / body。返回是否找到了这条 skill。"""
+    with session() as s:
+        sk = s.query(Skill).filter(Skill.id == skill_id).first()
+        if sk is None:
+            return False
+        if summary is not None:
+            sk.summary = summary
+        if body is not None:
+            sk.body = body
+        s.commit()
+        return True
+
+
+# ----- agent_self_edits -----
+
+def record_self_edit(
+    *,
+    user_id: int | None,
+    target_type: str,
+    target_id: str | None,
+    before_content: str | None,
+    after_content: str | None,
+    reason: str,
+) -> int:
+    if target_type not in ("prompt", "skill_add", "skill_edit", "skill_disable", "issue"):
+        raise ValueError(f"bad target_type: {target_type}")
+    with session() as s:
+        e = AgentSelfEdit(
+            user_id=user_id,
+            target_type=target_type,
+            target_id=target_id,
+            before_content=before_content,
+            after_content=after_content,
+            reason=reason,
+            ts=datetime.utcnow(),
+            rolled_back=False,
+        )
+        s.add(e)
+        s.commit()
+        return int(e.id)
+
+
+def list_self_edits(
+    *,
+    user_id: int | None = None,
+    target_type: str | None = None,
+    include_rolled_back: bool = True,
+    limit: int = 100,
+) -> list[AgentSelfEdit]:
+    with session() as s:
+        q = s.query(AgentSelfEdit)
+        if user_id is not None:
+            q = q.filter(AgentSelfEdit.user_id == user_id)
+        if target_type:
+            q = q.filter(AgentSelfEdit.target_type == target_type)
+        if not include_rolled_back:
+            q = q.filter(AgentSelfEdit.rolled_back.is_(False))
+        return list(q.order_by(AgentSelfEdit.ts.desc()).limit(limit).all())
+
+
+def get_self_edit(edit_id: int) -> AgentSelfEdit | None:
+    with session() as s:
+        return s.query(AgentSelfEdit).filter(AgentSelfEdit.id == edit_id).first()
+
+
+def mark_self_edit_rolled_back(edit_id: int, *, by_uid: int) -> bool:
+    with session() as s:
+        e = s.query(AgentSelfEdit).filter(AgentSelfEdit.id == edit_id).first()
+        if e is None or e.rolled_back:
+            return False
+        e.rolled_back = True
+        e.rolled_back_at = datetime.utcnow()
+        e.rolled_back_by = by_uid
+        s.commit()
+        return True
+
+
+def count_recent_prompt_edits(user_id: int, name: str, *, days: int = 7) -> int:
+    """近 N 天内对 (user, prompt name) 自动 edit 的数量——rate limit 用。
+    只数未 rolled_back 的。"""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    with session() as s:
+        return int(
+            s.query(AgentSelfEdit)
+            .filter(
+                AgentSelfEdit.user_id == user_id,
+                AgentSelfEdit.target_type == "prompt",
+                AgentSelfEdit.target_id == name,
+                AgentSelfEdit.ts >= cutoff,
+                AgentSelfEdit.rolled_back.is_(False),
+            )
+            .count()
+        )
 
 
 # ----- user_prompt_overrides -----
