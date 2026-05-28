@@ -7,6 +7,23 @@
 
 ---
 
+## 2026-05-27 — 嘘寒问暖 → 直男锁话题 → 矫揉造作 → welcome 复述 / 自爆 AI（一日内四轮迭代）
+
+**触发**：当日测试反馈连环——bot 收到 user 简短开聊（"好"/"hi"）就回"昨晚睡得还行吗"/"去吃饭了吗"老妈子模式；user 说"用电脑"bot 锁定"工作"硬追；过度补正后变成诗朗诵腔（"像推开一扇不知道通向哪的门"）；welcome 后 user 说"你好" bot 完整复述 welcome；user 戳"为什么重复了"bot 自爆"那是系统自动带的开场白"。
+
+**改动**（按 commit 时间顺序，全部走 prompt 文件层）：
+
+1. `158f0d6` 修嘘寒问暖式开场——`system_baseline.md` 反应规则表加一档"用户极简开聊信号"明禁睡得好/吃了吗/在干嘛；`chat_role_discipline.md` 加段"不要嘘寒问暖型开场（极其重要）"列禁忌问候清单 + ✅替代示例；`agent.py + prompts.py` normal turn 也喂 `pending_ideas`（top-3 from `agent_ideas` pool）给 system prompt，让 bot 脑子里"有想说的事"对应短开聊。
+2. `af8cb74` 防直男锁话题 + INFP/ENFJ tilt + 玩梗——加段"不要从一个细节锁死话题硬追"（"用电脑"≠上班、"刚回来"≠下班）；加段"被戳穿/被嫌弃/被怼之后怎么办"（不补救不嘴硬，承认+立刻翻篇）；baseline 试加 INFP/ENFJ 标签 + 玩梗清单。
+3. `f2040c6` **回退**——LLM 把上一轮的具体例句（"邀请码这玩意儿听着像 90 年代某种秘密俱乐部"）和 INFP 标签直接当模板表演，输出诗朗诵。删 INFP/ENFJ 段 + 玩梗清单 + welcome 5 种角度示例；改成"不要表演细腻"反例段把诗朗诵句列为禁忌。教训：**给 LLM 的具体例句容易直接被 copy；越文艺越花哨越被表演**。
+4. `a751a65` welcome 解禁 sticker + 防复述 welcome / 防自爆 AI——`chat_welcome_opener.md` 删"不带表情包标记"改成可贴 1 个 sticker；`chat_role_discipline.md` 加段"不要复述自己刚说的话（welcome / opener 之后）"列已发生的复述翻车样例；加段"不要暴露系统/自动/开场白等技术内部"明禁"系统自动""默认模板""我是 chatbot"，正确反应=当成自己手滑/走神。
+
+**生效**：`prompt_loader` 重启即生效（容器 recreate 自然清 lru_cache）。
+
+**余热**：5/28 L4 自治第一轮跑出来后由 reflection LLM 自己补了一条 per-user `chat_proactive_opener_with_ctx` 覆写（"惜字如金者识别 + 低能量模式"）——详见 `document/agent-self-iterate.md`，不在此重复。
+
+---
+
 ## 2026-05-13 — 用户激活后 AI 生成开场白（welcome opener）
 
 **触发**：上云后多人邀请制——一个新用户走完 `/start <code>` 激活后，仅有"搞定，可以聊了"的系统提示太干，对方很容易想不出说啥然后不聊了。

@@ -48,12 +48,14 @@ TELEGRAM_PROXY=                          # HK/海外服务器留空（直连 Tel
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=anthropic/claude-sonnet-4.6
+OPENROUTER_MODEL_REFLECTION=anthropic/claude-opus-4.7  # 可选；空走代码默认。dream/form_ideas/self_iterate 走这个 tier
 JINA_API_KEY=jina_...                    # 可选，没填会退到 Exa
 MEMU_DB_URL=postgresql+psycopg://postgres:postgres@postgres:5432/memu
 MEMU_CHAT_MODEL=deepseek/deepseek-v4-flash
 ADMIN_UI_USER=<env 凭证用户名，备用，登录主路径已不用密码>
 ADMIN_UI_PASSWORD=<env 凭证密码>
 # ADMIN_UI_DEV_NO_AUTH=1   # 仅本地 dev！容器/生产**绝不**设这个，否则裸奔到公网
+# AGENT_SELF_ITERATE_ENABLED=1 # L4 自治总开关；2026-05-28 起默认开。设 0 关掉所有自改
 TEST_BOT_TOKEN=                          # 可选，第二个 bot 用于多用户模拟
 ```
 

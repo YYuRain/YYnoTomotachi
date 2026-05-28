@@ -47,9 +47,10 @@
 │   │                               └─► _fire_conflict_check (PRD 5.1 异步) │
 │   │                               └─► _fire_feedback_check (sub-agent 沉淀 user 偏好) │
 │   ├─ persona_consolidate    每日 03:07 (CST) per user 衰减/清旧观察│
-│   ├─ auto_dream             每日 03:13 (CST) 5 段流水：5.3 三态判定 / override 整理 / │
-│   │                                insight 生成 P1-6（含 cosine 写入去重）/ │
-│   │                                form_ideas（agent_ideas pool / airi 借鉴）/ skill 库整理│
+│   ├─ auto_dream             每日 03:13 (CST) 6 段流水（per-user 5 段 + 全局 1 段）：│
+│   │                                5.3 三态判定 / override 整理 / insight P1-6（cosine 去重） / │
+│   │                                form_ideas / **agent self_iterate (L4 自治，2026-05-28)** /  │
+│   │                                skill 库整理；反思类 LLM 全部走 reflection tier (opus-4.7) │
 │   ├─ proactive_job          每 25m per user 软概率门 + LLM 决策 │
 │   │                                └─► decide(uid) → mode={topic_chat|share_discovery}, │
 │   │                                    consumed_idea_id（采纳 agent_ideas 一条） │
@@ -96,11 +97,12 @@
 | `src/prompts.py` | 装配 system prompt（baseline + memory + interests + emotion directive + role discipline + tool ctx + per-user overrides）。文本走 `prompt_loader` 从 `prompt/chat_*.md` 加载 | ✅ MVP（prompt 抽离 2026-05-21） |
 | `src/rhythm.py` | 剥 markdown + 按标点切短 + 打字模拟 | ✅ MVP |
 | `src/agent.py` | turn 流水线（含 vision multimodal、表情包发送）+ `generate_opener` + `record_proactive_message`（proactive/welcome/triggered_reach 直发后写 `_recent` 让下轮上下文看见）+ `pop_pending_reach_for_merge`（active trigger 暂存内容拼进 user 消息）；`_recent` 持久化到 `data/recent.json`（重启接续短期上下文） | ✅ MVP |
-| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit + wipe_backup)。所有 job 配 `max_instances=1 + coalesce=True + misfire_grace_time` 防重叠堆积 | ✅ MVP |
-| `src/agent_ideas.py` | bot 凌晨自主形成"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 sonnet 看最近事实写 0-5 条 idea；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 | ✅ 接入（2026-05-25）|
+| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit + wipe_backup)。所有 job 配 `max_instances=1 + coalesce=True + misfire_grace_time`。auto_dream per-user 5 段（auto_dream / overrides / insights / form_ideas / **self_iterate** L4）+ 全局 1 段 (skills) | ✅ MVP |
+| `src/agent_ideas.py` | bot 凌晨自主形成"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 reflection LLM (opus) 看最近事实写 0-5 条 idea；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 | ✅ 接入（2026-05-25）|
+| `src/agent_self.py` | **L4 自治**（2026-05-28）：bot 在 dream cron 跑 reflection LLM (opus) 自改 per-user prompt / skill / 写 issue。6 工具 + 硬护栏（PROTECTED 片段不可删）+ rate limit（5 edits/run, 3 改/prompt/周）+ rollback。详见 `document/agent-self-iterate.md` | ✅ 接入（2026-05-28）|
 | `src/bot.py` | 主 bot：邀请码准入门、命令 `/start /myid /memory /invite /users`、激活后调 `agent.generate_welcome` 发开场白；text + photo handler；`send_sticker` 回调 | ✅ MVP |
 | `src/main.py` | 统一启动/关停（embed_server + prod bot + 可选 test bot + scheduler）；`DEV_SKIP_PROD_BOT=1` 时跳过 prod bot 让本地不抢云端 polling | ✅ MVP |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应 | ✅ MVP |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码，靠 Telegram `/memory` 一键登录链接）；按 viewer 区分（admin 看全部 + 下拉切换、普通用户只看自己）；移动端卡片自适应；五个 tab：记忆项 / 图谱 / 调教（pending/active overrides + skill + 兴趣 + **Prompt 文件 per-user 覆写**）/ **Agent 自治**（self-edits + issues inbox + 手动触发，2026-05-28）/ 审计 | ✅ MVP |
 | `src/agent.py::generate_welcome` | 用户邀请码激活后立刻生成的"拉对方进对话"第一条消息 | ✅ 接入（2026-05-13） |
 | `src/feedback_prompts.py` / `src/feedback_agent.py` | Sonnet 子 agent + skill 库（仓库语义）——监听用户偏好/不满/能力诉求信号，沉淀 prompt_overrides；硬护栏双层防 jailbreak；capability_request 走 skill_creator 输出 trigger-based 指令 | ✅ 接入（2026-05-19） |
 | `src/triggered_reach.py` | active trigger 通道：cron 定时扫 → sonnet 判 condition + 生成消息 → user 在聊就暂存等下轮融入，否则直发；不走 proactive 冷却 | ✅ 接入（2026-05-19） |

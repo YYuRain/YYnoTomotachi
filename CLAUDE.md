@@ -83,7 +83,7 @@ docker compose logs -f bot   # 看 ready
 | `src/agent_ideas.py` | bot 凌晨自主"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 sonnet 看最近事实写 0-5 条；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 |
 | `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
 | `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
-| `src/agent_self.py` | **L4 自治**（2026-05-28 加，`agent-l4` 分支）：bot 在 dream cron 自主迭代 prompt/skill/写 issue。reflection tier (opus) + 6 工具（read_source/apply_prompt_edit/apply_skill_*/write_agent_issue）+ hard guardrails（PROTECTED 片段不可删）+ rate limits（5 edits/run，3 改/prompt/周）+ rollback（admin webUI）。详见 `document/agent-self-iterate.md` |
+| `src/agent_self.py` | **L4 自治**（2026-05-28 加，已 merge 到 main）：bot 在 dream cron 自主迭代 prompt/skill/写 issue。reflection tier (opus-4.7) + 6 工具（read_source/apply_prompt_edit/apply_skill_*/write_agent_issue）+ hard guardrails（PROTECTED 片段不可删）+ rate limits（5 edits/run，3 改/prompt/周）+ rollback（admin webUI）+ ctx 喂 prompt_changelog (git log) / recent_self_edits 让 LLM 时间轴对齐 audit。容器需 mount `./.git:/app/.git:ro` + `./me:/app/me`。详见 `document/agent-self-iterate.md` |
 | `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |

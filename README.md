@@ -38,7 +38,7 @@
 **多个人用同一个 bot 互不干扰。** 邀请制（5–50 人）；admin 用 `/invite` 生成邀请码、`/users` 看注册列表；每个用户的记忆 / 兴趣 / 持久化 _recent / 偏好 overrides 全部独立按 `user_id` 隔离。
 （实现：`src/users.py` 邀请码 + 准入；所有 SQLite 表带 `user_id` 列；scheduler 各 job `asyncio.gather` 遍历活跃用户；可选 `TEST_BOT_TOKEN` 跑第二个 test bot 一个 telegram 账户扮演多虚拟用户调试）
 
-**有 webUI 看记忆 + 调教。** Bot 发 `/memory` 拿一键登录链接（HMAC token URL，10 min 有效）→ 进 admin UI 四个 tab：记忆项 / 图谱（D3 force-directed depends_on 关系图）/ 调教（pending overrides 审核 + active trigger 配置 + skill 库）/ 审计（所有事件流）。admin 看全部 + 下拉切，普通用户只看自己。
+**有 webUI 看记忆 + 调教。** Bot 发 `/memory` 拿一键登录链接（HMAC token URL，10 min 有效）→ 进 admin UI 五个 tab：记忆项 / 图谱（D3 force-directed depends_on 关系图）/ 调教（pending overrides 审核 + active trigger 配置 + skill 库 + 兴趣热度 + Prompt 文件 per-user 整份覆写）/ Agent 自治（L4 self-edits + issues inbox + 手动触发，2026-05-28 加）/ 审计（所有事件流）。admin 看全部 + 下拉切，普通用户只看自己。
 （实现：`src/admin_ui.py` FastAPI :18081；HMAC cookie session 无密码登录）
 
 ---
@@ -165,7 +165,7 @@ docker compose logs -f bot
 | `src/tools.py` | 5 工具 + URL 自动路由（小红书/B站/YouTube → 对应 CLI；其他 → Jina Reader） |
 | `src/prompts.py` / `prompt_loader.py` | system prompt 装配 + `prompt/*.md` 扁平加载（26 个 prompt） |
 | `src/storage.py` | SQLite 表 + 启动 ALTER 兜底（自动补新增 nullable 列） |
-| `src/admin_ui.py` | webUI :18081（4 tab：记忆 / 图谱 / 调教 / 审计） |
+| `src/admin_ui.py` | webUI :18081（5 tab：记忆 / 图谱 / 调教 / Agent 自治 / 审计） |
 | `src/scheduler.py` | APScheduler 7 个 job |
 | `src/clock.py` / `stickers.py` / `rhythm.py` / `interests.py` / `availability.py` / `emotion.py` | 时间感 / 表情包 / 拆短句 / 兴趣热度 / 活跃曲线 / 情绪四档 |
 

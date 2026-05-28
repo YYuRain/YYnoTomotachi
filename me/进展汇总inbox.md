@@ -190,3 +190,52 @@
 - `document/deployment.md` port 改 127.0.0.1 + ADMIN_UI_DEV_NO_AUTH 注释
 - `document/extension-points.md` 新加 agent_ideas pool 整段
 - 同步顺手清掉 `me/进展汇总inbox` 同名空文件（同名 .md 才是真 inbox）
+
+---
+
+## 2026-05-26
+
+### per-user prompt 整份覆写（commit 38959fb）
+
+补 admin 一直缺的杠杆——之前 prompt_overrides 表只能"在 system prompt 末尾追加片段"，无法改 baseline / 任意 prompt 主体。
+
+- **新表 `user_prompt_overrides`**（SQLite）：`(user_id, name)` 复合主键 / `content` / `updated_at` / `updated_by`。`wipe_user` 反射机制自动清
+- **`prompt_loader` 改两层**：`_load_default(name)` 走 lru_cache 读默认文件；`load(name, user_id=None)` 优先查 user override（带进程内 `(uid, name)` cache + sentinel for None）；`invalidate_user(uid, name)` admin 改完立刻清 cache 不重启
+- **9 个 caller 全串 user_id**：prompts / persona / emotion / interests / proactive / feedback_prompts / memory_prompts / agent_ideas / agent；persona baseline `system_prompt_path.read_text()` 改走 loader（之前裸读绕过覆写）
+- **admin UI** 调教 tab 加第 5 个 section「Prompt 文件」：列全 26 个 prompt + 状态（默认 / 自定义），点编辑 dual-textarea modal（左 default 只读、右 user 可编辑、解析并显示 `.format()` 占位符防漏），Save / 恢复默认按钮
+- **4 个新路由**：`GET /api/prompts` / `GET /api/prompts/{name}` / `PUT /api/prompts/{name}` / `DELETE /api/prompts/{name}`，PUT 需 `Body(...)` 显式 + module-level `PromptPutBody`（function 内 BaseModel pydantic v2 ForwardRef 解析失败的坑）
+- **审计**：`prompt_override_set` / `prompt_override_deleted` 事件
+
+为 5/28 L4 自治打地基——self_iterate 自改时直接 `set_user_prompt_override` + `invalidate_user`。
+
+### sticker 解禁 welcome（commit a751a65 一部分）
+
+`chat_welcome_opener.md` 删"不带表情包标记"限制——welcome 现在能贴 1 个 sticker 了。
+
+## 2026-05-27
+
+### 嘘寒问暖 → 直男 → 矫揉造作 → 复述 / 自爆 AI（一日内四轮 prompt 调优）
+
+实测发现的连环问题，commit 158f0d6 / af8cb74 / f2040c6 / a751a65 四轮迭代。详见 `document/dialog-tuning-log.md`。教训：**给 LLM 的具体例句容易直接被 copy；越文艺越花哨越被表演**。
+
+## 2026-05-28
+
+### L4 Agent Autonomy（commit 6118e5b → main 合 8747450 + 后续修补 a424fe2 / eb21bb8 / d7779e2 / d715dbd）
+
+bot 在凌晨 dream cron 自主调 reflection LLM (opus-4.7) 反思最近 7 天对话，自改 per-user prompt / 加改停 skill / 写 issue 给 admin——**不走审批门**，admin 在 webUI 一键 rollback。
+
+- **新模块 `src/agent_self.py`**（~700 行）：常量（PROTECTED 片段 regex / allowlist / denylist）+ 6 工具（read_source / apply_prompt_edit / apply_skill_*×3 / write_agent_issue）+ rollback + dream 段 + tool schemas + dispatcher（user_id 强制注入，LLM 不能改别人 prompt）
+- **新表 `agent_self_edits`**：before/after 快照 + rolled_back 标记，admin rollback 按表回退
+- **新 LLM tier `reflection`**：env `OPENROUTER_MODEL_REFLECTION`（默认 `anthropic/claude-opus-4.7`）；6 处反思路径切到这个 tier（auto_dream / overrides / insights / skills / form_ideas / self_iterate）。opus-4.7 实际 $5/$25 per MT，仅是 sonnet 的 1.7x（早期估的 5x 高估了）
+- **scheduler.auto_dream_job 5 → 6 段** per-user，加 `auto_dream_self_iterate(uid)` 放最后（先有 ideas 再决定改自己）
+- **新 prompt `prompt/agent_self_iterate.md`**：核心 KPI"对方还想接你下一句吗"+ 7 条观察重点 + 6 工具说明 + hard rules + 时间轴对齐说明
+- **新文件 `me/agent_issues.md`**：bot append-only issue inbox
+- **admin UI 第 5 个顶级 tab「Agent 自治」**：最近 self-edits + rollback / Issues inbox / 手动触发；4 路由
+- **容器基础设施**：docker-compose mount `./.git:/app/.git:ro`（agent_self 跑 git log 用）+ `./me:/app/me`（bot 写、admin 读，跨容器共享，防 recreate 丢历史）；Dockerfile 装 git；代码用 `git -c safe.directory=/app log` 绕容器内 dubious ownership
+- **HK 实测两轮**：第一轮 6 round / 1 edit + 1 误报 issue（opus 看到 5/27 修复部署前的翻车当还在的 bug）→ 修补 `_gather_prompt_changelog` 喂 14 天 git log + `recent_self_edits` 给 ctx → 第二轮 3 round / 0 edit / 0 issue（opus 正确识别"修复线之前的事=已修"，主动沉默）。设计落地，prompt 时间轴对齐避误报
+
+详见 `document/agent-self-iterate.md`。
+
+### admin UI 看不到 issue（compose mount 修复，commit d715dbd）
+
+部署后发现 admin webUI 「Agent 自治」tab Issues inbox 空——bot 写 `me/agent_issues.md` 写在 bot 容器自己的镜像层，admin 容器有独立副本，两边没共享，外加 bot recreate 时 issue 丢失。修：bot 挂 `./me:/app/me`（rw）/ admin 挂 `./me:/app/me:ro`（ro）。两容器现在 md5 一致。

@@ -71,7 +71,7 @@ INFO __main__: ready
 nohup .venv/bin/python -m scripts.admin > data/admin.log 2>&1 & disown
 ```
 
-浏览器打开 http://127.0.0.1:18081 ——四个 tab：记忆项 / 图谱（D3） / 调教（pending/active overrides + skill 库） / 审计。
+浏览器打开 http://127.0.0.1:18081 ——五个 tab：记忆项 / 图谱（D3） / 调教（pending/active overrides + skill 库 + 兴趣热度 + Prompt 文件 per-user 覆写）/ Agent 自治（L4 self-edits 列表 + 一键 rollback + issues inbox + 手动触发，2026-05-28 加）/ 审计。
 
 **鉴权**：除非显式设 `ADMIN_UI_DEV_NO_AUTH=1`，否则必须有 session cookie——
 开发模式可设 env 跳过；或正常走 Telegram `/memory` 命令拿一次性登录链接。

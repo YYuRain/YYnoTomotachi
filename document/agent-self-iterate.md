@@ -10,7 +10,7 @@
 |---|---|---|
 | 作用域 | per-user | 写到 `user_prompt_overrides`，每个用户独立分流；不动 `prompt/*.md` 文件本体；不能改其他 user 的 prompt |
 | 触发 | dream cron 03:13 + admin 手动按钮 | 不接 hot path，避免 prompt injection 顺势让 user 改 bot；不影响对话延迟 |
-| LLM tier | reflection（默认 opus-4.7） | 反思类判断质量天花板更高；频率低（1/日），5x 单价仍可控 |
+| LLM tier | reflection（默认 opus-4.7） | 反思类判断质量天花板更高；opus-4.7 实际单价 $5/$25 per MT，仅是 sonnet（$3/$15）的 ~1.7x（早期估计 5x 高估了） |
 | 代码读权限 | `src/` `prompt/` `document/` 可读；`.env` `data/` `.git` 严禁 | bot 能"看自己怎么实现的"+"看 prompt 现状"，但拿不到密钥 / 用户数据 |
 | 审批 | 无（L4 跳审批） | 高速度迭代；用 rollback + audit + rate limit 兜底 |
 
@@ -18,7 +18,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `src/agent_self.py` | 核心模块——常量 / apply_* 工具 / read_source / write_agent_issue / rollback / dream 段 / tool schemas |
+| `src/agent_self.py` | 核心模块——常量 / apply_* 工具 / read_source / write_agent_issue / rollback / dream 段 / tool schemas / `_gather_audit_excerpts` / `_gather_prompt_changelog`（git log）|
 | `src/storage.py::AgentSelfEdit` | 表，记录每条自改的 before/after 快照 |
 | `src/storage.py` 4 个 helper | record_self_edit / list_self_edits / get_self_edit / mark_self_edit_rolled_back / count_recent_prompt_edits |
 | `src/scheduler.py::auto_dream_job` | per-user 第 5 段调 `agent_self.auto_dream_self_iterate(uid)` |
@@ -44,9 +44,9 @@
 ```python
 MAX_SELF_EDITS_PER_RUN = 5                       # 单 user 单次 dream 最多 5 个 apply_*
 MAX_PROMPT_EDITS_PER_NAME_PER_WEEK = 3           # 单 user 同 prompt 7 天内最多 3 改
-DREAM_LLM_OUTPUT_TOKEN_BUDGET = 4000             # 单轮 LLM 输出上限
+DREAM_LLM_OUTPUT_TOKEN_BUDGET = 16000            # 单轮 LLM 输出上限——整份 prompt 替换可能 8k+ tokens（4000 实测被截断成 args={}）
 DREAM_TOOL_LOOP_MAX_ROUNDS = 6                   # tool loop 最多 6 轮
-DREAM_TIMEOUT_SEC_PER_ROUND = 90                 # 单轮 LLM 调用 90s 超时
+DREAM_TIMEOUT_SEC_PER_ROUND = 180                # 单轮 LLM 调用 180s 超时（reflection tier 一轮 30-90s）
 READ_MAX_BYTES = 100_000                         # read_source 单文件上限
 
 PROTECTED_PROMPT_FRAGMENTS = (                   # 改后内容必须仍命中这些 regex
@@ -64,6 +64,34 @@ READ_DENY_PATTERNS = (
 ```
 
 被拒绝的 apply 写 audit `agent_self_edit_denied`，记 reason；不抛异常、不算入 edit count。
+
+## reflection LLM 看到的上下文（ctx_payload）
+
+每次 dream 跑前 agent_self 收集这些字段塞 user message JSON：
+
+| 字段 | 来源 | 用途 |
+|---|---|---|
+| `audit_excerpts` | `_gather_audit_excerpts(uid, days=7, max_chars=12_000)` 抽样 user_msg / assistant_reply / proactive_decision / proactive_opener_generated 等事件 | 看最近怎么聊的 |
+| `prompt_changelog` | `_gather_prompt_changelog(days=14)` 跑 git log 拉 prompt/* 提交时间线 | **时间轴对齐**——某条翻车的 ts 早于相关 prompt commit ts → 已修，不要重复写 issue |
+| `recent_self_edits` | `storage.list_self_edits(user_id=uid, limit=20)` | 看自己最近改过啥，避免反复改同一处 |
+| `active_overrides` | `storage.list_active_overrides(uid)` | feedback agent 沉淀的追加片段 |
+| `user_prompt_overrides` | `storage.list_user_prompt_overrides(uid)` | 当前 user 的 prompt 整份覆写列表 |
+| `persona_traits` | `persona.load_persona_state(uid).extras` | 对该 user 的 sarcasm/warmth/verbosity 分数 |
+| `available_prompts` | `prompt_loader.list_default_prompt_names()` | 26 个可改的 prompt name |
+| `active_skills` | `storage.list_skills(status="active", limit=200)` | skill 库（id/name/summary） |
+
+**`prompt_changelog` 是抗误报的关键**——5/28 实测：opus 第一轮没拿到 changelog 时把 5/27 11:24（修复部署前）的翻车当"现在还有的 bug"写了 high severity issue；加上 changelog 后第二轮正确判断"修复线之前的事=已修"，**主动沉默不操作**。
+
+## 容器基础设施
+
+agent_self 跑在 bot 容器里，需要这两个 host mount 才能正常工作：
+
+| mount | 用途 | 不挂会怎样 |
+|---|---|---|
+| `./.git:/app/.git:ro` | `_gather_prompt_changelog` 跑 `git log` 用 | git log 失败 → opus 看不到 prompt 时间轴 → 同 5/28 第一轮误报 |
+| `./me:/app/me`（rw 给 bot，ro 给 admin） | `write_agent_issue` 写 `me/agent_issues.md`；admin webUI 读它 | bot 写入只在自己镜像层；admin 容器看不到；bot recreate 丢历史 |
+
+外加 Dockerfile 装了 `git`（apt），代码用 `git -c safe.directory=/app log` 绕容器内 dubious ownership 检查。
 
 ## 模型 tier
 
@@ -146,7 +174,8 @@ print(res)  # 期望 ok=False, denied_reason 含 protected fragment
 |---|---|
 | Prompt injection 通过 user 对话进入 dream | dream 看的是 audit 摘要不是 raw user 消息；audit_excerpts 函数过滤 + 截断；保护片段强制保留 |
 | LLM 误判改坏 prompt | rate limit + admin rollback + audit；admin issue inbox 能 catch 异常行为 |
-| opus 成本超标 | 单次 dream 输出 ≤ 4k tokens；5 edits / run 上限；每周每 prompt 3 改上限 |
+| opus 成本超标 | 单次 dream 输出 ≤ 16k tokens；5 edits / run 上限；每周每 prompt 3 改上限。实测一轮 6 round ≈ 75k input + 12k output ≈ $0.55 |
+| opus 区域限制 403 | OpenRouter 偶发"This model is not available in your region"——bot 容器走 mihomo 出美区已部分缓解；error 进 audit `agent_self_iterate_llm_err`，自动跳过该 round 不阻塞 |
 | 多用户并发撑爆 OpenRouter rate limit | scheduler 已有 `_fan_out` Semaphore(5) + 300ms inter-task；reflection tier 沿用 |
 | bot 反复改 prompt 让人格漂移 | rollback + audit；保护片段防核心人设漂移；每周 limit 自然减速 |
 | read_source path traversal | 解析为绝对路径 + 检查在 ALLOWED_DIRS 下 + 查 DENY_PATTERNS |

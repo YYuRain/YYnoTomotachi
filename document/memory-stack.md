@@ -188,14 +188,27 @@ audit memory_recall 加 candidates_per_path（cosine/ngram/entity 各路命中�
    │   │
    │   ▼
    │   抽样最近 30 天 profile + event；拉近 14 天现存 idea（open + used）作"已写过"清单
-   │   sonnet 自主形成 0-5 条"想问她 X / 想跟进 Y / 想分享 Z"
+   │   reflection LLM (opus) 自主形成 0-5 条"想问她 X / 想跟进 Y / 想分享 Z"
    │   kind ∈ {question, share, follow_up, observation}；priority 1-10
    │   share kind 必带 suggested_query（具体搜索关键词）；缺则降级 follow_up
    │   写入前 cosine 去重（≥ 0.85 拦）；通过的 INSERT agent_ideas 表
    │   expires_at = now + 7 天；7 天没 used 自动 expire（daily_cleanup 跑）
    │   audit agent_ideas_form
    │
-   └─► 5. auto_dream_skills()         ← skill 库整理（全局一次）
+   ├─► 5. agent_self.auto_dream_self_iterate(uid)  ← L4 自治（2026-05-28）
+   │   │
+   │   ▼
+   │   收 ctx：audit_excerpts 7d / prompt_changelog 14d (git log) / recent_self_edits 20 /
+   │     active_overrides / user_prompt_overrides / persona_traits / 26 个 prompt names / active skills
+   │   reflection LLM (opus) 跑 tool loop ≤ 6 round，可调 6 工具：
+   │     · read_source / apply_prompt_edit (per-user) / apply_skill_*×3 / write_agent_issue
+   │   硬护栏：PROTECTED 片段不可删（"不能说自己是 AI" 等）+ allowlist + denylist + path traversal
+   │   rate limit：5 edits/run，3 改/prompt/周
+   │   每 apply_* 写 agent_self_edits 表（before/after 快照），admin 可一键 rollback
+   │   audit agent_self_iterate_started / _done / _applied / _denied / _llm_err
+   │   详见 document/agent-self-iterate.md
+   │
+   └─► 6. auto_dream_skills()         ← skill 库整理（全局一次，reflection tier opus）
 ```
 
 ### agent_ideas 怎么被消费
