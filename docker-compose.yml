@@ -54,6 +54,10 @@ services:
       # 2026-05-28：agent_self.py L4 自治需要跑 git log 看 prompt 时间线（对齐 audit 事件）。
       # .git 在 .dockerignore 里没烤进镜像；只读 mount 解决，给 reflection LLM 看 prompt 改了啥
       - ./.git:/app/.git:ro
+      # me/ 跨 bot+admin 共享读写——bot 通过 write_agent_issue 写到 me/agent_issues.md，
+      # admin webUI 读这个文件。不挂 mount 的话两个容器各自有独立副本，admin 看不到 bot 写的。
+      # 也防 bot 容器 recreate 时 issue 丢失（写到镜像层会随重建消失）
+      - ./me:/app/me
     # 不暴露端口；bot 是出站连接
 
   admin:
@@ -69,6 +73,9 @@ services:
     volumes:
       # 改成读写：admin 现在要 UPDATE prompt_overrides / skills 表（approve/reject/disable）
       - ./data:/app/data
+      # 2026-05-28：跟 bot 共享 me/ 读 agent_issues.md（admin webUI Agent 自治 tab 用）。
+      # ro 因为 admin 只读 issues，不写
+      - ./me:/app/me:ro
     command: ["python", "-m", "scripts.admin"]
     ports:
       # 仅绑 loopback——cloudflared 同 compose 内网走 admin:18081 不受影响。
