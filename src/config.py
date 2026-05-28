@@ -39,9 +39,10 @@ class Settings:
 
     llm_provider: str          # "anthropic" | "minimax"
     anthropic_api_key: str
-    anthropic_model: str       # 主输出（主聊天 / 主动开场）
-    anthropic_model_aux: str   # 辅助判断（情绪判档 / 话题抽取）
-    anthropic_base_url: str    # 空 = SDK 默认 (api.anthropic.com)
+    anthropic_model: str           # 主输出（主聊天 / 主动开场）
+    anthropic_model_aux: str       # 辅助判断（情绪判档 / 话题抽取）
+    anthropic_model_reflection: str  # 自我反思（dream / form_ideas / self_iterate），默认 opus
+    anthropic_base_url: str        # 空 = SDK 默认 (api.anthropic.com)
 
     memu_db_url: str           # postgres URL（沿用旧 env key，自搭记忆栈也用它）
     memu_chat_model: str       # 抽取模型（默认 deepseek/deepseek-v4-flash）
@@ -56,9 +57,13 @@ class Settings:
     # OpenRouter
     openrouter_api_key: str
     openrouter_base_url: str
-    openrouter_model: str       # LLM_PROVIDER=openrouter 时主输出
-    openrouter_model_aux: str   # LLM_PROVIDER=openrouter 时辅助 tier；空 → 同 main
-    eval_models: str            # 仅 scripts/eval_models 使用
+    openrouter_model: str           # LLM_PROVIDER=openrouter 时主输出
+    openrouter_model_aux: str       # LLM_PROVIDER=openrouter 时辅助 tier；空 → 同 main
+    openrouter_model_reflection: str  # LLM_PROVIDER=openrouter 时反思 tier；空 → 同 main
+    eval_models: str                # 仅 scripts/eval_models 使用
+
+    # L4 自治：bot 是否在 dream cron 自主迭代（自改 prompt / skill / 写 issue）
+    agent_self_iterate_enabled: bool
 
     proactive_idle_threshold_sec: int
     interest_decay_tau_hours: float
@@ -85,6 +90,7 @@ def load_settings() -> Settings:
         anthropic_api_key=_opt("ANTHROPIC_API_KEY", ""),
         anthropic_model=_opt("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
         anthropic_model_aux=_opt("ANTHROPIC_MODEL_AUX", "claude-sonnet-4-6"),
+        anthropic_model_reflection=_opt("ANTHROPIC_MODEL_REFLECTION", "claude-opus-4-7"),
         anthropic_base_url=_opt("ANTHROPIC_BASE_URL", "").rstrip("/"),
         memu_db_url=_opt("MEMU_DB_URL", ""),
         memu_chat_model=_opt("MEMU_CHAT_MODEL", ""),
@@ -96,7 +102,9 @@ def load_settings() -> Settings:
         openrouter_base_url=_opt("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
         openrouter_model=_opt("OPENROUTER_MODEL", ""),
         openrouter_model_aux=_opt("OPENROUTER_MODEL_AUX", ""),
+        openrouter_model_reflection=_opt("OPENROUTER_MODEL_REFLECTION", "anthropic/claude-opus-4.7"),
         eval_models=_opt("EVAL_MODELS", ""),
+        agent_self_iterate_enabled=_opt("AGENT_SELF_ITERATE_ENABLED", "1") == "1",
         proactive_idle_threshold_sec=int(_opt("PROACTIVE_IDLE_THRESHOLD_SEC", "21600")),
         interest_decay_tau_hours=float(_opt("INTEREST_DECAY_TAU_HOURS", "48")),
         app_db_path=(ROOT / _opt("APP_DB_PATH", "./data/app.sqlite")).resolve(),

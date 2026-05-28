@@ -47,9 +47,13 @@ docker compose logs -f bot   # 看 ready
 | `MINIMAX_CHAT_MODEL` | 默认 `MiniMax-M2` |
 | `LLM_PROVIDER` | `openrouter`（当前）/ `minimax` / `anthropic` |
 | `OPENROUTER_MODEL` | 主聊天模型；当前 `anthropic/claude-sonnet-4.6`（之前 `moonshotai/kimi-k2.6`，2026-05-12 切） |
+| `OPENROUTER_MODEL_AUX` | 辅助 tier（情绪判档/话题抽取）；默认同 main |
+| `OPENROUTER_MODEL_REFLECTION` | **反思 tier**（dream/form_ideas/self_iterate/skill 整理/overrides 整理）；默认 `anthropic/claude-opus-4.7`（2026-05-28 加） |
 | `ANTHROPIC_API_KEY` | Claude key（LLM_PROVIDER=anthropic 时） |
 | `ANTHROPIC_MODEL` | 默认 `claude-opus-4-6` |
 | `ANTHROPIC_MODEL_AUX` | 默认 `claude-sonnet-4-6`（辅助 tier） |
+| `ANTHROPIC_MODEL_REFLECTION` | 默认 `claude-opus-4-7`（反思 tier，2026-05-28 加） |
+| `AGENT_SELF_ITERATE_ENABLED` | `1`（默认）= bot 在 dream cron 自主迭代 prompt/skill；设 `0` 关掉 |
 | `MEMU_DB_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/memu`（自搭记忆栈也用这个 env，容器/库名都沿用旧名） |
 | `MEMU_CHAT_MODEL` | 记忆抽取模型（OpenAI 兼容，走 OpenRouter）；当前 `deepseek/deepseek-v4-flash` |
 | `JINA_API_KEY` | Jina Reader 鉴权 key（网页正文读取，匿名易被 401）。免费注册：https://jina.ai/reader/ |
@@ -79,6 +83,7 @@ docker compose logs -f bot   # 看 ready
 | `src/agent_ideas.py` | bot 凌晨自主"想做的事" pool（airi `come_up_ideas` 借鉴，2026-05-25）：`form_ideas` 让 sonnet 看最近事实写 0-5 条；`list_pending` proactive 决策时拉 top-3；`mark_idea_used` 采纳后落 used；`expire_old_ideas` 7 天兜底 |
 | `src/feedback_prompts.py` | Feedback sub-agent 的 SCREEN（aux 粗筛）+ JUDGE（sonnet 精判，含硬护栏）+ SKILL_CREATOR（capability_request 转 trigger 指令）prompt |
 | `src/feedback_agent.py` | flush 后异步 fire；监听偏好/不满/能力诉求信号，沉淀 prompt_overrides + skill 库（仓库语义；详见 `document/feedback-agent.md`）|
+| `src/agent_self.py` | **L4 自治**（2026-05-28 加，`agent-l4` 分支）：bot 在 dream cron 自主迭代 prompt/skill/写 issue。reflection tier (opus) + 6 工具（read_source/apply_prompt_edit/apply_skill_*/write_agent_issue）+ hard guardrails（PROTECTED 片段不可删）+ rate limits（5 edits/run，3 改/prompt/周）+ rollback（admin webUI）。详见 `document/agent-self-iterate.md` |
 | `src/triggered_reach.py` | active trigger 通道：每分钟扫 cron + sonnet 判 condition + user 在聊就暂存等下轮融入、否则直发；不走 proactive 冷却 |
 | `src/interests.py` | 话题热度 bump/decay/top |
 | `src/availability.py` | 用户活跃时段学习 + score |
@@ -89,10 +94,10 @@ docker compose logs -f bot   # 看 ready
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
 | `src/agent.py` | 对话 turn 流水线（吃 `user_id`）+ `generate_opener` + `generate_welcome`（新人激活后开场白）；`_recent_per_user` dict 持久化 `data/recent.json` |
-| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit 30 天 + wipe_backup 7 天)。所有 job 配 `max_instances=1 + coalesce + misfire_grace_time` 防重叠堆积 |
+| `src/scheduler.py` | APScheduler 八个 job：decay/memu_flush/proactive/persona_consolidate (03:07)/auto_dream (03:13)/triggered_reach (1min)/pending_reach_overdue (1min)/daily_cleanup (04:23 清 audit 30 天 + wipe_backup 7 天)。所有 job 配 `max_instances=1 + coalesce + misfire_grace_time` 防重叠堆积。auto_dream per-user 现 5 段（auto_dream / overrides / insights / form_ideas / **self_iterate**，2026-05-28）+ 全局 1 段（skills），反思类全部走 reflection tier (opus) |
 | `src/bot.py` | 主 bot：邀请码门 + 命令 `/start /myid /memory /invite /users`；激活成功后调 `agent.generate_welcome` 发开场白 |
 | `src/main.py` | 统一启停 |
-| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；四个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库 + 兴趣热度 + **Prompt 文件 per-user 整份覆写**）」「审计」 |
+| `src/admin_ui.py` | 记忆浏览/编辑 Web UI（FastAPI :18081）；HMAC cookie session（无密码登录，靠 `/memory` 给 token URL）；按 viewer 区分（admin 看全部 + 下拉切；普通用户只看自己）；移动端卡片自适应；五个 tab「记忆项」「图谱（D3 force-directed）」「调教（pending/active overrides + skill 库 + 兴趣热度 + **Prompt 文件 per-user 整份覆写**）」「Agent 自治（self-edits + issues inbox + 手动触发，2026-05-28 加）」「审计」 |
 | `src/prompt_loader.py` | 统一 prompt 入口：`load(name, user_id=None)` —— user_id 给定时优先返 `user_prompt_overrides` 表里的整份覆写；进程内 `(uid, name)` cache + `invalidate_user(uid, name)`，admin UI 改完立刻生效不重启 |
 | `src/clock.py` | 中文时间感字符串（now_signal / since_phrase） |
 | `src/stickers.py` | 表情包：扫 `data/stickers/`、文件名当 tag、parse `[sticker:tag]` 标记 |
@@ -188,6 +193,7 @@ aux LLM detect 路径（2026-05-21 删，主 LLM 自己 tool_use）。
 | `document/minimax-integration.md` | MiniMax 接入与坑点 |
 | `document/memory-stack.md` | 自搭记忆栈（postgres+pgvector）+ PRD v2 三层防线实现 |
 | `document/feedback-agent.md` | per-user prompt overrides + Feedback Sub-Agent + skill 库 |
+| `document/agent-self-iterate.md` | **L4 自治**（2026-05-28）：bot 自主迭代 prompt/skill/写 issue 的设计 + guardrails + 调试 |
 | `document/memu-setup.md` | （已归档）memU SDK 时代配置；自搭栈替换前的踩坑参考 |
 | `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测/多用户都已落地） |
 | `document/deployment.md` | 云部署（Docker Compose + mihomo + cloudflared + 多用户测试流程） |

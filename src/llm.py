@@ -106,7 +106,12 @@ async def _anthropic_chat(
 ) -> str:
     s = settings()
     if model is None:
-        model = s.anthropic_model_aux if tier == "aux" else s.anthropic_model
+        if tier == "reflection" and s.anthropic_model_reflection:
+            model = s.anthropic_model_reflection
+        elif tier == "aux" and s.anthropic_model_aux:
+            model = s.anthropic_model_aux
+        else:
+            model = s.anthropic_model
     system_text, rest = _split_system(messages)
     rest = _coalesce_messages(rest)
     if not rest:
@@ -157,7 +162,9 @@ async def _openrouter_chat(
 ) -> str:
     s = settings()
     if model is None:
-        if tier == "aux" and s.openrouter_model_aux:
+        if tier == "reflection" and s.openrouter_model_reflection:
+            model = s.openrouter_model_reflection
+        elif tier == "aux" and s.openrouter_model_aux:
             model = s.openrouter_model_aux
         else:
             model = s.openrouter_model
@@ -227,7 +234,12 @@ async def chat_with_tools(
     if s.llm_provider == "openrouter":
         m = model
         if m is None:
-            m = s.openrouter_model_aux if (tier == "aux" and s.openrouter_model_aux) else s.openrouter_model
+            if tier == "reflection" and s.openrouter_model_reflection:
+                m = s.openrouter_model_reflection
+            elif tier == "aux" and s.openrouter_model_aux:
+                m = s.openrouter_model_aux
+            else:
+                m = s.openrouter_model
         if not m:
             raise RuntimeError("OPENROUTER_MODEL 未配置")
         res = await openrouter.chat(
@@ -267,7 +279,12 @@ async def _anthropic_chat_with_tools(
     """Anthropic SDK 原生 tool_use。把 OpenAI 格式 tools 转成 Anthropic 格式。"""
     s = settings()
     if model is None:
-        model = s.anthropic_model_aux if tier == "aux" else s.anthropic_model
+        if tier == "reflection" and s.anthropic_model_reflection:
+            model = s.anthropic_model_reflection
+        elif tier == "aux" and s.anthropic_model_aux:
+            model = s.anthropic_model_aux
+        else:
+            model = s.anthropic_model
     system_text, rest = _split_system(messages)
     # Anthropic messages 不接受 role="tool"，要把它转成 user(role) + tool_result block
     rest = _convert_messages_for_anthropic(rest)

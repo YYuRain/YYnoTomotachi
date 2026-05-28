@@ -1017,7 +1017,9 @@ async def _dream_one(
             log.debug("dream neighbor pull err id=%s: %s", fact_id[:8], e)
 
     s = settings()
-    model = s.memu_chat_model or s.openrouter_model
+    # 5.3 dream 批量整理走 reflection tier（opus）——判断质量直接影响 to_verify 是否被
+    # 错杀成 stale 或保留。reflection 没设时 fallback 到 memu_chat_model / main。
+    model = s.openrouter_model_reflection or s.memu_chat_model or s.openrouter_model
     if not model:
         return None
     prompt = memory_prompts.render_dream(fact, upstream, neighbors, user_id=user_id)
@@ -1242,7 +1244,7 @@ async def auto_dream_insights(user_id: int) -> dict[str, Any]:
         data = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main",
+                tier="reflection",  # opus：跨条事实反思，判断质量优先
                 max_tokens=2000,
             ),
             timeout=INSIGHT_DREAM_TIMEOUT_SEC,
@@ -1454,7 +1456,8 @@ async def auto_dream_overrides(user_id: int) -> dict[str, Any]:
         d = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main", temperature=0.1, max_tokens=4000,
+                tier="reflection",  # opus：override 合并/淘汰判断关键
+                temperature=0.1, max_tokens=4000,
             ),
             timeout=OVERRIDE_DREAM_TIMEOUT_SEC,
         )
@@ -1574,7 +1577,8 @@ async def auto_dream_skills() -> dict[str, Any]:
         d = await asyncio.wait_for(
             llm.chat_json(
                 [{"role": "user", "content": prompt}],
-                tier="main", temperature=0.1, max_tokens=4000,
+                tier="reflection",  # opus：skill 库整理判断关键
+                temperature=0.1, max_tokens=4000,
             ),
             timeout=SKILL_DREAM_TIMEOUT_SEC,
         )

@@ -117,18 +117,22 @@ def build() -> AsyncIOScheduler:
         await _fan_out(_one)
 
     async def auto_dream_job() -> None:
-        """PRD v2 / 5.3 + P1-6 + airi-borrow：搭便车 03:13 班车，跑批量整理。
+        """PRD v2 / 5.3 + P1-6 + airi-borrow + L4 自治：搭便车 03:13 班车，跑批量整理。
 
-        per-user 四段：
+        per-user 五段：
         1. memories 三态判定（auto_dream）
         2. prompt_overrides 冲突整理（auto_dream_overrides）
         3. insight 生成（auto_dream_insights）—— P1-6
         4. **agent_ideas 自主形成**（airi `come_up_ideas` 借鉴）—— bot 凌晨想心事
+        5. **agent self iterate**（L4）—— bot 看自己最近聊得咋样、自改 prompt / skill / 写 issue
 
         全局一段：
-        5. skill 库整理（auto_dream_skills）
-        6. agent_ideas 过期清理（expire_old_ideas）
+        6. skill 库整理（auto_dream_skills）
+        7. agent_ideas 过期清理（expire_old_ideas）
+
+        所有反思类 LLM 调用（1/3/4/5/6）走 reflection tier（默认 opus）。
         """
+        from . import agent_self
         async def _one(uid: int):
             try:
                 await memory.auto_dream(uid)
@@ -146,6 +150,11 @@ def build() -> AsyncIOScheduler:
                 await agent_ideas.form_ideas(uid)
             except Exception as e:
                 log.warning("agent_ideas.form_ideas uid=%d err: %s", uid, e)
+            # L4 self iterate—放最后，先有 ideas + insights，再决定要不要改自己
+            try:
+                await agent_self.auto_dream_self_iterate(uid)
+            except Exception as e:
+                log.warning("auto_dream_self_iterate uid=%d err: %s", uid, e)
         await _fan_out(_one)
         # skill 库不分 user，跑一次即可
         try:

@@ -297,6 +297,7 @@ _INDEX_HTML = """<!doctype html>
   <button data-tab="items" class="active">记忆项</button>
   <button data-tab="graph">图谱</button>
   <button data-tab="tune" title="Procedural Memory（LangMem 命名）：偏好 / skill 库 / 兴趣热度">调教</button>
+  <button data-tab="autonomy" title="L4 自治：bot 自改 prompt / skill / 写 issue 的记录">Agent 自治</button>
   <button data-tab="audit">审计</button>
 </nav>
 
@@ -388,6 +389,35 @@ _INDEX_HTML = """<!doctype html>
           <thead><tr><th style="width:280px">name</th><th style="width:90px">状态</th><th style="width:150px" class="mono">改于</th><th></th></tr></thead>
           <tbody id="tune-prompts-tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-autonomy" class="tab" style="display:none">
+    <div style="display:flex;flex-direction:column;gap:18px">
+      <div style="font-size:11px;color:var(--muted);padding-bottom:4px;border-bottom:1px solid var(--border)">
+        L4 自治：bot 在 dream cron（凌晨 03:13）自主调用 reflection LLM（opus）改 prompt / skill / 写 issue。改完立刻生效，下方记录 admin 可一键 rollback。
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">📋 最近自改记录（self-edits）</h3>
+        <div class="muted" style="font-size:11px;margin-bottom:6px" id="autonomy-edits-hint">选了具体 user 才显示该 user 的；admin 不选时显示所有</div>
+        <table>
+          <thead><tr><th style="width:140px" class="mono">时间</th><th style="width:90px">类型</th><th style="width:90px">user</th><th style="width:160px" class="mono">target</th><th>reason</th><th style="width:140px"></th></tr></thead>
+          <tbody id="autonomy-edits-tbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">📥 Issues inbox</h3>
+        <div class="muted" style="font-size:11px;margin-bottom:6px">bot 通过 <code>write_agent_issue</code> 写到 me/agent_issues.md 的内容（最新在底部）</div>
+        <pre id="autonomy-issues-pre" style="background:#fafafa;border:1px solid var(--bd);border-radius:6px;padding:12px;font-size:12px;line-height:1.5;white-space:pre-wrap;max-height:480px;overflow:auto;font-family:ui-monospace,Menlo,monospace">加载中…</pre>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;font-size:14px;font-weight:600">▶️ 手动触发（admin）</h3>
+        <div class="muted" style="font-size:11px;margin-bottom:8px">立刻为当前下拉选定的 user 跑一轮 self_iterate（不等到 03:13）。耗时 30-90 秒。</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="autonomy-run-btn" class="primary" style="padding:6px 14px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:white;cursor:pointer;font:inherit">立刻跑一轮</button>
+          <span class="muted" id="autonomy-run-status" style="font-size:11px"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -655,6 +685,7 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   if (tab === 'items') loadItems();
   if (tab === 'graph') loadGraph();
   if (tab === 'tune') loadTune();
+  if (tab === 'autonomy') loadAutonomy();
   if (tab === 'audit') loadAudit();
   toggleAuditAutoRefresh(tab === 'audit' && $('#audit-auto').checked);
 }));
@@ -1059,6 +1090,91 @@ let _deb;
 $('#q').addEventListener('input', () => { clearTimeout(_deb); _deb = setTimeout(loadItems, 250); });
 $('#type-filter').addEventListener('change', loadItems);
 $('#status-filter').addEventListener('change', loadItems);
+
+// ============ autonomy tab（L4 自治） ============
+async function loadAutonomy() {
+  await Promise.all([loadAutonomyEdits(), loadAutonomyIssues()]);
+}
+
+async function loadAutonomyEdits() {
+  const tb = $('#autonomy-edits-tbody');
+  const hint = $('#autonomy-edits-hint');
+  const qs = withUid('limit=100');
+  const r = await fetch('/api/self_edits?' + qs);
+  if (!r.ok) { tb.innerHTML = `<tr><td colspan="6" class="empty">加载失败：${r.status}</td></tr>`; return; }
+  const j = await r.json();
+  hint.textContent = _currentUid ? `当前 user_id=${_currentUid}` : '当前显示全部 user 的自改记录';
+  tb.innerHTML = '';
+  if (!j.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">还没有自改记录（cron 03:13 才跑，或手动触发一轮）</td></tr>'; return; }
+  for (const it of j) {
+    const tr = el('tr');
+    const typeChip = (() => {
+      const m = {
+        'prompt': '<span style="color:#3a6dab">📝 prompt</span>',
+        'skill_add': '<span style="color:#1a8a3a">➕ skill</span>',
+        'skill_edit': '<span style="color:#3a6dab">✏️ skill</span>',
+        'skill_disable': '<span style="color:#a04040">⏸ skill</span>',
+        'issue': '<span style="color:#888">📥 issue</span>',
+      };
+      return m[it.target_type] || it.target_type;
+    })();
+    const rolledBack = it.rolled_back
+      ? `<span style="color:#888;text-decoration:line-through">${escapeHtml(it.target_id || '')}</span>`
+      : escapeHtml(it.target_id || '');
+    tr.innerHTML = `
+      <td class="mono" data-label="时间">${fmt(it.ts)}</td>
+      <td data-label="类型">${typeChip}</td>
+      <td class="mono" data-label="user">${it.user_id ?? '-'}</td>
+      <td class="mono" data-label="target">${rolledBack}</td>
+      <td class="summary" data-label="reason">${escapeHtml(it.reason || '')}</td>
+      <td class="ops"></td>
+    `;
+    const ops = tr.querySelector('.ops');
+    if (!it.rolled_back) {
+      const bRb = el('button', { class: 'op danger' }, '↺ rollback');
+      bRb.onclick = async () => {
+        if (!confirm(`回退这条自改（${it.target_type} ${it.target_id || ''}）？`)) return;
+        const r = await fetch(`/api/self_edits/${it.id}/rollback`, { method: 'POST' });
+        if (r.ok) { toast('已回退'); loadAutonomyEdits(); }
+        else toast('失败：' + r.status);
+      };
+      ops.appendChild(bRb);
+    } else {
+      ops.innerHTML = '<span class="muted" style="font-size:11px">已回退</span>';
+    }
+    tb.appendChild(tr);
+  }
+}
+
+async function loadAutonomyIssues() {
+  const pre = $('#autonomy-issues-pre');
+  const r = await fetch('/api/agent_issues');
+  if (!r.ok) { pre.textContent = `加载失败：${r.status}`; return; }
+  const j = await r.json();
+  pre.textContent = j.content || '（issue inbox 还是空的）';
+}
+
+$('#autonomy-run-btn').onclick = async () => {
+  if (!_currentUid) { toast('先在顶部下拉选个 user'); return; }
+  if (!confirm(`立刻为 user_id=${_currentUid} 跑一轮 self_iterate？这会调 opus，耗时 30-90s`)) return;
+  const status = $('#autonomy-run-status');
+  status.textContent = '跑中... 别关浏览器';
+  $('#autonomy-run-btn').disabled = true;
+  try {
+    const r = await fetch('/api/self_iterate/run?' + withUid(), { method: 'POST' });
+    const j = await r.json();
+    if (r.ok && j.ok) {
+      status.textContent = `跑完：${j.rounds} rounds / ${j.actions} actions / ${j.edits} edits / ${j.elapsed_ms}ms`;
+      toast('跑完了');
+      loadAutonomy();
+    } else {
+      status.textContent = '失败：' + (j.error || r.status);
+      toast('失败：' + (j.error || r.status));
+    }
+  } finally {
+    $('#autonomy-run-btn').disabled = false;
+  }
+};
 
 // ============ audit tab ============
 const truncate = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + '…' : s; };
@@ -1951,5 +2067,79 @@ def build_app() -> FastAPI:
         audit("prompt_override_deleted", user_id=uid, name=name,
               editor=editor, was_present=deleted)
         return {"ok": True, "deleted": deleted}
+
+    # ============ L4 自治：self-edits / agent_issues / 手动触发 ============
+
+    @app.get("/api/self_edits")
+    async def self_edits_list(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        """admin 不传 user_id 时看全部；普通用户强制看自己。"""
+        uid = _resolve_uid(viewer, user_id)
+        if viewer is not None and uid != viewer:
+            raise HTTPException(403, "not yours")
+        rows = storage.list_self_edits(user_id=uid, limit=limit)
+        return [
+            {
+                "id": r.id,
+                "ts": r.ts.isoformat() if r.ts else None,
+                "user_id": r.user_id,
+                "target_type": r.target_type,
+                "target_id": r.target_id,
+                "reason": r.reason,
+                "rolled_back": bool(r.rolled_back),
+                "rolled_back_at": r.rolled_back_at.isoformat() if r.rolled_back_at else None,
+            }
+            for r in rows
+        ]
+
+    @app.post("/api/self_edits/{edit_id}/rollback")
+    async def self_edit_rollback(
+        edit_id: int,
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        from . import agent_self
+        # 普通用户只能回退自己的；admin 都能回退
+        e = storage.get_self_edit(edit_id)
+        if e is None:
+            raise HTTPException(404, "not found")
+        if viewer is not None and e.user_id != viewer:
+            raise HTTPException(403, "not yours")
+        result = agent_self.rollback_self_edit(edit_id, by_uid=viewer or 0)
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("denied_reason", "rollback failed"))
+        return result
+
+    @app.get("/api/agent_issues")
+    async def agent_issues_get(
+        viewer: int | None = Depends(_get_viewer),
+    ) -> dict[str, Any]:
+        """admin 看全部；普通用户看不到（issue 是 admin 用的）。"""
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        from pathlib import Path as _P
+        issues_path = settings().root / "me" / "agent_issues.md"
+        if not issues_path.exists():
+            return {"content": ""}
+        try:
+            return {"content": issues_path.read_text(encoding="utf-8")}
+        except Exception as e:
+            raise HTTPException(500, f"read err: {e}")
+
+    @app.post("/api/self_iterate/run")
+    async def self_iterate_run(
+        viewer: int | None = Depends(_get_viewer),
+        user_id: int | None = Query(None),
+    ) -> dict[str, Any]:
+        """admin only：手动触发一轮 self_iterate。同步等结果（30-90s）。"""
+        if viewer is not None:
+            raise HTTPException(403, "admin only")
+        if not user_id:
+            raise HTTPException(400, "user_id required")
+        from . import agent_self
+        result = await agent_self.auto_dream_self_iterate(user_id)
+        return result
 
     return app
