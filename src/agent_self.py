@@ -50,9 +50,11 @@ PROTECTED_PROMPT_NAMES: tuple[str, ...] = ()
 
 MAX_SELF_EDITS_PER_RUN = 5
 MAX_PROMPT_EDITS_PER_NAME_PER_WEEK = 3
-DREAM_LLM_OUTPUT_TOKEN_BUDGET = 4000
+# 注意：apply_prompt_edit 可能整份替换 chat_role_discipline（12k 字 ≈ 8k tokens），
+# tool_use 的 arguments 也算在输出 token 内——4000 不够，会被截断成 args={}。
+DREAM_LLM_OUTPUT_TOKEN_BUDGET = 16000
 DREAM_TOOL_LOOP_MAX_ROUNDS = 6
-DREAM_TIMEOUT_SEC_PER_ROUND = 90
+DREAM_TIMEOUT_SEC_PER_ROUND = 180
 
 ISSUES_FILE = Path(__file__).resolve().parent.parent / "me" / "agent_issues.md"
 
