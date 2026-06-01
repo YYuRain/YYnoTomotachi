@@ -89,7 +89,7 @@ docker compose logs -f bot   # 看 ready
 | `src/availability.py` | 用户活跃时段学习 + score |
 | `src/emotion.py` | 四档聊法判断：casual/empathy/depth/interest |
 | `src/tools.py` | Agent Reach 工具集 + `TOOL_SCHEMAS`（OpenAI tool schema，主 LLM native tool_use 用）：search_web (Jina) / search_xhs (xhs CLI) / search_bilibili (bili CLI) / read_url (Jina) / read_github (REST API anon) / URL 域名自动路由 (yt-dlp / xhs / Jina) |
-| `src/proactive.py` | 主动搭话：软概率门（违规越深 skip_prob 越高，封顶 0.97）+ LLM 决策；**三路并行**（2026-05-25）：(A) 消费 `share` kind agent_idea + suggested_query → 自动调 _select_share_item，opener 走"想到 X → 顺手搜了下"双层叙事；(B) 临时 share_intent → 现搜现挑（"刚翻到一条"）；(C) 消费非 share kind idea → topic_chat opener 走"想起来的事"叙事。xhs/bili 各日 1 条独立配额 |
+| `src/proactive.py` | 主动搭话：**硬休眠门**（2026-05-29，应 L4 自治多次 escalate 的 issue：idle ≥ 24h 距上次 fire < 6h 退避；idle ≥ 48h/72h 退避更长；idle ≥ 7d / inf + ≥5 unanswered 永久 mute）→ 软概率门（违规越深 skip_prob 越高，封顶 0.97）→ LLM 决策；**三路并行**（2026-05-25）：(A) 消费 `share` kind agent_idea + suggested_query → 自动调 _select_share_item，opener 走"想到 X → 顺手搜了下"双层叙事；(B) 临时 share_intent → 现搜现挑（"刚翻到一条"）；(C) 消费非 share kind idea → topic_chat opener 走"想起来的事"叙事。xhs/bili 各日 1 条独立配额 |
 | `src/persona.py` | 人格演化：traits/mood/观察/锚点；flush 后增量更新 + 每日 03:07 衰减 |
 | `src/prompts.py` | system prompt 装配（含四档情绪指令：empathy/depth/interest/casual + per-user prompt overrides 段尾追加 + 联网能力声明） |
 | `src/rhythm.py` | 拆短句 + 打字模拟 |
