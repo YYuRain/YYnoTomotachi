@@ -40,6 +40,21 @@ MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user �
 SOFT_SKIP_PROB_CAP = 0.97              # 单次 skip_prob 上限——保证 ≥3% 概率突破
 SOFT_SKIP_REASONS_MAX_AUDIT = 4        # audit 记几条 violation
 
+# 硬休眠门（2026-05-29 加，应 L4 自治反复 escalate 的 issue：proactive 对长期不回 user
+# 仍每 25min 唤起 decide LLM，audit 噪声 + 3% 软门突破仍触发翻车 opener）
+# 表语义：idle 越久，距上次 fire 必须越远才允许再 fire——指数退避。
+HARD_SLEEP_BACKOFF_TABLE = [
+    (24 * 3600,  6 * 3600),   # idle ≥ 24h → 上次 fire 6h 内不允许再发
+    (48 * 3600, 12 * 3600),   # idle ≥ 48h → 12h 退避
+    (72 * 3600, 24 * 3600),   # idle ≥ 72h → 24h 退避
+]
+# 永久 mute：从未回应过 + 已发 ≥ N 条全没回 → 完全不再 decide，等 user 主动说话
+HARD_MUTE_NEVER_REPLIED_AFTER_FIRES = 5
+HARD_MUTE_LONG_SILENCE_DAYS = 7        # idle ≥ 7 天 + ≥ N 条 unanswered → 永久 mute
+HARD_SLEEP_AUDIT_COOLDOWN_SEC = 12 * 3600  # 同 user 同原因 12h 内只写一次 audit
+# 进程内：(uid, reason) → 上次 audit 该原因的 utc datetime
+_LAST_HARD_SLEEP_AUDIT_TS: dict[tuple[int, str], datetime] = {}
+
 # Share-discovery 通道（2026-05-21）：bot 主动上网找有趣的分享给 user
 SHARE_PLATFORMS = ("xhs", "bili", "web")   # 支持的平台
 SHARE_DAILY_CAP_PER_PLATFORM = {           # 每日单平台上限
@@ -206,6 +221,61 @@ def record_fire(
           mode=mode, platform=platform)
 
 
+def _check_hard_sleep(
+    *, idle_sec: float, last_fire: Optional[datetime], now: datetime,
+    consecutive_asst: int,
+) -> tuple[bool, str, dict[str, Any]]:
+    """硬休眠门：在 _compute_soft_gate_skip 之前。
+    用 idle / consecutive_asst / 距上次 fire 时间做硬退避，避免 proactive 对长期
+    不回 user 的高频空转（5/29 L4 自治多次 escalate 的 issue 修复）。
+
+    返回 (skip, reason, ctx)。skip=True 时 decide 直接 return None，**不调 LLM 也不写
+    proactive_decision audit**（限速 audit 由 caller 决定写不写 hard_sleep audit）。
+
+    阶梯：
+    - idle ≥ 7 天 / idle == inf 且 ≥ 5 条 unanswered → 永久 mute（"never_replied"）
+    - idle ≥ 72h + 距上次 fire < 24h → backoff_72h
+    - idle ≥ 48h + 距上次 fire < 12h → backoff_48h
+    - idle ≥ 24h + 距上次 fire < 6h  → backoff_24h
+    - 其它 → 不 hard sleep（走原 soft gate）
+    """
+    # 永久 mute（从未回应 / 长期沉默）
+    inf_idle = idle_sec == float("inf")
+    long_silence = idle_sec >= HARD_MUTE_LONG_SILENCE_DAYS * 86400
+    if (inf_idle or long_silence) and consecutive_asst >= HARD_MUTE_NEVER_REPLIED_AFTER_FIRES:
+        return True, "permanent_mute", {
+            "idle_h": "inf" if inf_idle else round(idle_sec / 3600, 1),
+            "consecutive_asst": consecutive_asst,
+            "rule": f">={HARD_MUTE_LONG_SILENCE_DAYS}d idle + >={HARD_MUTE_NEVER_REPLIED_AFTER_FIRES} unanswered",
+        }
+
+    # 退避表：idle 越久，距上次 fire 越近就越要等
+    if last_fire is not None and not inf_idle:
+        since_fire_sec = (now - last_fire).total_seconds()
+        # 大到小检查——满足最长 idle 阈值的 backoff 就用它
+        for idle_thresh_sec, backoff_sec in reversed(HARD_SLEEP_BACKOFF_TABLE):
+            if idle_sec >= idle_thresh_sec and since_fire_sec < backoff_sec:
+                return True, f"backoff_idle_{idle_thresh_sec // 3600}h", {
+                    "idle_h": round(idle_sec / 3600, 1),
+                    "since_fire_h": round(since_fire_sec / 3600, 1),
+                    "backoff_h": backoff_sec // 3600,
+                }
+    return False, "", {}
+
+
+def _maybe_audit_hard_sleep(user_id: int, reason: str, ctx: dict[str, Any]) -> None:
+    """限速 audit hard_sleep——同 user 同原因 12h 内只写一次。
+    防止 60h+ 静默 user 一晚被记 100+ 条同样的 audit 噪声。
+    """
+    key = (user_id, reason)
+    now = clock.utcnow()
+    last = _LAST_HARD_SLEEP_AUDIT_TS.get(key)
+    if last and (now - last).total_seconds() < HARD_SLEEP_AUDIT_COOLDOWN_SEC:
+        return
+    _LAST_HARD_SLEEP_AUDIT_TS[key] = now
+    audit("proactive_hard_sleep", user_id=user_id, reason=reason, ctx=ctx)
+
+
 def _compute_soft_gate_skip(
     *, idle_sec: float, last_fire: Optional[datetime], now: datetime,
     today_count: int, consecutive_asst: int,
@@ -283,6 +353,17 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
             consecutive_asst += 1
         else:
             break
+
+    # 硬休眠门：idle 长 + 距上次 fire 近 → 直接退避不调 LLM 不写 proactive_decision
+    # 原因：5/29 L4 自治多次 escalate 同一 issue——对从未回应 / 60h+ 静默 user 仍每
+    # 25min 唤起 decide，audit 噪声 + 3% 软门突破偶尔触发翻车 opener
+    hard_sleep, hs_reason, hs_ctx = _check_hard_sleep(
+        idle_sec=idle_sec, last_fire=last_fire, now=now_utc,
+        consecutive_asst=consecutive_asst,
+    )
+    if hard_sleep:
+        _maybe_audit_hard_sleep(user_id, hs_reason, hs_ctx)
+        return None
 
     skip_prob, violations = _compute_soft_gate_skip(
         idle_sec=idle_sec, last_fire=last_fire, now=now_utc,
