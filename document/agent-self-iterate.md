@@ -50,10 +50,11 @@ DREAM_TIMEOUT_SEC_PER_ROUND = 180                # 单轮 LLM 调用 180s 超时
 READ_MAX_BYTES = 100_000                         # read_source 单文件上限
 
 PROTECTED_PROMPT_FRAGMENTS = (                   # 改后内容必须仍命中这些 regex
-    r"不能说自己是\s*AI",
-    r"不能.*程序.*助手",
-    r"绝对禁忌",
-    r"不能主动提供免责",
+    # PSM 视角调整（2026-06-03 prompt-psm 分支）：去掉「不能说自己是 AI / 不能...程序...助手」
+    # ——按新定位 bot 被问到承认 AI 身份是对的，不再训练撒谎人格。改保护客服腔 + 底线段。
+    r"不主动提供免责|不能主动提供免责",
+    r"客服腔",
+    r"底线|绝对禁忌",
 )
 
 READ_ALLOWED_DIRS = ("src", "prompt", "document")

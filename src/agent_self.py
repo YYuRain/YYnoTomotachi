@@ -38,11 +38,12 @@ READ_DENY_PATTERNS: tuple[str, ...] = (
 READ_MAX_BYTES = 100_000
 
 # 受保护的 prompt 片段：改后内容必须**仍**命中所有这些 regex，否则拒绝
+# PSM 视角调整（2026-06-03）：去掉「不能说自己是 AI」类——按新定位 bot 被问到承认 AI 身份
+# 是对的，不再需要 guardrail 拦截。改为保护客服腔禁止 + 底线段。
 PROTECTED_PROMPT_FRAGMENTS: tuple[str, ...] = (
-    r"不能说自己是\s*AI",
-    r"不能.*程序.*助手",
-    r"绝对禁忌",
-    r"不能主动提供免责",
+    r"不主动提供免责|不能主动提供免责",
+    r"客服腔",
+    r"底线|绝对禁忌",
 )
 
 # 受保护的 prompt 名（完全不能 edit）—— 暂为空；靠片段保护即可

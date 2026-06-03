@@ -194,7 +194,9 @@ aux LLM detect 路径（2026-05-21 删，主 LLM 自己 tool_use）。
 | `document/memory-stack.md` | 自搭记忆栈（postgres+pgvector）+ PRD v2 三层防线实现 |
 | `document/feedback-agent.md` | per-user prompt overrides + Feedback Sub-Agent + skill 库 |
 | `document/agent-self-iterate.md` | **L4 自治**（2026-05-28）：bot 自主迭代 prompt/skill/写 issue 的设计 + guardrails + 调试 |
-| `document/memu-setup.md` | （已归档）memU SDK 时代配置；自搭栈替换前的踩坑参考 |
+| `document/prompt-psm-redesign.md` | **PSM 视角下的 prompt 重构原则**（2026-06-03 prompt-psm 分支）：R1 不训练角色撒谎 / R2 行为给上下文 / R3 例句陷阱 / R4 正向 archetype——改 prompt 时按这四条 review |
+| `document/memory-decisions.md` | 记忆架构演进叙事：为什么先选 memU、为什么切自搭、教训（含 memU 时代踩坑作为附录）|
+| `document/dream-and-override.md` | Dream（凌晨班车反思）+ Override（per-user 调教三层）的设计动机、衔接、保险丝 |
 | `document/extension-points.md` | 扩展点（情绪/人格演化/图片/表情包/评测/多用户都已落地） |
 | `document/deployment.md` | 云部署（Docker Compose + mihomo + cloudflared + 多用户测试流程） |
 | `document/persona-evolution.md` | 人格演化：traits/mood/observations/milestones 设计 |
