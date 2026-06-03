@@ -138,7 +138,9 @@ async def _send_active_message(user_id: int, message: str, *, override_id: int, 
     from .rhythm import deliver
     from .agent import record_proactive_message
     await deliver(message, send, typing)
-    record_proactive_message(user_id, message)
+    # kind="reminder"：active trigger 是条件信息推送，user 读了不回是设计意图，
+    # 不计入 proactive soft gate 的 unanswered_streak（见 proactive._compute_soft_gate_skip）。
+    record_proactive_message(user_id, message, kind="reminder")
 
 
 _CONDITION_PARSE_FALLBACK = re.compile(

@@ -36,7 +36,17 @@ log = logging.getLogger(__name__)
 MIN_GAP_FROM_USER_SEC = 30 * 60        # 对方刚聊过的参考阈值
 MIN_GAP_FROM_SELF_SEC = 60 * 60        # 自己上次主动的参考阈值
 DAILY_CAP = 6                          # 软上限——超了之后概率快速衰减但仍可能触发
-MAX_UNANSWERED_FIRES = 1               # 连续 N 次 proactive 没收到 user 回应 → 降频
+# unanswered_streak 阈值（2026-06-03 调）：原 1（一条尾巴 assistant 即触发 0.70 prob skip）
+# 太严——bot 回复一句 user 没接（normal chat 收尾）/ active trigger reminder 读了不回，都被
+# 当成"对方在冷落 bot"打 skip。raise 到 2 → "至少两条没回才算信号"。
+MAX_UNANSWERED_FIRES = 2
+# unanswered_streak 时间衰减（同次调整加）：bot 最后一条 assistant > 4h 还没收到 user 回，
+# 视作 user 离线/忙，不是"在冷落 bot"——streak 当 0。4-24h 这段窗口现在没人盖
+# （hard sleep 表从 24h 起），这条把它还给 user。
+UNANSWERED_STREAK_DECAY_SEC = 4 * 3600
+# 不计入 streak 的 record_proactive_message kind：active trigger reminder 是条件信息推送
+# （"if 下雨 then ping"），读了不回是设计意图。spontaneous proactive opener 不在这个集合。
+UNANSWERED_STREAK_EXCLUDED_KINDS = frozenset(("reminder",))
 SOFT_SKIP_PROB_CAP = 0.97              # 单次 skip_prob 上限——保证 ≥3% 概率突破
 SOFT_SKIP_REASONS_MAX_AUDIT = 4        # audit 记几条 violation
 
@@ -310,10 +320,13 @@ def _compute_soft_gate_skip(
         violations.append({"reason": "daily_cap", "prob": round(prob, 3),
                            "opens_today": today_count, "cap": DAILY_CAP})
 
-    # 4) 连续没回——1 条 0.7，2 条 0.85，3+ 0.95（仍有 5% 概率突破）
+    # 4) 连续没回（2026-06-03 软化曲线）：threshold MAX_UNANSWERED_FIRES=2，
+    #    base 从 0.70 → 0.50。
+    #    2 条没回 → 0.50（之前 1 条就 0.70）
+    #    3 条 → 0.65 / 4 → 0.80 / 5+ → 0.95（封顶 0.97）
     if consecutive_asst >= MAX_UNANSWERED_FIRES and last_fire is not None:
         extras = consecutive_asst - MAX_UNANSWERED_FIRES
-        prob = min(SOFT_SKIP_PROB_CAP, 0.70 + 0.15 * extras)
+        prob = min(SOFT_SKIP_PROB_CAP, 0.50 + 0.15 * extras)
         violations.append({"reason": "unanswered_streak", "prob": round(prob, 3),
                            "consecutive_asst": consecutive_asst})
 
@@ -347,19 +360,40 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         rec_msgs = list(_recent_per_user.get(str(user_id), []))
     except Exception:
         rec_msgs = []
-    consecutive_asst = 0
+    # 算两个值（2026-06-03 拆）：
+    # - consecutive_asst_raw：含 reminder + 不衰减——给 _check_hard_sleep 永久 mute 规则用
+    #   （idle ≥ 7d + ≥ 5 unanswered → mute；reminder 也要计、时间衰减不该影响这条）
+    # - consecutive_asst_for_soft：跳 reminder + 4h 时间衰减——给 soft gate unanswered_streak 用
+    consecutive_asst_raw = 0
+    consecutive_asst_for_soft = 0
+    last_counted_asst_ts: Optional[str] = None
     for m in reversed(rec_msgs):
-        if m.get("role") == "assistant":
-            consecutive_asst += 1
-        else:
+        if m.get("role") != "assistant":
             break
+        consecutive_asst_raw += 1
+        if m.get("kind") in UNANSWERED_STREAK_EXCLUDED_KINDS:
+            continue
+        if last_counted_asst_ts is None:
+            last_counted_asst_ts = m.get("ts")
+        consecutive_asst_for_soft += 1
+    # soft 用的时间衰减：last counted asst > 4h 前 → user 大概率离线/忙，不是冷落 → streak=0
+    # 旧条目可能没 ts（兼容老 data/recent.json）——这种情况不衰减，保留原 streak
+    if consecutive_asst_for_soft > 0 and last_counted_asst_ts:
+        try:
+            ts = datetime.fromisoformat(last_counted_asst_ts)
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            if (now_utc - ts).total_seconds() > UNANSWERED_STREAK_DECAY_SEC:
+                consecutive_asst_for_soft = 0
+        except Exception:
+            pass
 
     # 硬休眠门：idle 长 + 距上次 fire 近 → 直接退避不调 LLM 不写 proactive_decision
     # 原因：5/29 L4 自治多次 escalate 同一 issue——对从未回应 / 60h+ 静默 user 仍每
     # 25min 唤起 decide，audit 噪声 + 3% 软门突破偶尔触发翻车 opener
     hard_sleep, hs_reason, hs_ctx = _check_hard_sleep(
         idle_sec=idle_sec, last_fire=last_fire, now=now_utc,
-        consecutive_asst=consecutive_asst,
+        consecutive_asst=consecutive_asst_raw,
     )
     if hard_sleep:
         _maybe_audit_hard_sleep(user_id, hs_reason, hs_ctx)
@@ -367,7 +401,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
 
     skip_prob, violations = _compute_soft_gate_skip(
         idle_sec=idle_sec, last_fire=last_fire, now=now_utc,
-        today_count=today_count, consecutive_asst=consecutive_asst,
+        today_count=today_count, consecutive_asst=consecutive_asst_for_soft,
     )
     if skip_prob > 0:
         roll = random.random()
@@ -426,7 +460,7 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
     # 把最近 3 条自己发过的 proactive opener 摘出来——让软门 LLM 看到"我反复戳过这些"
     # 单独抽是因为 recent_history 是混杂的对话流，LLM 不容易辨认"哪些是我主动发的没回应的"
     recent_assistant_openers: list[str] = []
-    if consecutive_asst > 0:
+    if consecutive_asst_raw > 0:
         for m in reversed(rec_msgs):
             if m.get("role") != "assistant":
                 break
@@ -447,7 +481,8 @@ async def decide(user_id: int, now: datetime | None = None) -> Optional[dict[str
         "opens_today": today_count,
         "daily_cap": DAILY_CAP,
         "share_quota_remaining": share_quota_remaining,
-        "consecutive_asst_no_reply": consecutive_asst,
+        "consecutive_asst_no_reply": consecutive_asst_raw,
+        "consecutive_asst_eligible_for_soft_gate": consecutive_asst_for_soft,
         "recent_assistant_openers": recent_assistant_openers,
         "pending_ideas": pending_ideas,
     }

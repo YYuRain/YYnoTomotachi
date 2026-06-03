@@ -139,21 +139,31 @@ def _load_recent() -> None:
         log.warning("load _recent failed (ignored): %s", e)
 
 
-def record_proactive_message(user_id: int, text: str) -> None:
-    """主动开场（proactive opener / welcome opener）发出后调用，把这条 assistant
-    消息追加进 _recent，让下一轮 user 回复时 handle_user_message 拼上下文能看见。
+def record_proactive_message(user_id: int, text: str, kind: str | None = None) -> None:
+    """主动开场（proactive opener / welcome opener / triggered reminder）发出后调用，
+    把这条 assistant 消息追加进 _recent，让下一轮 user 回复时 handle_user_message 拼
+    上下文能看见。
 
     **不**进 memory.note_turn buffer——主动开场是单边消息（没 user 输入配对），
     塞进 buffer 会让 flush 时 LLM 抽 profile/event 看到不平衡的 batch。
 
     历史 bug：proactive 发"草莓音乐节有个新阵容"，user 回"哪个啊"，bot 回"啊？
     你问哪个哪个"——bot 完全不知道自己刚说过什么，因为 opener 没进 _recent。
+
+    kind: 可选标签，用于 proactive soft gate 区分。
+        - "reminder"——active trigger 触发的条件信息推送（"if 下雨 then ping"），
+          user 读了不回是设计意图，**不计入 unanswered_streak**。
+        - None / 其他——计入 streak。
     """
     if not text:
         return
     uid = str(user_id)
     recent = _recent_per_user.setdefault(uid, [])
-    recent.append({"role": "assistant", "content": text})
+    entry: dict[str, str] = {"role": "assistant", "content": text,
+                             "ts": clock.utcnow().isoformat()}
+    if kind:
+        entry["kind"] = kind
+    recent.append(entry)
     _trim(uid)
     _save_recent()
 
@@ -484,8 +494,9 @@ async def handle_user_message(
     history_user_text = user_text if user_text else ("[图片]" if image_b64 else "")
     if image_b64 and user_text:
         history_user_text = f"[图片] {user_text}"
-    recent.append({"role": "user", "content": history_user_text})
-    recent.append({"role": "assistant", "content": reply})
+    now_iso = clock.utcnow().isoformat()
+    recent.append({"role": "user", "content": history_user_text, "ts": now_iso})
+    recent.append({"role": "assistant", "content": reply, "ts": now_iso})
     _trim(uid)
     _save_recent()
 
