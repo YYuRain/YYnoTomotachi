@@ -5,7 +5,8 @@
 > P0-1 hybrid retrieval（Mem0 v3）+ P0-4 episodes provenance（Graphiti）+
 > P0-2 三因子 ranker（Generative Agents）+
 > P1-5 bi-temporal 字段（Graphiti）+ P1-6 insight 生成（Generative Agents reflection）。
-> memU 时代的归档说明在 `memu-setup.md`；横向研究分析在 `me/记忆框架横纵分析.md`。
+> memU 选型 → 自搭的决策叙事看 [`memory-decisions.md`](memory-decisions.md)；横向研究分析在 `me/记忆框架横纵分析.md`。
+> Dream 与 Override 的设计动机看 [`dream-and-override.md`](dream-and-override.md)。
 
 ## 一句话
 
@@ -330,4 +331,4 @@ LLM 调用次数 = 该用户 profile 数；deepseek-flash 一次 ~$0.0001。
 
 - PRD 原文：`me/prd_memory.md`
 - MEME paper 引用 + 三层方案推导：PRD §3-§5
-- 历史 memU 时代细节：`memu-setup.md`（已归档）
+- 历史决策叙事 + memU 时代踩坑附录：`memory-decisions.md`

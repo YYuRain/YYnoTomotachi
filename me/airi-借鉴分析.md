@@ -42,16 +42,16 @@ function loopPeriodic(botCtx) {
 
 每个 tick LLM 输出一个 JSON action（`prompts/system-ticking-v1.velin.md`）：
 
-| Action | 语义 |
-|--------|------|
-| `list_chats` / `list_stickers` | 探索环境（看自己有哪些群 / 哪些表情包） |
-| `read_unread_messages` | **主动**去读未读 |
-| `send_message` / `send_sticker` | 发消息 |
-| `come_up_ideas` | **自主形成想法**写长期记忆 |
-| `come_up_goals` | **自主立目标**（含 deadline + priority）写长期记忆 |
-| `continue` | 当前任务继续，下个 tick 再问我 |
-| `break` | 累了，清掉现有 working memory，下个 tick 再问 |
-| `sleep` | 闲太久了，清掉 ongoing task + working memory |
+| Action                          | 语义                                    |
+| ------------------------------- | ------------------------------------- |
+| `list_chats` / `list_stickers`  | 探索环境（看自己有哪些群 / 哪些表情包）                 |
+| `read_unread_messages`          | **主动**去读未读                            |
+| `send_message` / `send_sticker` | 发消息                                   |
+| `come_up_ideas`                 | **自主形成想法**写长期记忆                       |
+| `come_up_goals`                 | **自主立目标**（含 deadline + priority）写长期记忆 |
+| `continue`                      | 当前任务继续，下个 tick 再问我                    |
+| `break`                         | 累了，清掉现有 working memory，下个 tick 再问     |
+| `sleep`                         | 闲太久了，清掉 ongoing task + working memory |
 
 LLM 不是被动响应——是**作为 agent 在循环里活着**，自己决定"现在要不要参与对话 /
 想点什么 / 是不是该歇一会"。返回 `{"messages": []}` 表示"我现在不想说话"是合法输出。

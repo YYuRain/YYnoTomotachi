@@ -215,7 +215,8 @@ test bot（如启用）：
 | `document/eval-system.md` | 模型评测系统（OpenRouter 多模型横向 + LLM judge） |
 | `document/minimax-integration.md` | MiniMax 接入与坑点 |
 | `document/session-log.md` | 搭建流水（按时间） |
-| `document/memu-setup.md` | （归档）memU SDK 时代配置，自搭栈替换前的踩坑参考 |
+| `document/memory-decisions.md` | 记忆架构演进叙事：memU → 自搭的决策路径 + 踩坑附录 |
+| `document/dream-and-override.md` | Dream + Override 设计动机：bot 自我演化的两个机制 |
 | `me/` | 手写 PRD 与笔记（`prd_memory.md` / `记忆框架横纵分析.md` / `进展汇总inbox.md` 等） |
 | `prompt/` | 24 个 LLM prompt（扁平结构，命名 `<module>_<name>.md`，改文件重启即生效） |
 
